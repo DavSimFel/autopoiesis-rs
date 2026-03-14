@@ -714,9 +714,9 @@ impl Gate for ShellHeuristic {
                             gate_id: _,
                         } => {
                             if most_restrictive.is_none()
-                                || (most_restrictive.is_some_and(|(_, current)| {
-                                    current == Severity::Low && severity == Severity::High
-                                }))
+                                || most_restrictive.as_ref().is_some_and(|(_, current)| {
+                                    *current == Severity::Low && severity == Severity::High
+                                })
                             {
                                 most_restrictive = Some((reason, severity));
                             }
