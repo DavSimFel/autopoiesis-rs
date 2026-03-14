@@ -1,7 +1,8 @@
 //! Binary entrypoint for the `autopoiesis` CLI.
 
 use anyhow::{anyhow, Result};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Parser, Subcommand};
+use std::io::{self, BufRead, Write};
 
 mod agent;
 mod auth;
@@ -81,20 +82,11 @@ async fn main() -> Result<()> {
             let config = Config::load("agents.toml")
                 .map_err(|error| anyhow!("failed to load configuration: {error}"))?;
 
-            if cli.prompt.is_empty() {
-                let mut cmd = Cli::command();
-                cmd.print_help()?;
-                println!();
-                println!("Run: autopoiesis auth login");
-                return Ok(());
-            }
-
             let mut session = Session::new(config.system_prompt.clone());
-            let prompt = cli.prompt.join(" ");
             let provider_config = config.clone();
 
             // Build a fresh provider per turn so the auth token can be refreshed mid-session.
-            let provider_factory = move || {
+            let mut provider_factory = move || {
                 let provider_config = provider_config.clone();
 
                 async move {
@@ -108,7 +100,30 @@ async fn main() -> Result<()> {
                 }
             };
 
-            run_agent_loop(provider_factory, &mut session, prompt).await?;
+            if cli.prompt.is_empty() {
+                let stdin = io::stdin();
+                let mut line = String::new();
+                let mut handle = stdin.lock();
+                loop {
+                    print!("> ");
+                    io::stdout().flush()?;
+                    line.clear();
+                    if handle.read_line(&mut line)? == 0 {
+                        break;
+                    }
+                    let prompt = line.trim();
+                    if prompt.is_empty() {
+                        continue;
+                    }
+                    if prompt == "exit" || prompt == "quit" {
+                        break;
+                    }
+                    run_agent_loop(&mut provider_factory, &mut session, prompt.to_string()).await?;
+                    println!();
+                }
+            } else {
+                run_agent_loop(&mut provider_factory, &mut session, cli.prompt.join(" ")).await?;
+            }
         }
     }
 
