@@ -6,4 +6,5 @@ pub mod identity;
 pub mod llm;
 pub mod session;
 pub mod template;
+pub mod gate;
 pub mod tools;
