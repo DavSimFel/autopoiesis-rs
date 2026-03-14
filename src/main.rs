@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use autopoiesis::{agent, auth, config, context, guard, llm, session, tool, turn};
+use autopoiesis::{agent, auth, config, context, guard, llm, session, tool, tool::Tool as _, turn};
 
 use std::collections::HashMap;
 use std::env;

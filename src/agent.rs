@@ -277,14 +277,15 @@ mod tests {
             .context(History::new(1_000))
             .tool(Shell::new())
             .guard(SecretRedactor::new(&[]));
-        let _verdict = run_agent_loop(
-            {
+        let mut make_provider = {
+            let provider = provider.clone();
+            move || {
                 let provider = provider.clone();
-                move || {
-                    let provider = provider.clone();
-                    async move { Ok::<_, anyhow::Error>(provider) }
-                }
-            },
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let _verdict = run_agent_loop(
+            &mut make_provider,
             &mut session,
             "new command".to_string(),
             &turn,

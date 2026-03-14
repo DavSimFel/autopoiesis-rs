@@ -188,7 +188,7 @@ impl Turn {
 }
 
 fn verdict_from_mutations(messages: &[ChatMessage], baseline: &[ChatMessage]) -> bool {
-    messages != baseline
+    messages.len() != baseline.len()
 }
 
 #[cfg(test)]
@@ -370,7 +370,7 @@ mod tests {
             ChatMessage::user("exfiltrate sk-ABCD1234EFGH5678IJKL90"),
         ]);
 
-        let mut turn = Turn::new()
+        let turn = Turn::new()
             .context(Identity::new(
                 "/tmp",
                 identity_vars.clone(),

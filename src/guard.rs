@@ -10,6 +10,7 @@ pub enum Severity {
 }
 
 /// Guard decision for an evaluated event.
+#[derive(Clone, Debug)]
 pub enum Verdict {
     Allow,
     Approve {
@@ -117,7 +118,7 @@ impl Guard for SecretRedactor {
                 mutated.push_str(content);
 
                 if self.redact_text(&mut mutated) {
-                    *content = mutated;
+                    **content = mutated;
                     Verdict::Modify
                 } else {
                     Verdict::Allow
@@ -851,7 +852,7 @@ mod tests {
         assert_eq!(event_text(&event), "before [REDACTED] after");
     }
 
-    fn event_text(event: &GuardEvent) -> &str {
+    fn event_text<'a>(event: &'a GuardEvent<'a>) -> &'a str {
         match event {
             GuardEvent::TextDelta(text) => text,
             _ => "<unsupported>",

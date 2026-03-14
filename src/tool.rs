@@ -108,7 +108,9 @@ impl Shell {
         });
 
         let duration = Duration::from_millis(timeout_ms);
-        rx.recv_timeout(duration).map_err(|_| anyhow!("tool execute timed out after {timeout_ms}ms"))?
+        rx.recv_timeout(duration)
+            .map_err(|_| anyhow!("tool execute timed out after {timeout_ms}ms"))?
+            .map_err(|e| anyhow!(e))
     }
 
     fn _default_timeout_ms() -> u64 {

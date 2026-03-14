@@ -195,7 +195,7 @@ mod tests {
 
         let mut vars = HashMap::new();
         vars.insert("model".to_string(), "gpt-5.4".to_string());
-        let mut source = Identity::new(
+        let source = Identity::new(
             dir.path().to_str().expect("temp path should be utf-8"),
             vars,
             "fallback",
