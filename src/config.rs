@@ -10,6 +10,7 @@ pub struct Config {
     pub system_prompt: String,
     pub max_tokens: Option<u32>,
     pub openai_api_key: Option<String>,
+    pub base_url: String,
 }
 
 impl Config {
@@ -20,7 +21,12 @@ impl Config {
             model: "gpt-4o".to_string(),
             system_prompt: "You are a direct and capable coding agent. Execute tasks efficiently.".to_string(),
             max_tokens: Some(8192),
-            openai_api_key: env::var("OPENAI_API_KEY").ok(),
+            openai_api_key: env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| env::var("OPENROUTER_API_KEY").ok())
+                .filter(|v| !v.trim().is_empty()),
+            base_url: env::var("BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
         };
 
         if let Ok(contents) = std::fs::read_to_string(config_path.as_ref()) {

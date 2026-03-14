@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
         .map_err(|error| anyhow::anyhow!("failed to load configuration: {error}"))?;
     let api_key = config.openai_api_key()?;
 
-    let provider = OpenAIProvider::new(api_key, config.model, config.max_tokens);
+    let provider = OpenAIProvider::new(api_key, config.base_url, config.model, config.max_tokens);
     let mut session = Session::new(config.system_prompt);
 
     run_agent_loop(&provider, &mut session, cli.prompt).await

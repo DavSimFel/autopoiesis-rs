@@ -13,15 +13,17 @@ use crate::llm::{
 #[derive(Debug, Clone)]
 pub struct OpenAIProvider {
     api_key: String,
+    base_url: String,
     model: String,
     max_tokens: Option<u32>,
     client: Client,
 }
 
 impl OpenAIProvider {
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>, max_tokens: Option<u32>) -> Self {
+    pub fn new(api_key: impl Into<String>, base_url: impl Into<String>, model: impl Into<String>, max_tokens: Option<u32>) -> Self {
         Self {
             api_key: api_key.into(),
+            base_url: base_url.into(),
             model: model.into(),
             max_tokens,
             client: Client::new(),
@@ -157,16 +159,18 @@ impl LlmProvider for OpenAIProvider {
 
         let response = self
             .client
-            .post("https://api.openai.com/v1/chat/completions")
+            .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&request)
             .send()
             .await
             .context("failed to send request to OpenAI")?;
 
-        let response = response
-            .error_for_status()
-            .context("OpenAI API returned an error response")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("API error {status}: {body}");
+        }
 
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();

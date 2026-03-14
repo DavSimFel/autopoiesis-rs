@@ -1,4 +1,4 @@
 [agent]
-model = "gpt-4o"
+model = "anthropic/claude-sonnet-4.6"
 system_prompt = "You are a direct and capable coding agent. Execute tasks efficiently."
 max_tokens = 8192
