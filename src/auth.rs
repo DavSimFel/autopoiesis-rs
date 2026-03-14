@@ -259,8 +259,22 @@ struct DeviceCodeResponse {
     device_auth_id: String,
     #[serde(rename = "user_code", alias = "usercode")]
     user_code: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_interval")]
     interval: Option<u64>,
+}
+
+fn deserialize_interval<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(serde_json::Value::Number(n)) => Ok(n.as_u64()),
+        Some(serde_json::Value::String(s)) => s.parse::<u64>().map(Some).map_err(D::Error::custom),
+        Some(_) => Ok(None),
+    }
 }
 
 #[derive(Debug, Deserialize)]

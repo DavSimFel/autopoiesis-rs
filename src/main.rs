@@ -91,11 +91,13 @@ async fn main() -> Result<()> {
             let prompt = cli.prompt.join(" ");
             let base_url = config.base_url.clone();
             let model = config.model.clone();
-            let max_tokens = config.max_tokens;
+            let max_output_tokens = config.max_output_tokens;
+            let reasoning_effort = config.reasoning_effort.clone();
 
             let provider_factory = move || {
                 let base_url = base_url.clone();
                 let model = model.clone();
+                let reasoning_effort = reasoning_effort.clone();
 
                 async move {
                     let api_key = auth::get_valid_token().await?;
@@ -103,7 +105,8 @@ async fn main() -> Result<()> {
                         api_key,
                         base_url,
                         model,
-                        max_tokens,
+                        max_output_tokens,
+                        reasoning_effort,
                     ))
                 }
             };

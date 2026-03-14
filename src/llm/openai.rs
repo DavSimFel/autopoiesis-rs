@@ -3,11 +3,12 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use futures::TryStreamExt;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+// serde used by tests
+use serde_json::{json, Value};
 
 use crate::llm::{
-    ChatMessage, ChatRole, FunctionTool, LlmProvider, MessageContent, StreamedTurn, StopReason, ToolCall,
+    ChatMessage, ChatRole, FunctionTool, LlmProvider, MessageContent, StopReason, StreamedTurn,
+    ToolCall,
 };
 
 #[derive(Debug, Clone)]
@@ -15,124 +16,107 @@ pub struct OpenAIProvider {
     api_key: String,
     base_url: String,
     model: String,
-    max_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+    reasoning_effort: Option<String>,
     client: Client,
 }
 
 impl OpenAIProvider {
-    pub fn new(api_key: impl Into<String>, base_url: impl Into<String>, model: impl Into<String>, max_tokens: Option<u32>) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        max_output_tokens: Option<u32>,
+        reasoning_effort: Option<String>,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
             model: model.into(),
-            max_tokens,
+            max_output_tokens,
+            reasoning_effort,
             client: Client::new(),
         }
     }
 
-    fn map_stop_reason(reason: Option<&str>) -> StopReason {
-        match reason {
-            Some("stop") => StopReason::Stop,
-            Some("tool_calls") => StopReason::ToolCalls,
-            Some("length") => StopReason::Length,
-            Some("content_filter") => StopReason::ContentFilter,
-            Some(other) => StopReason::Other(other.to_string()),
-            None => StopReason::Stop,
-        }
-    }
+    /// Extract system prompt from messages and convert remaining to Responses API input format
+    fn build_input(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
+        let mut instructions = None;
+        let mut input = Vec::new();
 
-    fn to_openai_messages(messages: &[ChatMessage]) -> Vec<OpenAIMessage> {
-        messages
-            .iter()
-            .map(|message| {
-                let role = match message.role {
-                    ChatRole::System => "system",
-                    ChatRole::User => "user",
-                    ChatRole::Assistant => "assistant",
-                    ChatRole::Tool => "tool",
-                };
-
-                let mut content = String::new();
-                let mut tool_calls = Vec::<OpenAIMessageToolCall>::new();
-                let mut tool_call_id = None;
-                let mut tool_name = None;
-
-                for (index, block) in message.content.iter().enumerate() {
-                    match block {
-                        MessageContent::Text { text } => {
-                            content.push_str(text);
-                        }
-                        MessageContent::ToolCall { call } => {
-                            tool_calls.push(OpenAIMessageToolCall {
-                                index,
-                                id: call.id.clone(),
-                                kind: "function".to_string(),
-                                function: OpenAIFunctionCall {
-                                    name: call.name.clone(),
-                                    arguments: call.arguments.clone(),
-                                },
-                            });
-                        }
-                        MessageContent::ToolResult { result } => {
-                            tool_call_id = Some(result.tool_call_id.clone());
-                            tool_name = Some(result.name.clone());
-                            content = result.content.clone();
+        for msg in messages {
+            match msg.role {
+                ChatRole::System => {
+                    // Extract system prompt as instructions
+                    for block in &msg.content {
+                        if let MessageContent::Text { text } = block {
+                            instructions = Some(text.clone());
                         }
                     }
                 }
-
-                OpenAIMessage {
-                    role: role.to_string(),
-                    content: (!content.is_empty()).then_some(content),
-                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
-                    name: tool_name,
-                    tool_call_id,
+                ChatRole::User => {
+                    for block in &msg.content {
+                        if let MessageContent::Text { text } = block {
+                            input.push(json!({
+                                "role": "user",
+                                "content": text
+                            }));
+                        }
+                    }
                 }
-            })
-            .collect()
+                ChatRole::Assistant => {
+                    // Assistant messages may contain text and/or tool calls
+                    for block in &msg.content {
+                        match block {
+                            MessageContent::Text { text } => {
+                                input.push(json!({
+                                    "role": "assistant",
+                                    "content": text
+                                }));
+                            }
+                            MessageContent::ToolCall { call } => {
+                                input.push(json!({
+                                    "type": "function_call",
+                                    "id": call.id,
+                                    "name": call.name,
+                                    "arguments": call.arguments
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ChatRole::Tool => {
+                    // Tool results become function_call_output
+                    for block in &msg.content {
+                        if let MessageContent::ToolResult { result } = block {
+                            input.push(json!({
+                                "type": "function_call_output",
+                                "call_id": result.tool_call_id,
+                                "output": result.content
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
+        (instructions, input)
     }
 
-    fn build_tools(tools: &[FunctionTool]) -> Vec<OpenAIProviderTool> {
+    /// Convert FunctionTool to Responses API tool format
+    fn build_tools(tools: &[FunctionTool]) -> Vec<Value> {
         tools
             .iter()
-            .map(|tool| OpenAIProviderTool {
-                kind: "function".to_string(),
-                function: OpenAIProviderFunction {
-                    name: tool.name.clone(),
-                    description: tool.description.clone(),
-                    parameters: tool.parameters.clone(),
-                },
+            .map(|tool| {
+                json!({
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters
+                })
             })
             .collect()
-    }
-
-    fn stream_turn_from_pending(
-        tool_calls: HashMap<usize, StreamingToolCall>,
-        assistant_content: String,
-        stop_reason: StopReason,
-    ) -> StreamedTurn {
-        if tool_calls.is_empty() {
-            return StreamedTurn {
-                assistant_message: ChatMessage::assistant_text(assistant_content),
-                tool_calls: Vec::new(),
-                stop_reason,
-            };
-        }
-
-        let calls: Vec<ToolCall> = tool_calls
-            .into_values()
-            .map(|entry| ToolCall {
-                id: entry.id,
-                name: entry.name,
-                arguments: entry.arguments,
-            })
-            .collect();
-
-        StreamedTurn {
-            assistant_message: ChatMessage::assistant_tool_calls(calls.clone()),
-            tool_calls: calls,
-            stop_reason,
-        }
     }
 }
 
@@ -144,22 +128,35 @@ impl LlmProvider for OpenAIProvider {
         tools: &[FunctionTool],
         on_token: &mut (dyn FnMut(String) + Send),
     ) -> Result<StreamedTurn> {
-        let request = OpenAIStreamRequest {
-            model: self.model.clone(),
-            messages: Self::to_openai_messages(messages),
-            stream: true,
-            tools: Self::build_tools(tools),
-            tool_choice: if tools.is_empty() {
-                None
-            } else {
-                Some("auto".to_string())
-            },
-            max_tokens: self.max_tokens,
-        };
+        let (instructions, input) = Self::build_input(messages);
+        let tools_json = Self::build_tools(tools);
+
+        let mut request = json!({
+            "model": self.model,
+            "input": input,
+            "stream": true,
+            "store": false,
+        });
+
+        if let Some(ref instructions) = instructions {
+            request["instructions"] = json!(instructions);
+        }
+
+        if !tools_json.is_empty() {
+            request["tools"] = json!(tools_json);
+        }
+
+        if let Some(max_tokens) = self.max_output_tokens {
+            request["max_output_tokens"] = json!(max_tokens);
+        }
+
+        if let Some(ref effort) = self.reasoning_effort {
+            request["reasoning"] = json!({"effort": effort});
+        }
 
         let response = self
             .client
-            .post(format!("{}/chat/completions", self.base_url))
+            .post(&self.base_url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&request)
             .send()
@@ -174,13 +171,18 @@ impl LlmProvider for OpenAIProvider {
 
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
-        let mut pending_tool_calls: HashMap<usize, StreamingToolCall> = HashMap::new();
         let mut assistant_content = String::new();
+
+        // Track function calls: call_id -> (name, arguments)
+        let mut pending_calls: HashMap<String, (String, String)> = HashMap::new();
+        let mut current_call_id: Option<String> = None;
+        let mut current_call_name: Option<String> = None;
+        let mut current_call_args = String::new();
         let mut stop_reason = StopReason::Stop;
 
-        while let Some(chunk) = stream.try_next().await.context("failed to read OpenAI stream")? {
+        while let Some(chunk) = stream.try_next().await.context("stream read error")? {
             let chunk_text = std::str::from_utf8(&chunk)
-                .context("received non-utf8 data from OpenAI stream")?;
+                .context("received non-utf8 data from stream")?;
             buffer.push_str(chunk_text);
 
             while let Some(line_break) = buffer.find('\n') {
@@ -191,216 +193,172 @@ impl LlmProvider for OpenAIProvider {
                     continue;
                 }
 
-                if !line.starts_with("data:") {
+                if line == "data: [DONE]" {
+                    break;
+                }
+
+                let data = if let Some(stripped) = line.strip_prefix("data: ") {
+                    stripped
+                } else {
                     continue;
-                }
+                };
 
-                let data = line.trim_start_matches("data:").trim();
-                if data == "[DONE]" {
-                    return Ok(Self::stream_turn_from_pending(
-                        pending_tool_calls,
-                        assistant_content,
-                        stop_reason,
-                    ));
-                }
+                let event: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
 
-                let chunk: OpenAIStreamResponse = serde_json::from_str(data)
-                    .with_context(|| format!("failed to parse OpenAI stream chunk: {data}"))?;
+                let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-                for choice in chunk.choices {
-                    if let Some(reason) = choice.finish_reason.as_deref() {
-                        stop_reason = Self::map_stop_reason(Some(reason));
+                match event_type {
+                    "response.output_text.delta" => {
+                        if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
+                            assistant_content.push_str(delta);
+                            on_token(delta.to_string());
+                        }
                     }
 
-                    if let Some(delta) = choice.delta {
-                        if let Some(text) = delta.content {
-                            assistant_content.push_str(&text);
-                            on_token(text.clone());
+                    "response.function_call_arguments.delta" => {
+                        if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
+                            current_call_args.push_str(delta);
                         }
-
-                        if let Some(calls) = delta.tool_calls {
-                            for call in calls {
-                                let entry = pending_tool_calls.entry(call.index).or_insert_with(|| {
-                                    StreamingToolCall {
-                                        id: call.id.clone().unwrap_or_else(|| format!("tool-call-{}", call.index)),
-                                        name: String::new(),
-                                        arguments: String::new(),
-                                    }
-                                });
-
-                                if let Some(id) = call.id {
-                                    entry.id = id;
-                                }
-
-                                if let Some(function) = call.function {
-                                    if let Some(name) = function.name {
-                                        entry.name = name;
-                                    }
-                                    if let Some(arguments) = function.arguments {
-                                        entry.arguments.push_str(&arguments);
-                                    }
-                                }
+                        // Capture call_id and name from the first delta if present
+                        if current_call_id.is_none() {
+                            if let Some(id) = event.get("call_id").and_then(|v| v.as_str()) {
+                                current_call_id = Some(id.to_string());
+                            }
+                        }
+                        if current_call_name.is_none() {
+                            if let Some(name) = event.get("name").and_then(|v| v.as_str()) {
+                                current_call_name = Some(name.to_string());
                             }
                         }
                     }
-                }
 
-                if stop_reason == StopReason::ToolCalls {
-                    return Ok(Self::stream_turn_from_pending(
-                        pending_tool_calls,
-                        assistant_content,
-                        StopReason::ToolCalls,
-                    ));
+                    "response.function_call_arguments.done" => {
+                        let call_id = event
+                            .get("call_id")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                            .or(current_call_id.take())
+                            .unwrap_or_else(|| "unknown".to_string());
+
+                        let name = event
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                            .or(current_call_name.take())
+                            .unwrap_or_else(|| "unknown".to_string());
+
+                        let arguments = event
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| std::mem::take(&mut current_call_args));
+
+                        pending_calls.insert(call_id, (name, arguments));
+                        current_call_args.clear();
+                        stop_reason = StopReason::ToolCalls;
+                    }
+
+                    "response.output_item.done" => {
+                        if let Some(item) = event.get("item") {
+                            if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                                let call_id = item
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let name = item
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let arguments = item
+                                    .get("arguments")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("{}")
+                                    .to_string();
+
+                                pending_calls.insert(call_id, (name, arguments));
+                                stop_reason = StopReason::ToolCalls;
+                            }
+                        }
+                    }
+
+                    "response.completed" => {
+                        // Final event — we can extract output from here too if needed
+                        if pending_calls.is_empty() {
+                            stop_reason = StopReason::Stop;
+                        }
+                    }
+
+                    _ => {
+                        // Ignore other event types (response.created, response.in_progress, etc.)
+                    }
                 }
             }
         }
 
-        Ok(Self::stream_turn_from_pending(
-            pending_tool_calls,
-            assistant_content,
+        // Build tool calls from pending
+        let tool_calls: Vec<ToolCall> = pending_calls
+            .into_iter()
+            .map(|(id, (name, arguments))| ToolCall {
+                id,
+                name,
+                arguments,
+            })
+            .collect();
+
+        // Build assistant message
+        let mut assistant_msg = ChatMessage::with_role(ChatRole::Assistant);
+        if !assistant_content.is_empty() {
+            assistant_msg
+                .content
+                .push(MessageContent::Text { text: assistant_content });
+        }
+        for tc in &tool_calls {
+            assistant_msg.content.push(MessageContent::ToolCall {
+                call: tc.clone(),
+            });
+        }
+
+        Ok(StreamedTurn {
+            assistant_message: assistant_msg,
+            tool_calls,
             stop_reason,
-        ))
+        })
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OpenAIStreamRequest {
-    model: String,
-    messages: Vec<OpenAIMessage>,
-    stream: bool,
-    tools: Vec<OpenAIProviderTool>,
-    #[serde(rename = "tool_choice")]
-    tool_choice: Option<String>,
-    #[serde(rename = "max_tokens")]
-    max_tokens: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OpenAIProviderTool {
-    #[serde(rename = "type")]
-    kind: String,
-    function: OpenAIProviderFunction,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OpenAIProviderFunction {
-    name: String,
-    description: String,
-    parameters: Value,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OpenAIMessage {
-    role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(rename = "tool_calls", skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<OpenAIMessageToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    #[serde(rename = "tool_call_id", skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OpenAIMessageToolCall {
-    index: usize,
-    id: String,
-    #[serde(rename = "type")]
-    kind: String,
-    function: OpenAIFunctionCall,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OpenAIFunctionCall {
-    name: String,
-    arguments: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIStreamResponse {
-    choices: Vec<OpenAIStreamChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIStreamChoice {
-    delta: Option<OpenAIStreamDelta>,
-    #[serde(rename = "finish_reason")]
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIStreamDelta {
-    content: Option<String>,
-    #[serde(rename = "tool_calls")]
-    tool_calls: Option<Vec<OpenAIStreamToolCall>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct OpenAIStreamToolCall {
-    index: usize,
-    id: Option<String>,
-    function: Option<OpenAIStreamFunctionCall>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct OpenAIStreamFunctionCall {
-    name: Option<String>,
-    arguments: Option<String>,
-}
-
-#[derive(Debug)]
-struct StreamingToolCall {
-    id: String,
-    name: String,
-    arguments: String,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn test_openai_request_uses_function_tools() {
-        let tool = FunctionTool {
-            name: "execute".to_string(),
-            description: "run shell".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"}
-                },
-                "required": ["command"]
-            }),
-        };
-
-        let request_tools = OpenAIStreamRequest {
-            model: "gpt-4o".to_string(),
-            messages: vec![],
-            stream: true,
-            tools: OpenAIProvider::build_tools(&[tool]),
-            tool_choice: Some("auto".to_string()),
-            max_tokens: None,
-        };
-
-        let serialized = serde_json::to_value(request_tools).expect("serialize request");
-        assert_eq!(serialized["tools"][0]["type"], json!("function"));
-        assert_eq!(serialized["tools"][0]["function"]["name"], json!("execute"));
+    fn test_build_input_extracts_instructions() {
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello"),
+        ];
+        let (instructions, input) = OpenAIProvider::build_input(&messages);
+        assert_eq!(instructions, Some("You are helpful".to_string()));
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "Hello");
     }
 
     #[test]
-    fn test_tool_messages_convert() {
-        let tool_call = ToolCall {
-            id: "call-123".to_string(),
+    fn test_build_tools_flat_format() {
+        let tools = vec![FunctionTool {
             name: "execute".to_string(),
-            arguments: "{\"command\":\"ls\"}".to_string(),
-        };
-
-        let message = ChatMessage::assistant_tool_calls(vec![tool_call]);
-        let converted = OpenAIProvider::to_openai_messages(std::slice::from_ref(&message));
-
-        assert_eq!(converted[0].tool_calls.as_ref().unwrap()[0].id, "call-123");
-        assert_eq!(converted[0].tool_calls.as_ref().unwrap()[0].function.name, "execute");
+            description: "Run a command".to_string(),
+            parameters: json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+        }];
+        let result = OpenAIProvider::build_tools(&tools);
+        assert_eq!(result[0]["type"], "function");
+        assert_eq!(result[0]["name"], "execute");
+        // NOT nested under "function"
+        assert!(result[0].get("function").is_none());
     }
 }
