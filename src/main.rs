@@ -8,8 +8,13 @@ mod agent;
 mod auth;
 mod config;
 mod llm;
+mod identity;
+mod template;
 mod session;
 mod tools;
+
+use std::collections::HashMap;
+use std::env;
 
 use crate::agent::run_agent_loop;
 use crate::config::Config;
@@ -82,7 +87,25 @@ async fn main() -> Result<()> {
             let config = Config::load("agents.toml")
                 .map_err(|error| anyhow!("failed to load configuration: {error}"))?;
 
-            let mut session = Session::new(config.system_prompt.clone());
+            let cwd = env::current_dir()
+                .ok()
+                .and_then(|path| path.to_str().map(ToString::to_string))
+                .unwrap_or_else(String::new);
+            let tools = vec![tools::execute_tool_definition()];
+            let tool_names = tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut vars = HashMap::new();
+            vars.insert("model".to_string(), config.model.clone());
+            vars.insert("cwd".to_string(), cwd);
+            vars.insert("tools".to_string(), tool_names);
+
+            let system_prompt = identity::load_system_prompt("identity", &vars)
+                .unwrap_or(config.system_prompt.clone());
+
+            let mut session = Session::new(system_prompt);
             let provider_config = config.clone();
 
             // Build a fresh provider per turn so the auth token can be refreshed mid-session.

@@ -1,4 +1,3 @@
 [agent]
 model = "gpt-5.3-codex-spark"
-system_prompt = "You are a direct and capable coding agent. Execute tasks efficiently."
 reasoning_effort = "high"

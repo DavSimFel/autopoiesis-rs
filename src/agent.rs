@@ -1,6 +1,7 @@
 //! Agent orchestration loop coordinating model turns and tool execution.
 
 use std::io::{self, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
@@ -20,7 +21,8 @@ where
     P: LlmProvider,
 {
     let tools = vec![tools::execute_tool_definition()];
-    session.add_user_message(user_prompt);
+    let stamped_prompt = format!("[{}] {}", utc_timestamp(), user_prompt);
+    session.add_user_message(stamped_prompt);
 
     loop {
         let mut on_token = |token: String| {
@@ -60,4 +62,45 @@ where
     }
 
     Ok(())
+}
+
+fn utc_timestamp() -> String {
+    const SECS_PER_MINUTE: i64 = 60;
+    const SECS_PER_HOUR: i64 = 3_600;
+    const SECS_PER_DAY: i64 = 86_400;
+
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let mut days = duration / SECS_PER_DAY;
+    let mut rem = duration % SECS_PER_DAY;
+
+    let hour = rem / SECS_PER_HOUR;
+    rem %= SECS_PER_HOUR;
+    let minute = rem / SECS_PER_MINUTE;
+    let second = rem % SECS_PER_MINUTE;
+
+    // Days since Unix epoch -> civil date.
+    days += 719_468;
+    let era = if days >= 0 { days / 146_097 } else { (days - 146_096) / 146_097 };
+    let doe = days - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + (if month <= 2 { 1 } else { 0 });
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second
+    )
 }
