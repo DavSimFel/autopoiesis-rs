@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use std::io::{self, BufRead, Write};
-use autopoiesis::{agent, auth, config, identity, llm, session, tools};
+use autopoiesis::{agent, auth, config, gate, identity, llm, session, tools};
 
 use std::collections::HashMap;
 use std::env;
@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
             let mut session = session::Session::new(system_prompt, "sessions")?;
             session.load_today()?;
             let provider_config = config.clone();
+            let pipeline = default_pipeline();
 
             // Build a fresh provider per turn so the auth token can be refreshed mid-session.
             let mut provider_factory = move || {
@@ -129,14 +130,37 @@ async fn main() -> Result<()> {
                     if prompt == "exit" || prompt == "quit" {
                         break;
                     }
-                    agent::run_agent_loop(&mut provider_factory, &mut session, prompt.to_string()).await?;
+                    agent::run_agent_loop(
+                        &mut provider_factory,
+                        &mut session,
+                        prompt.to_string(),
+                        &pipeline,
+                    )
+                    .await?;
                     println!();
                 }
             } else {
-                agent::run_agent_loop(&mut provider_factory, &mut session, cli.prompt.join(" ")).await?;
+                agent::run_agent_loop(
+                    &mut provider_factory,
+                    &mut session,
+                    cli.prompt.join(" "),
+                    &pipeline,
+                )
+                .await?;
             }
         }
     }
 
     Ok(())
+}
+
+fn default_pipeline() -> gate::Pipeline {
+    gate::Pipeline::new()
+        .sanitize(gate::SecretRedactor::new(&[
+            r"sk-[a-zA-Z0-9_-]{20,}",
+            r"ghp_[a-zA-Z0-9]{36}",
+            r"AKIA[0-9A-Z]{16}",
+        ]))
+        .validate(gate::ShellHeuristic::new())
+        .validate(gate::ExfiltrationDetector::new())
 }

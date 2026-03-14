@@ -4,6 +4,7 @@ pub mod config;
 pub mod util;
 pub mod identity;
 pub mod llm;
+pub mod gate;
 pub mod session;
 pub mod template;
 pub mod tools;
