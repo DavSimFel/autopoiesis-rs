@@ -105,7 +105,8 @@ async fn main() -> Result<()> {
             let system_prompt = identity::load_system_prompt("identity", &vars)
                 .unwrap_or(config.system_prompt.clone());
 
-            let mut session = Session::new(system_prompt);
+            let mut session = Session::new(system_prompt, "sessions");
+            session.load_today()?;
             let provider_config = config.clone();
 
             // Build a fresh provider per turn so the auth token can be refreshed mid-session.

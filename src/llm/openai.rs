@@ -11,6 +11,7 @@ use crate::llm::{
     ChatMessage, ChatRole, FunctionTool, LlmProvider, MessageContent, StreamedTurn, StopReason,
     ToolCall,
 };
+use crate::session::TurnMeta;
 
 /// HTTP client and request settings for the OpenAI-compatible Responses API.
 #[derive(Debug, Clone)]
@@ -137,7 +138,9 @@ enum SseEvent {
         name: String,
         arguments: String,
     },
-    Completed,
+    Completed {
+        meta: Option<TurnMeta>,
+    },
     Done,
 }
 
@@ -208,14 +211,35 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown")
                     .to_string(),
-                arguments: item
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or("{}")
-                    .to_string(),
+                    arguments: item
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("{}")
+                        .to_string(),
             })
         }
-        "response.completed" => Some(SseEvent::Completed),
+        "response.completed" => {
+            let response = event.get("response").unwrap_or(&event);
+            let usage = response.get("usage").or_else(|| event.get("usage"));
+
+            let mut meta = TurnMeta::default();
+            meta.model = response.get("model").and_then(Value::as_str).map(ToString::to_string);
+
+            if let Some(usage) = usage {
+                meta.input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
+                meta.output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
+                meta.reasoning_tokens = usage.get("reasoning_tokens").and_then(Value::as_u64);
+            }
+
+            let has_meta = meta.model.is_some()
+                || meta.input_tokens.is_some()
+                || meta.output_tokens.is_some()
+                || meta.reasoning_tokens.is_some();
+
+            Some(SseEvent::Completed {
+                meta: if has_meta { Some(meta) } else { None },
+            })
+        }
         _ => None,
     }
 }
@@ -468,6 +492,7 @@ impl LlmProvider for OpenAIProvider {
         let mut current_call_name: Option<String> = None;
         let mut current_call_args = String::new();
         let mut stop_reason = StopReason::Stop;
+        let mut completion_meta = None;
         let mut assistant_content = String::new();
 
         // Parse SSE frame-by-frame.
@@ -511,7 +536,11 @@ impl LlmProvider for OpenAIProvider {
                     pending_calls.insert(call_id, (name, arguments));
                     stop_reason = StopReason::ToolCalls;
                 }
-                Some(SseEvent::Completed) => {
+                Some(SseEvent::Completed { meta }) => {
+                    if let Some(meta) = meta {
+                        completion_meta = Some(meta);
+                    }
+
                     if pending_calls.is_empty() {
                         stop_reason = StopReason::Stop;
                     }
@@ -547,6 +576,7 @@ impl LlmProvider for OpenAIProvider {
         Ok(StreamedTurn {
             assistant_message: assistant_msg,
             tool_calls,
+            meta: completion_meta,
             stop_reason,
         })
     }

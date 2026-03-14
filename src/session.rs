@@ -4,13 +4,15 @@
 //! Messages are appended in real time. On load, the file is
 //! replayed to rebuild in-memory state.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::llm::ChatMessage;
+use crate::llm::{ChatMessage, ChatRole, MessageContent};
 
 /// Metadata returned by the provider for a single completion.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -61,29 +63,195 @@ pub struct Session {
     total_tokens: u64,
     /// Path to the sessions directory.
     sessions_dir: PathBuf,
+    /// Token totals stored per message, aligned to `messages`.
+    message_tokens: Vec<u64>,
+}
+
+fn utc_timestamp() -> String {
+    const SECS_PER_MINUTE: i64 = 60;
+    const SECS_PER_HOUR: i64 = 3_600;
+    const SECS_PER_DAY: i64 = 86_400;
+
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let mut days = duration / SECS_PER_DAY;
+    let mut rem = duration % SECS_PER_DAY;
+
+    let _hour = rem / SECS_PER_HOUR;
+    rem %= SECS_PER_HOUR;
+    let _minute = rem / SECS_PER_MINUTE;
+    let _second = rem % SECS_PER_MINUTE;
+
+    // 719_468 is the number of days from year 0 to the Unix epoch (1970-01-01) in the
+    // proleptic Gregorian calendar; 146_097 is the number of days per 400-year cycle.
+    days += 719_468;
+    let era = if days >= 0 {
+        days / 146_097
+    } else {
+        (days - 146_096) / 146_097
+    };
+    let doe = days - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    let day = doy - (153 * mp + 2) / 5 + 1;
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year,
+        month,
+        day,
+        _hour,
+        _minute,
+        _second
+    )
 }
 
 impl Session {
     /// Start a session with a system prompt.
     pub fn new(system_prompt: impl Into<String>, sessions_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            messages: vec![ChatMessage::system(system_prompt)],
+        let system_prompt = system_prompt.into();
+        let mut session = Self {
+            messages: vec![ChatMessage::system(system_prompt.clone())],
             max_context_tokens: 100_000,
             total_tokens: 0,
             sessions_dir: sessions_dir.into(),
+            message_tokens: vec![0],
+        };
+
+        // Persist system message immediately so today's log exists before the first user turn.
+        let _ = Self::append_entry_to_file(
+            &session.today_path(),
+            &Self::to_entry(&session.messages[0], None),
+        );
+
+        session
+    }
+
+    fn to_entry(message: &ChatMessage, meta: Option<&TurnMeta>) -> SessionEntry {
+        let role = match message.role {
+            ChatRole::System => "system",
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+            ChatRole::Tool => "tool",
+        };
+
+        let content = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                MessageContent::Text { text } => Some(text.as_str()),
+                MessageContent::ToolResult { result } => Some(result.content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let (call_id, tool_name) = match message.role {
+            ChatRole::Tool => message
+                .content
+                .iter()
+                .find_map(|block| match block {
+                    MessageContent::ToolResult { result } => {
+                        Some((result.tool_call_id.clone(), result.name.clone()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default(),
+            _ => (None, None),
+        };
+
+        SessionEntry {
+            role: role.to_string(),
+            content,
+            ts: utc_timestamp(),
+            meta: meta.cloned(),
+            call_id,
+            tool_name,
         }
+    }
+
+    fn token_total(meta: Option<&TurnMeta>) -> u64 {
+        meta.map_or(0, |meta| {
+            meta.input_tokens.unwrap_or(0) + meta.output_tokens.unwrap_or(0)
+        })
+    }
+
+    fn append_entry_to_file(path: &Path, entry: &SessionEntry) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+
+        let line = serde_json::to_string(entry).context("failed to serialize session entry")?;
+        writeln!(file, "{line}").context("failed to write session entry")?;
+        Ok(())
+    }
+
+    fn message_from_entry(entry: SessionEntry) -> (Option<ChatMessage>, u64) {
+        let token_delta = Self::token_total(entry.meta.as_ref());
+
+        let message = match entry.role.as_str() {
+            "system" => None,
+            "user" => Some(ChatMessage::user(entry.content)),
+            "assistant" => Some(ChatMessage {
+                role: ChatRole::Assistant,
+                content: if entry.content.is_empty() {
+                    vec![]
+                } else {
+                    vec![MessageContent::text(entry.content)]
+                },
+            }),
+            "tool" => {
+                if entry.call_id.is_none() && entry.tool_name.is_none() && entry.content.is_empty() {
+                    None
+                } else {
+                    Some(ChatMessage::tool_result(
+                        entry.call_id.unwrap_or_default(),
+                        entry.tool_name.unwrap_or_default(),
+                        entry.content,
+                    ))
+                }
+            }
+            _ => None,
+        };
+
+        (message, token_delta)
     }
 
     /// Append a message and persist it to today's JSONL file.
     pub fn append(&mut self, message: ChatMessage, meta: Option<TurnMeta>) -> Result<()> {
-        // TODO: implement
-        todo!()
+        let token_delta = Self::token_total(meta.as_ref());
+        let entry = Self::to_entry(&message, meta.as_ref());
+
+        self.messages.push(message);
+        self.message_tokens.push(token_delta);
+        self.total_tokens += token_delta;
+
+        Self::append_entry_to_file(&self.today_path(), &entry)?;
+
+        if self.total_tokens > self.max_context_tokens {
+            self.trim_context();
+        }
+
+        Ok(())
     }
 
     /// Add a user prompt message with timestamp.
     pub fn add_user_message(&mut self, message: impl Into<String>) -> Result<()> {
-        // TODO: implement
-        todo!()
+        self.append(ChatMessage::user(message), None)
     }
 
     /// Immutable access to full message history.
@@ -93,20 +261,67 @@ impl Session {
 
     /// Load today's session from disk if it exists.
     pub fn load_today(&mut self) -> Result<()> {
-        // TODO: implement
-        todo!()
+        let path = self.today_path();
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let file = File::open(&path).context("failed to open sessions file")?;
+        let reader = BufReader::new(file);
+
+        for raw_line in reader.lines() {
+            let raw_line = raw_line?;
+            if raw_line.trim().is_empty() {
+                continue;
+            }
+
+            let entry: SessionEntry = serde_json::from_str(&raw_line)
+                .context("failed to parse session entry")?;
+
+            let (message, token_delta) = Self::message_from_entry(entry);
+            if let Some(message) = message {
+                self.messages.push(message);
+                self.message_tokens.push(token_delta);
+                self.total_tokens += token_delta;
+            } else if token_delta > 0 {
+                self.total_tokens += token_delta;
+                self.message_tokens.push(token_delta);
+            }
+        }
+
+        Ok(())
     }
 
     /// Get the path for today's JSONL file.
     pub fn today_path(&self) -> PathBuf {
-        // TODO: implement
-        todo!()
+        self.sessions_dir
+            .join(format!("{}.jsonl", utc_timestamp()[..10].to_string()))
     }
 
     /// Trim oldest non-system messages when over token limit.
     fn trim_context(&mut self) {
-        // TODO: implement
-        todo!()
+        while self.total_tokens > self.max_context_tokens {
+            if self.messages.len() <= 1 {
+                break;
+            }
+
+            let mut removed = 0;
+            for _ in 0..2 {
+                if self.messages.len() <= 1 {
+                    break;
+                }
+
+                let token_delta = self.message_tokens.remove(1);
+                self.messages.remove(1);
+                removed += token_delta;
+            }
+
+            if removed == 0 {
+                break;
+            }
+
+            self.total_tokens = self.total_tokens.saturating_sub(removed);
+        }
     }
 
     /// Get total token count from provider metadata.
@@ -116,8 +331,23 @@ impl Session {
 
     /// List available session files.
     pub fn list_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
-        // TODO: implement
-        todo!()
+        if !sessions_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(sessions_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file()
+                && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            {
+                paths.push(path);
+            }
+        }
+
+        paths.sort_by_key(|path| path.file_name().map(ToOwned::to_owned));
+        Ok(paths)
     }
 }
 

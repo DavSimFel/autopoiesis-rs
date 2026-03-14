@@ -22,7 +22,7 @@ where
 {
     let tools = vec![tools::execute_tool_definition()];
     let stamped_prompt = format!("[{}] {}", utc_timestamp(), user_prompt);
-    session.add_user_message(stamped_prompt);
+    session.add_user_message(stamped_prompt)?;
 
     loop {
         let mut on_token = |token: String| {
@@ -36,11 +36,12 @@ where
         let turn = provider
             .stream_completion(session.history(), &tools, &mut on_token)
             .await?;
+        let turn_meta = turn.meta;
 
         match turn.stop_reason {
             // The model produced tool calls; append assistant turn and execute each in order.
             StopReason::ToolCalls => {
-                session.append(turn.assistant_message);
+                session.append(turn.assistant_message, turn_meta)?;
 
                 for call in turn.tool_calls {
                     let result = match tools::execute_tool_call(&call).await {
@@ -48,14 +49,14 @@ where
                         Err(err) => format!(r#"{{\"error\": \"{err}\"}}"#),
                     };
 
-                    session.append(ChatMessage::tool_result(&call.id, &call.name, result));
+                    session.append(ChatMessage::tool_result(&call.id, &call.name, result), None)?;
                 }
             }
 
             // Final text output is appended and execution returns to caller.
             StopReason::Stop => {
                 println!();
-                session.append(turn.assistant_message);
+                session.append(turn.assistant_message, turn_meta)?;
                 break;
             }
         }

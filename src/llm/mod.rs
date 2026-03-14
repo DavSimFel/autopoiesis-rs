@@ -3,11 +3,12 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use crate::session::TurnMeta;
 
 pub mod openai;
 
 /// Role of a chat message in the message history.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatRole {
     System,
@@ -137,6 +138,8 @@ pub struct StreamedTurn {
     pub assistant_message: ChatMessage,
     /// Parsed tool calls accumulated from the stream.
     pub tool_calls: Vec<ToolCall>,
+    /// Optional turn-level metadata from provider completion usage.
+    pub meta: Option<TurnMeta>,
     /// Why the stream ended.
     pub stop_reason: StopReason,
 }
