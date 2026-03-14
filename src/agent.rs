@@ -129,7 +129,7 @@ where
                 for call in &tool_calls {
                     let result = match tools::execute_tool_call(call).await {
                         Ok(output) => output,
-                        Err(err) => format!(r#"{\"error\": \"{err}\"}"#),
+                        Err(err) => format!(r#"{{"error": "{err}"}}"#),
                     };
 
                     session.append(ChatMessage::tool_result(&call.id, &call.name, result), None)?;
