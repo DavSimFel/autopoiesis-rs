@@ -199,9 +199,11 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
             if item.get("type").and_then(Value::as_str) != Some("function_call") {
                 return None;
             }
+
             Some(SseEvent::FunctionCallOutputItemDone {
                 call_id: item
-                    .get("id")
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
                     .and_then(Value::as_str)
                     .unwrap_or("unknown")
                     .to_string(),
