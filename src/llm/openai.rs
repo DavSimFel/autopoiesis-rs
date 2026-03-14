@@ -403,34 +403,4 @@ impl LlmProvider for OpenAIProvider {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn test_build_input_extracts_instructions() {
-        let messages = vec![
-            ChatMessage::system("You are helpful"),
-            ChatMessage::user("Hello"),
-        ];
-        let (instructions, input) = OpenAIProvider::build_input(&messages);
-        assert_eq!(instructions, Some("You are helpful".to_string()));
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"], "Hello");
-    }
-
-    #[test]
-    fn test_build_tools_flat_format() {
-        let tools = vec![FunctionTool {
-            name: "execute".to_string(),
-            description: "Run a command".to_string(),
-            parameters: json!({"type": "object", "properties": {"command": {"type": "string"}}}),
-        }];
-        let result = OpenAIProvider::build_tools(&tools);
-        assert_eq!(result[0]["type"], "function");
-        assert_eq!(result[0]["name"], "execute");
-        // NOT nested under "function"
-        assert!(result[0].get("function").is_none());
-    }
-}

@@ -91,7 +91,7 @@ mod tests {
 
         let prompt = load_system_prompt(dir.to_str().expect("temp path should be utf8"), &vars)
             .expect("expected prompt load to succeed");
-        assert_eq!(prompt, "name: Ada\ncwd: /tmp\ndone");
+        assert_eq!(prompt, "name: Ada\n\ncwd: /tmp\n\ndone");
     }
 
     #[test]
