@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod auth;
 pub mod config;
+pub mod util;
 pub mod identity;
 pub mod llm;
 pub mod session;

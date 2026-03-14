@@ -9,9 +9,8 @@ use serde_json::{json, Value};
 
 use crate::llm::{
     ChatMessage, ChatRole, FunctionTool, LlmProvider, MessageContent, StreamedTurn, StopReason,
-    ToolCall,
+    ToolCall, TurnMeta,
 };
-use crate::session::TurnMeta;
 
 /// HTTP client and request settings for the OpenAI-compatible Responses API.
 #[derive(Debug, Clone)]
@@ -211,11 +210,11 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown")
                     .to_string(),
-                    arguments: item
-                        .get("arguments")
-                        .and_then(Value::as_str)
-                        .unwrap_or("{}")
-                        .to_string(),
+                arguments: item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}")
+                    .to_string(),
             })
         }
         "response.completed" => {
@@ -293,6 +292,23 @@ mod tests {
 
         assert_eq!(tokens, vec!["hello".to_string()]);
         assert!(!done);
+    }
+
+    #[test]
+    fn parse_sse_line_response_completed_contains_usage_metadata() {
+        let line = "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.3-codex-spark\",\"usage\":{\"input_tokens\":100,\"output_tokens\":50,\"reasoning_tokens\":25}}}";
+        let event = parse_sse_line(line).expect("completed event should parse");
+
+        match event {
+            SseEvent::Completed { meta } => {
+                let meta = meta.expect("completed event should include metadata");
+                assert_eq!(meta.model, Some("gpt-5.3-codex-spark".to_string()));
+                assert_eq!(meta.input_tokens, Some(100));
+                assert_eq!(meta.output_tokens, Some(50));
+                assert_eq!(meta.reasoning_tokens, Some(25));
+            }
+            _ => panic!("expected completed event"),
+        }
     }
 
     #[test]

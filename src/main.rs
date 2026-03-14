@@ -9,6 +9,7 @@ mod auth;
 mod config;
 mod llm;
 mod identity;
+mod util;
 mod template;
 mod session;
 mod tools;
@@ -105,7 +106,7 @@ async fn main() -> Result<()> {
             let system_prompt = identity::load_system_prompt("identity", &vars)
                 .unwrap_or(config.system_prompt.clone());
 
-            let mut session = Session::new(system_prompt, "sessions");
+            let mut session = Session::new(system_prompt, "sessions")?;
             session.load_today()?;
             let provider_config = config.clone();
 

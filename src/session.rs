@@ -7,32 +7,12 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{ChatMessage, ChatRole, MessageContent};
-
-/// Metadata returned by the provider for a single completion.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct TurnMeta {
-    /// Model that produced this turn.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Tokens consumed by input.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input_tokens: Option<u64>,
-    /// Tokens produced as output.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_tokens: Option<u64>,
-    /// Tokens used for reasoning (not injectable).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_tokens: Option<u64>,
-    /// Reasoning trace text (saved but never re-injected).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_trace: Option<String>,
-}
+use crate::llm::{ChatMessage, ChatRole, MessageContent, TurnMeta};
+use crate::util::utc_timestamp;
 
 /// One line in the JSONL session file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,57 +47,11 @@ pub struct Session {
     message_tokens: Vec<u64>,
 }
 
-fn utc_timestamp() -> String {
-    const SECS_PER_MINUTE: i64 = 60;
-    const SECS_PER_HOUR: i64 = 3_600;
-    const SECS_PER_DAY: i64 = 86_400;
-
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    let mut days = duration / SECS_PER_DAY;
-    let mut rem = duration % SECS_PER_DAY;
-
-    let _hour = rem / SECS_PER_HOUR;
-    rem %= SECS_PER_HOUR;
-    let _minute = rem / SECS_PER_MINUTE;
-    let _second = rem % SECS_PER_MINUTE;
-
-    // 719_468 is the number of days from year 0 to the Unix epoch (1970-01-01) in the
-    // proleptic Gregorian calendar; 146_097 is the number of days per 400-year cycle.
-    days += 719_468;
-    let era = if days >= 0 {
-        days / 146_097
-    } else {
-        (days - 146_096) / 146_097
-    };
-    let doe = days - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = y + if month <= 2 { 1 } else { 0 };
-    let day = doy - (153 * mp + 2) / 5 + 1;
-
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year,
-        month,
-        day,
-        _hour,
-        _minute,
-        _second
-    )
-}
-
 impl Session {
     /// Start a session with a system prompt.
-    pub fn new(system_prompt: impl Into<String>, sessions_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(system_prompt: impl Into<String>, sessions_dir: impl Into<PathBuf>) -> Result<Self> {
         let system_prompt = system_prompt.into();
-        let mut session = Self {
+        let session = Self {
             messages: vec![ChatMessage::system(system_prompt.clone())],
             max_context_tokens: 100_000,
             total_tokens: 0,
@@ -125,13 +59,15 @@ impl Session {
             message_tokens: vec![0],
         };
 
-        // Persist system message immediately so today's log exists before the first user turn.
-        let _ = Self::append_entry_to_file(
-            &session.today_path(),
-            &Self::to_entry(&session.messages[0], None),
-        );
+        let today_path = session.today_path();
+        if !today_path.exists() {
+            Self::append_entry_to_file(
+                &today_path,
+                &Self::to_entry(&session.messages[0], None),
+            )?;
+        }
 
-        session
+        Ok(session)
     }
 
     fn to_entry(message: &ChatMessage, meta: Option<&TurnMeta>) -> SessionEntry {
@@ -325,11 +261,13 @@ impl Session {
     }
 
     /// Get total token count from provider metadata.
+    #[allow(dead_code)]
     pub fn total_tokens(&self) -> u64 {
         self.total_tokens
     }
 
     /// List available session files.
+    #[allow(dead_code)]
     pub fn list_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
         if !sessions_dir.exists() {
             return Ok(Vec::new());
@@ -373,7 +311,7 @@ mod tests {
     #[test]
     fn append_user_message_writes_jsonl_line() {
         let dir = temp_sessions_dir("user_msg");
-        let mut session = Session::new("You are helpful.", &dir);
+        let mut session = Session::new("You are helpful.", &dir).unwrap();
 
         session.add_user_message("hello").unwrap();
 
@@ -396,7 +334,7 @@ mod tests {
     #[test]
     fn append_assistant_message_includes_meta() {
         let dir = temp_sessions_dir("asst_meta");
-        let mut session = Session::new("You are helpful.", &dir);
+        let mut session = Session::new("You are helpful.", &dir).unwrap();
 
         let meta = TurnMeta {
             model: Some("gpt-5.3".to_string()),
@@ -434,7 +372,7 @@ mod tests {
     #[test]
     fn today_path_is_date_based_jsonl() {
         let dir = temp_sessions_dir("path_format");
-        let session = Session::new("test", &dir);
+        let session = Session::new("test", &dir).unwrap();
         let path = session.today_path();
 
         let filename = path.file_name().unwrap().to_str().unwrap();
@@ -455,7 +393,7 @@ mod tests {
 
         // Write a session
         {
-            let mut session = Session::new("You are helpful.", &dir);
+            let mut session = Session::new("You are helpful.", &dir).unwrap();
             session.add_user_message("first message").unwrap();
             session
                 .append(ChatMessage::user("second message"), None)
@@ -464,7 +402,7 @@ mod tests {
 
         // Load it in a new session
         {
-            let mut session = Session::new("You are helpful.", &dir);
+            let mut session = Session::new("You are helpful.", &dir).unwrap();
             session.load_today().unwrap();
 
             let history = session.history();
@@ -478,7 +416,7 @@ mod tests {
     #[test]
     fn load_today_with_no_file_is_ok() {
         let dir = temp_sessions_dir("no_file");
-        let mut session = Session::new("You are helpful.", &dir);
+        let mut session = Session::new("You are helpful.", &dir).unwrap();
 
         // Should not error — just starts empty
         session.load_today().unwrap();
@@ -492,7 +430,7 @@ mod tests {
     #[test]
     fn total_tokens_accumulates_from_meta() {
         let dir = temp_sessions_dir("token_count");
-        let mut session = Session::new("test", &dir);
+        let mut session = Session::new("test", &dir).unwrap();
 
         let meta1 = TurnMeta {
             input_tokens: Some(50),
@@ -522,7 +460,7 @@ mod tests {
     #[test]
     fn trim_drops_oldest_non_system_messages() {
         let dir = temp_sessions_dir("trim");
-        let mut session = Session::new("system prompt", &dir);
+        let mut session = Session::new("system prompt", &dir).unwrap();
         // Set a very low limit to force trimming
         session.max_context_tokens = 50;
 
@@ -559,7 +497,7 @@ mod tests {
 
         // Write a session with reasoning trace
         {
-            let mut session = Session::new("system", &dir);
+            let mut session = Session::new("system", &dir).unwrap();
             session.add_user_message("think hard").unwrap();
             session
                 .append(
@@ -574,7 +512,7 @@ mod tests {
 
         // Verify trace is in the file
         let content = fs::read_to_string({
-            let s = Session::new("system", &dir);
+            let s = Session::new("system", &dir).unwrap();
             s.today_path()
         })
         .unwrap();
@@ -582,7 +520,7 @@ mod tests {
 
         // Load session — reasoning trace should NOT be in the messages
         {
-            let mut session = Session::new("system", &dir);
+            let mut session = Session::new("system", &dir).unwrap();
             session.load_today().unwrap();
 
             // The assistant message content should NOT contain the reasoning trace

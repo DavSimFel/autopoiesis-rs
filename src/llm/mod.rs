@@ -1,9 +1,29 @@
 //! Shared message and provider abstractions for LLM backends.
+#![allow(async_fn_in_trait)]
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::session::TurnMeta;
+
+/// Metadata returned by the provider for a single completion.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TurnMeta {
+    /// Model that produced this turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Tokens consumed by input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Tokens produced as output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// Tokens used for reasoning (not injectable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    /// Reasoning trace text (saved but never re-injected).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_trace: Option<String>,
+}
 
 pub mod openai;
 
