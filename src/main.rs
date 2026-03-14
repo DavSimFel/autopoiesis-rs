@@ -74,10 +74,10 @@ async fn main() -> Result<()> {
             let config = config::Config::load("agents.toml")
                 .map_err(|error| anyhow!("failed to load configuration: {error}"))?;
 
-            let mut session = session::Session::new("You are a helpful assistant.", "sessions")?;
+            let mut session = session::Session::new("sessions")?;
             session.load_today()?;
             let provider_config = config.clone();
-            let pipeline = default_pipeline(&config);
+            let mut pipeline = default_pipeline(&config);
 
             // Build a fresh provider per turn so the auth token can be refreshed mid-session.
             let mut provider_factory = move || {
@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
                         &mut provider_factory,
                         &mut session,
                         prompt.to_string(),
-                        &pipeline,
+                        &mut pipeline,
                     )
                     .await?;
                     println!();
@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
                     &mut provider_factory,
                     &mut session,
                     cli.prompt.join(" "),
-                    &pipeline,
+                    &mut pipeline,
                 )
                 .await?;
             }
@@ -154,7 +154,7 @@ fn default_pipeline(config: &config::Config) -> gate::Pipeline {
 
     gate::Pipeline::new()
         .assemble(gate::IdentityGate::new("identity", vars, &config.system_prompt))
-        .enrich(gate::TimestampGate)
+        .context(gate::HistoryGate::new(100_000))
         .sanitize(gate::SecretRedactor::new(&[
             r"sk-[a-zA-Z0-9_-]{20,}",
             r"ghp_[a-zA-Z0-9]{36}",

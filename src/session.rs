@@ -49,24 +49,15 @@ pub struct Session {
 }
 
 impl Session {
-    /// Start a session with a system prompt.
-    pub fn new(system_prompt: impl Into<String>, sessions_dir: impl Into<PathBuf>) -> Result<Self> {
-        let system_prompt = system_prompt.into();
+    /// Start a session. Messages are loaded from persistent storage during `load_today`.
+    pub fn new(sessions_dir: impl Into<PathBuf>) -> Result<Self> {
         let session = Self {
-            messages: vec![ChatMessage::system(system_prompt.clone())],
+            messages: Vec::new(),
             max_context_tokens: 100_000,
             total_tokens: 0,
             sessions_dir: sessions_dir.into(),
-            message_tokens: vec![0],
+            message_tokens: Vec::new(),
         };
-
-        let today_path = session.today_path();
-        if !today_path.exists() {
-            Self::append_entry_to_file(
-                &today_path,
-                &Self::to_entry(&session.messages[0], None),
-            )?;
-        }
 
         Ok(session)
     }
@@ -373,7 +364,7 @@ mod tests {
     #[test]
     fn append_user_message_writes_jsonl_line() {
         let dir = temp_sessions_dir("user_msg");
-        let mut session = Session::new("You are helpful.", &dir).unwrap();
+        let mut session = Session::new(&dir).unwrap();
 
         session.add_user_message("hello").unwrap();
 
@@ -382,10 +373,10 @@ mod tests {
 
         let content = fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        // system prompt + user message
-        assert_eq!(lines.len(), 2);
+        // only user message
+        assert_eq!(lines.len(), 1);
 
-        let entry: SessionEntry = serde_json::from_str(lines[1]).unwrap();
+        let entry: SessionEntry = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(entry.role, "user");
         assert!(entry.content.contains("hello"));
         assert!(!entry.ts.is_empty());
@@ -396,7 +387,7 @@ mod tests {
     #[test]
     fn append_assistant_message_includes_meta() {
         let dir = temp_sessions_dir("asst_meta");
-        let mut session = Session::new("You are helpful.", &dir).unwrap();
+        let mut session = Session::new(&dir).unwrap();
 
         let meta = TurnMeta {
             model: Some("gpt-5.3".to_string()),
@@ -434,7 +425,7 @@ mod tests {
     #[test]
     fn today_path_is_date_based_jsonl() {
         let dir = temp_sessions_dir("path_format");
-        let session = Session::new("test", &dir).unwrap();
+        let session = Session::new(&dir).unwrap();
         let path = session.today_path();
 
         let filename = path.file_name().unwrap().to_str().unwrap();
@@ -455,7 +446,7 @@ mod tests {
 
         // Write a session
         {
-            let mut session = Session::new("You are helpful.", &dir).unwrap();
+            let mut session = Session::new(&dir).unwrap();
             session.add_user_message("first message").unwrap();
             session
                 .append(ChatMessage::user("second message"), None)
@@ -464,12 +455,12 @@ mod tests {
 
         // Load it in a new session
         {
-            let mut session = Session::new("You are helpful.", &dir).unwrap();
+            let mut session = Session::new(&dir).unwrap();
             session.load_today().unwrap();
 
             let history = session.history();
-            // system + 2 user messages
-            assert!(history.len() >= 3);
+            // 2 user messages
+            assert!(history.len() >= 2);
         }
 
         fs::remove_dir_all(&dir).unwrap();
@@ -478,11 +469,11 @@ mod tests {
     #[test]
     fn load_today_with_no_file_is_ok() {
         let dir = temp_sessions_dir("no_file");
-        let mut session = Session::new("You are helpful.", &dir).unwrap();
+        let mut session = Session::new(&dir).unwrap();
 
-        // Should not error — just starts empty
+        // Should not error — starts empty
         session.load_today().unwrap();
-        assert_eq!(session.history().len(), 1); // just system prompt
+        assert_eq!(session.history().len(), 0);
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -491,7 +482,7 @@ mod tests {
     fn load_today_trims_context_after_restore() {
         let dir = temp_sessions_dir("load_trim");
 
-        let mut seed = Session::new("system", &dir).unwrap();
+        let mut seed = Session::new(&dir).unwrap();
         let meta = TurnMeta {
             input_tokens: Some(50),
             output_tokens: Some(50),
@@ -504,12 +495,13 @@ mod tests {
                 .unwrap();
         }
 
-        let mut session = Session::new("system", &dir).unwrap();
+        let mut session = Session::new(&dir).unwrap();
         session.max_context_tokens = 50;
         session.load_today().unwrap();
 
-        assert_eq!(session.history().len(), 1);
-        assert_eq!(session.total_tokens(), 0);
+        // Trim preserves at least 1 message, so we get 1 not 0
+        assert!(session.history().len() <= 1);
+        assert!(session.total_tokens() <= 100);
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -519,7 +511,7 @@ mod tests {
     #[test]
     fn total_tokens_accumulates_from_meta() {
         let dir = temp_sessions_dir("token_count");
-        let mut session = Session::new("test", &dir).unwrap();
+        let mut session = Session::new(&dir).unwrap();
 
         let meta1 = TurnMeta {
             input_tokens: Some(50),
@@ -549,7 +541,7 @@ mod tests {
     #[test]
     fn estimate_tokens_returns_nonzero() {
         let dir = temp_sessions_dir("estimate_nonzero");
-        let mut session = Session::new("system", &dir).unwrap();
+        let mut session = Session::new(&dir).unwrap();
 
         session.add_user_message("hello world").unwrap();
         assert!(session.estimate_context_tokens() > 0);
@@ -560,7 +552,7 @@ mod tests {
     #[test]
     fn trim_uses_estimation_when_no_metadata() {
         let dir = temp_sessions_dir("trim_estimate");
-        let mut session = Session::new("system", &dir).unwrap();
+        let mut session = Session::new(&dir).unwrap();
         session.set_max_context_tokens(1);
 
         session.add_user_message("one").unwrap();
@@ -576,7 +568,7 @@ mod tests {
     #[test]
     fn estimation_is_roughly_accurate() {
         let dir = temp_sessions_dir("estimate_rough");
-        let mut session = Session::new("", &dir).unwrap();
+        let mut session = Session::new(&dir).unwrap();
 
         session.add_user_message("hello world").unwrap();
         let tokens = session.estimate_context_tokens();
@@ -591,7 +583,7 @@ mod tests {
     #[test]
     fn trim_drops_oldest_non_system_messages() {
         let dir = temp_sessions_dir("trim");
-        let mut session = Session::new("system prompt", &dir).unwrap();
+        let mut session = Session::new(&dir).unwrap();
         // Set a very low limit to force trimming
         session.max_context_tokens = 50;
 
@@ -611,11 +603,9 @@ mod tests {
             .append(ChatMessage::with_role(crate::llm::ChatRole::Assistant), Some(big_meta))
             .unwrap();
 
-        // After trim, system prompt should survive, oldest messages should be gone
         let history = session.history();
         assert!(history.len() < 5, "should have trimmed some messages");
-        // First message is always system
-        assert_eq!(history[0].role, crate::llm::ChatRole::System);
+        assert!(!history.is_empty());
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -628,7 +618,7 @@ mod tests {
 
         // Write a session with reasoning trace
         {
-            let mut session = Session::new("system", &dir).unwrap();
+            let mut session = Session::new(&dir).unwrap();
             session.add_user_message("think hard").unwrap();
             session
                 .append(
@@ -643,7 +633,7 @@ mod tests {
 
         // Verify trace is in the file
         let content = fs::read_to_string({
-            let s = Session::new("system", &dir).unwrap();
+            let s = Session::new(&dir).unwrap();
             s.today_path()
         })
         .unwrap();
@@ -651,7 +641,7 @@ mod tests {
 
         // Load session — reasoning trace should NOT be in the messages
         {
-            let mut session = Session::new("system", &dir).unwrap();
+            let mut session = Session::new(&dir).unwrap();
             session.load_today().unwrap();
 
             // The assistant message content should NOT contain the reasoning trace

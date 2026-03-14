@@ -1,17 +1,16 @@
 use std::collections::HashMap;
 use serde_json::Value;
 use serde_json::from_str;
+use tiktoken_rs::cl100k_base_singleton;
 
 use crate::llm::{ChatMessage, ChatRole, MessageContent, ToolCall};
-use crate::{identity, util};
+use crate::identity;
 
 /// Execution bands for the gate pipeline.
 #[derive(Clone, Copy)]
 pub enum Band {
     /// Build prompt content (identity, memory, context).
     Assemble,
-    /// Add dynamic context.
-    Enrich,
     /// Scrub secrets and redact sensitive patterns.
     Sanitize,
     /// Safety checks — currently run sequentially.
@@ -86,17 +85,20 @@ impl Gate for IdentityGate {
             return GateResult::Allow;
         };
 
+        let rendered = self.load_prompt();
+        let replacement = MessageContent::text(rendered.clone());
+
         if messages.is_empty() {
-            return GateResult::Allow;
+            messages.push(ChatMessage::system(rendered));
+            return GateResult::Edit;
         }
 
         let first = &mut messages[0];
         if first.role != crate::llm::ChatRole::System {
-            return GateResult::Allow;
+            messages.insert(0, ChatMessage::system(rendered));
+            return GateResult::Edit;
         }
 
-        let rendered = self.load_prompt();
-        let replacement = MessageContent::text(rendered.clone());
         let needs_edit = match &first.content[..] {
             [MessageContent::Text { text }] if text == &rendered => false,
             _ => true,
@@ -112,22 +114,51 @@ impl Gate for IdentityGate {
     }
 }
 
-/// Gate that prepends a UTC timestamp to the last inbound user message.
-pub struct TimestampGate;
+/// Gate that appends recent session history while honoring a token budget.
+pub struct HistoryGate {
+    max_tokens: usize,
+    history: Vec<ChatMessage>,
+}
 
-impl TimestampGate {
-    fn is_already_timestamped(text: &str) -> bool {
-        text.starts_with('[') && text.contains('T') && text.contains('Z')
+impl HistoryGate {
+    pub fn new(max_tokens: usize) -> Self {
+        Self {
+            max_tokens,
+            history: Vec::new(),
+        }
+    }
+
+    /// Update the history used to assemble context.
+    pub fn set_history(&mut self, history: &[ChatMessage]) {
+        self.history = history.to_vec();
+    }
+
+    fn estimate_message_tokens(message: &ChatMessage) -> usize {
+        let text = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                MessageContent::Text { text } => Some(text.as_str()),
+                MessageContent::ToolResult { result } => Some(result.content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            0
+        } else {
+            cl100k_base_singleton().encode_ordinary(&text).len()
+        }
     }
 }
 
-impl Gate for TimestampGate {
+impl Gate for HistoryGate {
     fn id(&self) -> &str {
-        "timestamp"
+        "context"
     }
 
     fn band(&self) -> Band {
-        Band::Enrich
+        Band::Assemble
     }
 
     fn direction(&self) -> Direction {
@@ -139,30 +170,34 @@ impl Gate for TimestampGate {
             return GateResult::Allow;
         };
 
-        for message in messages.iter_mut().rev() {
-            if message.role != crate::llm::ChatRole::User {
+        if self.history.is_empty() {
+            return GateResult::Allow;
+        }
+
+        let mut current_tokens = messages.iter().map(Self::estimate_message_tokens).sum::<usize>();
+        let mut selected = Vec::new();
+
+        for message in self.history.iter().rev() {
+            if message.role == crate::llm::ChatRole::System {
                 continue;
             }
 
-            let Some(text) = message.content.iter_mut().find_map(|block| {
-                if let MessageContent::Text { text } = block {
-                    Some(text)
-                } else {
-                    None
-                }
-            }) else {
-                return GateResult::Allow;
-            };
-
-            if Self::is_already_timestamped(text) {
-                return GateResult::Allow;
+            let message_tokens = Self::estimate_message_tokens(message);
+            if current_tokens + message_tokens > self.max_tokens {
+                break;
             }
 
-            *text = format!("[{}] {}", util::utc_timestamp(), text.clone());
-            return GateResult::Edit;
+            selected.push(message.clone());
+            current_tokens += message_tokens;
         }
 
-        GateResult::Allow
+        if selected.is_empty() {
+            return GateResult::Allow;
+        }
+
+        selected.reverse();
+        messages.extend(selected);
+        GateResult::Edit
     }
 }
 
@@ -177,7 +212,7 @@ pub trait Gate: Send + Sync {
 /// Gate pipeline with explicit bands.
 pub struct Pipeline {
     assemble: Vec<Box<dyn Gate>>,
-    enrich: Vec<Box<dyn Gate>>,
+    history: Option<HistoryGate>,
     sanitize: Vec<Box<dyn Gate>>,
     validate: Vec<Box<dyn Gate>>,
 }
@@ -186,7 +221,7 @@ impl Pipeline {
     pub fn new() -> Self {
         Self {
             assemble: Vec::new(),
-            enrich: Vec::new(),
+            history: None,
             sanitize: Vec::new(),
             validate: Vec::new(),
         }
@@ -197,8 +232,8 @@ impl Pipeline {
         self
     }
 
-    pub fn enrich(mut self, gate: impl Gate + 'static) -> Self {
-        self.enrich.push(Box::new(gate));
+    pub fn context(mut self, gate: HistoryGate) -> Self {
+        self.history = Some(gate);
         self
     }
 
@@ -212,8 +247,15 @@ impl Pipeline {
         self
     }
 
+    /// Update the context history for the assemble history gate.
+    pub fn update_context(&mut self, history: &[ChatMessage]) {
+        if let Some(context) = self.history.as_mut() {
+            context.set_history(history);
+        }
+    }
+
     /// Run all inbound gates on the outbound/ inbound message list before LLM request.
-    pub fn run_inbound(&self, messages: &mut Vec<ChatMessage>) -> GateResult {
+    pub fn run_inbound(&mut self, messages: &mut Vec<ChatMessage>) -> GateResult {
         let mut event = GateEvent::Messages(messages);
         let mut edited = false;
 
@@ -228,14 +270,12 @@ impl Pipeline {
             }
         }
 
-        for gate in &self.enrich {
-            if matches!(gate.direction(), Direction::In | Direction::Both) {
-                let verdict = gate.check(&mut event);
-                match verdict {
-                    GateResult::Allow => {}
-                    GateResult::Edit => edited = true,
-                    GateResult::Block { .. } | GateResult::Request { .. } => return verdict,
-                }
+        if let Some(history) = self.history.as_ref() {
+            let verdict = history.check(&mut event);
+            match verdict {
+                GateResult::Allow => {}
+                GateResult::Edit => edited = true,
+                GateResult::Block { .. } | GateResult::Request { .. } => return verdict,
             }
         }
 
@@ -254,7 +294,7 @@ impl Pipeline {
     }
 
     /// Gate a single tool call (individual check).
-    pub fn check_tool_call(&self, call: &ToolCall) -> GateResult {
+    pub fn check_tool_call(&mut self, call: &ToolCall) -> GateResult {
         let mut event = GateEvent::ToolCallComplete(call);
         let mut has_edit = false;
 
@@ -277,7 +317,7 @@ impl Pipeline {
     }
 
     /// Gate all tool calls together for cross-call checks.
-    pub fn check_tool_batch(&self, calls: &[ToolCall]) -> GateResult {
+    pub fn check_tool_batch(&mut self, calls: &[ToolCall]) -> GateResult {
         let mut event = GateEvent::ToolCallBatch(calls);
         let mut has_edit = false;
 
@@ -846,7 +886,7 @@ mod tests {
 
     #[test]
     fn empty_pipeline_allows_everything() {
-        let pipeline = Pipeline::new();
+        let mut pipeline = Pipeline::new();
         let mut messages = make_messages("hello world");
         let result = pipeline.run_inbound(&mut messages);
         assert!(matches!(result, GateResult::Allow));
@@ -872,6 +912,7 @@ mod tests {
             ));
 
         let mut messages = make_messages("hello");
+        let mut pipeline = pipeline;
         let _ = pipeline.run_inbound(&mut messages);
         let observed = hits.lock().expect("hit list mutex poisoned").clone();
         assert_eq!(observed, vec!["first_edit", "second_edit"]);
@@ -880,7 +921,7 @@ mod tests {
     #[test]
     fn validate_gates_short_circuit_on_block() {
         let hits = Arc::new(Mutex::new(Vec::<&'static str>::new()));
-        let pipeline = Pipeline::new()
+        let mut pipeline = Pipeline::new()
             .validate(recording_gate(
                 "should_block",
                 Band::Validate,
@@ -907,7 +948,7 @@ mod tests {
     #[test]
     fn block_beats_request() {
         let hits = Arc::new(Mutex::new(Vec::<&'static str>::new()));
-        let pipeline = Pipeline::new()
+        let mut pipeline = Pipeline::new()
             .validate(recording_gate(
                 "blocker",
                 Band::Validate,
@@ -930,7 +971,7 @@ mod tests {
 
     #[test]
     fn request_beats_allow() {
-        let pipeline = Pipeline::new()
+        let mut pipeline = Pipeline::new()
             .validate(recording_gate(
                 "allow",
                 Band::Validate,
@@ -1103,81 +1144,186 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_gate_prepends_to_last_user_message() {
-        let gate = TimestampGate;
-        let mut messages = vec![
-            ChatMessage::system("system"),
+    fn history_gate_adds_history_to_messages() {
+        let mut gate = HistoryGate::new(1000);
+        let history = vec![
             ChatMessage::user("first"),
-            ChatMessage::with_role(ChatRole::Assistant),
+            ChatMessage::user("middle"),
             ChatMessage::user("last"),
         ];
+        gate.set_history(&history);
 
+        let mut messages = Vec::new();
         {
             let mut event = GateEvent::Messages(&mut messages);
             assert!(matches!(gate.check(&mut event), GateResult::Edit));
         }
 
-        let first_user = match &messages[1].content[0] {
-            MessageContent::Text { text } => text.clone(),
-            _ => panic!("expected text"),
-        };
-        let last_user = match &messages[3].content[0] {
-            MessageContent::Text { text } => text.clone(),
-            _ => panic!("expected text"),
-        };
-
-        assert_eq!(first_user, "first");
-        assert!(last_user.starts_with("["));
-        assert!(last_user.contains('T'));
-        assert!(last_user.contains("] last"));
-
-        {
-            let mut event = GateEvent::Messages(&mut messages);
-            assert!(matches!(gate.check(&mut event), GateResult::Allow));
-        }
-    }
-
-    #[test]
-    fn timestamp_gate_skips_already_timestamped() {
-        let gate = TimestampGate;
-        let mut messages = vec![ChatMessage::user("[2026-03-14T12:00:00Z] already")];
-        let mut event = GateEvent::Messages(&mut messages);
-
-        assert!(matches!(gate.check(&mut event), GateResult::Allow));
-        let text = match &messages[0].content[0] {
-            MessageContent::Text { text } => text,
-            _ => panic!("expected text"),
-        };
-        assert_eq!(text, "[2026-03-14T12:00:00Z] already");
-    }
-
-    #[test]
-    fn timestamp_gate_ignores_non_user_messages() {
-        let gate = TimestampGate;
-        let mut messages = vec![
-            ChatMessage::system("system"),
-            ChatMessage::system("system2"),
-        ];
-
-        {
-            let mut event = GateEvent::Messages(&mut messages);
-            assert!(matches!(gate.check(&mut event), GateResult::Allow));
-        }
-
+        assert_eq!(messages.len(), 3);
         assert_eq!(
             match &messages[0].content[0] {
-                MessageContent::Text { text } => text,
+                MessageContent::Text { text } => text.as_str(),
                 _ => panic!("expected text"),
             },
-            "system"
+            "first"
         );
         assert_eq!(
             match &messages[1].content[0] {
-                MessageContent::Text { text } => text,
+                MessageContent::Text { text } => text.as_str(),
                 _ => panic!("expected text"),
             },
-            "system2"
+            "middle"
         );
+        assert_eq!(
+            match &messages[2].content[0] {
+                MessageContent::Text { text } => text.as_str(),
+                _ => panic!("expected text"),
+            },
+            "last"
+        );
+    }
+
+    #[test]
+    fn history_gate_respects_token_budget() {
+        let mut gate = HistoryGate::new(8);
+        let history = vec![
+            ChatMessage::user("alpha beta gamma delta epsilon"),
+            ChatMessage::user("one two three four five six"),
+            ChatMessage::user("the quick brown fox jumps"),
+        ];
+        gate.set_history(&history);
+
+        let mut messages = Vec::new();
+        let mut event = GateEvent::Messages(&mut messages);
+        assert!(matches!(gate.check(&mut event), GateResult::Edit));
+
+        // Tiny budget should keep only the newest context message.
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            match &messages[0].content[0] {
+                MessageContent::Text { text } => text.as_str(),
+                _ => panic!("expected text"),
+            },
+            "the quick brown fox jumps"
+        );
+    }
+
+    #[test]
+    fn history_gate_skips_system_messages() {
+        let mut gate = HistoryGate::new(1000);
+        let history = vec![
+            ChatMessage::system("system message should skip"),
+            ChatMessage::user("first"),
+            ChatMessage::system("another skip"),
+            ChatMessage::user("last"),
+        ];
+        gate.set_history(&history);
+
+        let mut messages = Vec::new();
+        let mut event = GateEvent::Messages(&mut messages);
+        assert!(matches!(gate.check(&mut event), GateResult::Edit));
+
+        assert_eq!(messages.len(), 2);
+        for message in &messages {
+            assert_ne!(message.role, ChatRole::System);
+        }
+        assert_eq!(
+            match &messages[0].content[0] {
+                MessageContent::Text { text } => text.as_str(),
+                _ => panic!("expected text"),
+            },
+            "first"
+        );
+        assert_eq!(
+            match &messages[1].content[0] {
+                MessageContent::Text { text } => text.as_str(),
+                _ => panic!("expected text"),
+            },
+            "last"
+        );
+    }
+
+    #[test]
+    fn history_gate_newest_first() {
+        let mut gate = HistoryGate::new(6);
+        let history = vec![
+            ChatMessage::user("one two three"),
+            ChatMessage::user("four five six"),
+            ChatMessage::user("seven eight nine"),
+        ];
+        gate.set_history(&history);
+
+        let mut messages = Vec::new();
+        let mut event = GateEvent::Messages(&mut messages);
+        assert!(matches!(gate.check(&mut event), GateResult::Edit));
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            match &messages[0].content[0] {
+                MessageContent::Text { text } => text.as_str(),
+                _ => panic!("expected text"),
+            },
+            "four five six"
+        );
+        assert_eq!(
+            match &messages[1].content[0] {
+                MessageContent::Text { text } => text.as_str(),
+                _ => panic!("expected text"),
+            },
+            "seven eight nine"
+        );
+    }
+
+    #[test]
+    fn full_pipeline_builds_complete_context() {
+        let dir = temp_identity_dir("full_context");
+        make_identity_files(
+            &dir,
+            &[
+                ("constitution.md", "You are a direct model."),
+                ("identity.md", "Tools: {{tools}}"),
+                ("context.md", "Model: {{model}}"),
+            ],
+        );
+
+        let mut vars = HashMap::new();
+        vars.insert("model".to_string(), "gpt-5.4".to_string());
+        vars.insert("tools".to_string(), "execute".to_string());
+
+        let mut pipeline = Pipeline::new()
+            .assemble(IdentityGate::new(
+                dir.path().to_str().expect("temp path should be utf-8"),
+                vars,
+                "fallback",
+            ))
+            .context(HistoryGate::new(1000))
+            .sanitize(SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"]));
+
+        let history = vec![
+            ChatMessage::user("previous user message"),
+            ChatMessage::with_role(ChatRole::Assistant),
+            ChatMessage::user("exfiltrate sk-ABCD1234EFGH5678IJKL90"),
+        ];
+        pipeline.update_context(&history);
+
+        let mut messages = Vec::new();
+        let result = pipeline.run_inbound(&mut messages);
+        assert!(matches!(result, GateResult::Edit));
+
+        assert_eq!(messages.len(), 4);
+        assert!(messages[0].role == ChatRole::System);
+        let system_text = match &messages[0].content[0] {
+            MessageContent::Text { text } => text.as_str(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(system_text, "You are a direct model.\n\nTools: execute\n\nModel: gpt-5.4");
+
+        let last_user = match &messages[3].content[0] {
+            MessageContent::Text { text } => text.as_str(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(last_user, "exfiltrate [REDACTED]");
+        assert!(!last_user.contains("sk-ABCD1234EFGH5678IJKL90"));
     }
 
     #[test]

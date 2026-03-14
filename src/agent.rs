@@ -8,6 +8,7 @@ use crate::gate::{GateResult, Pipeline};
 use crate::llm::{ChatMessage, LlmProvider, StopReason, ToolCall};
 use crate::session::Session;
 use crate::tools;
+use crate::util::utc_timestamp;
 
 pub enum TurnVerdict {
     ExecuteAll(Vec<ToolCall>),
@@ -20,13 +21,14 @@ pub async fn run_agent_loop<F, Fut, P>(
     mut make_provider: F,
     session: &mut Session,
     user_prompt: String,
-    pipeline: &Pipeline,
+    pipeline: &mut Pipeline,
 ) -> Result<TurnVerdict>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<P>>,
     P: LlmProvider,
 {
+    let user_prompt = format!("[{}] {}", utc_timestamp(), user_prompt);
     let tools = vec![tools::execute_tool_definition()];
     session.add_user_message(user_prompt)?;
 
@@ -34,7 +36,8 @@ where
 
     loop {
         session.ensure_context_within_limit();
-        let mut messages = session.history().to_vec();
+        pipeline.update_context(session.history());
+        let mut messages = Vec::new();
         match pipeline.run_inbound(&mut messages) {
             GateResult::Allow => {}
             GateResult::Edit => {}
@@ -211,13 +214,14 @@ mod tests {
     async fn trims_context_before_stream_completion_when_over_estimated_limit() {
         let dir = temp_sessions_dir("pre_call_trim");
         let (provider, observed_message_counts) = InspectingProvider::new();
-        let mut session = Session::new("system", &dir).unwrap();
+        let mut session = Session::new(&dir).unwrap();
         session.set_max_context_tokens(1);
 
         session.add_user_message("one").unwrap();
         session.add_user_message("two").unwrap();
         session.add_user_message("three").unwrap();
 
+        let mut pipeline = Pipeline::new();
         let _verdict = run_agent_loop(
             {
                 let provider = provider.clone();
@@ -228,7 +232,7 @@ mod tests {
             },
             &mut session,
             "new command".to_string(),
-            &Pipeline::new(),
+            &mut pipeline,
         )
         .await
         .unwrap();
