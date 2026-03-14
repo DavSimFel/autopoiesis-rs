@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::llm::{ChatMessage, ChatRole, MessageContent};
 
 /// Metadata returned by the provider for a single completion.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TurnMeta {
     /// Model that produced this turn.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -159,11 +159,11 @@ impl Session {
                 .iter()
                 .find_map(|block| match block {
                     MessageContent::ToolResult { result } => {
-                        Some((result.tool_call_id.clone(), result.name.clone()))
+                        Some((Some(result.tool_call_id.clone()), Some(result.name.clone())))
                     }
                     _ => None,
                 })
-                .unwrap_or_default(),
+                .unwrap_or((None, None)),
             _ => (None, None),
         };
 
@@ -440,7 +440,7 @@ mod tests {
         let filename = path.file_name().unwrap().to_str().unwrap();
         // Format: YYYY-MM-DD.jsonl
         assert!(filename.ends_with(".jsonl"));
-        assert_eq!(filename.len(), 15); // 2026-03-14.jsonl
+        assert_eq!(filename.len(), 16); // 2026-03-14.jsonl
         assert_eq!(&filename[4..5], "-");
         assert_eq!(&filename[7..8], "-");
 
