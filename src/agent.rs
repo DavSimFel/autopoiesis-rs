@@ -6,7 +6,16 @@ use crate::llm::{ChatMessage, LlmProvider, StopReason};
 use crate::session::Session;
 use crate::tools;
 
-pub async fn run_agent_loop<P: LlmProvider>(provider: &P, session: &mut Session, user_prompt: String) -> Result<()> {
+pub async fn run_agent_loop<F, Fut, P>(
+    mut make_provider: F,
+    session: &mut Session,
+    user_prompt: String,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<P>>,
+    P: LlmProvider,
+{
     let tools = vec![tools::execute_tool_definition()];
 
     session.add_user_message(user_prompt);
@@ -18,6 +27,8 @@ pub async fn run_agent_loop<P: LlmProvider>(provider: &P, session: &mut Session,
                 eprintln!("failed to flush stdout: {err}");
             }
         };
+
+        let provider = make_provider().await?;
 
         let turn = provider
             .stream_completion(session.history(), &tools, &mut on_token)
