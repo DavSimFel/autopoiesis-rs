@@ -243,6 +243,20 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
     }
 }
 
+fn upsert_tool_call(
+    tool_calls: &mut Vec<(String, String, String)>,
+    call_id: String,
+    name: String,
+    arguments: String,
+) {
+    if let Some((_, existing_name, existing_args)) = tool_calls.iter_mut().find(|(id, _, _)| id == &call_id) {
+        *existing_name = name;
+        *existing_args = arguments;
+    } else {
+        tool_calls.push((call_id, name, arguments));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +296,146 @@ mod tests {
         }
 
         (tokens, done)
+    }
+
+    fn collect_tool_calls_from_events(events: Vec<SseEvent>) -> Vec<ToolCall> {
+        let mut current_call_id = None;
+        let mut pending_calls: HashMap<String, (Option<String>, String)> = HashMap::new();
+        let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+
+        for event in events {
+            match event {
+                SseEvent::FunctionCallArgumentsDelta { call_id, name, delta } => {
+                    let call_id = match call_id {
+                        Some(id) => {
+                            current_call_id = Some(id.clone());
+                            id
+                        }
+                        None => match current_call_id.clone() {
+                            Some(id) => id,
+                            None => continue,
+                        },
+                    };
+
+                    let entry = pending_calls.entry(call_id).or_insert((None, String::new()));
+                    if let Some(tool_name) = name {
+                        entry.0 = Some(tool_name);
+                    }
+
+                    if let Some(delta) = delta {
+                        entry.1.push_str(&delta);
+                    }
+                }
+                SseEvent::FunctionCallArgumentsDone { call_id, name, arguments } => {
+                    let call_id = call_id.or_else(|| current_call_id.clone()).unwrap_or_else(|| "unknown".to_string());
+                    let mut entry = pending_calls.remove(&call_id).unwrap_or((None, String::new()));
+                    if let Some(tool_name) = name {
+                        entry.0 = Some(tool_name);
+                    }
+                    let arguments = arguments.unwrap_or(entry.1);
+
+                    upsert_tool_call(
+                        &mut tool_calls,
+                        call_id,
+                        entry.0.unwrap_or_else(|| "unknown".to_string()),
+                        arguments,
+                    );
+                }
+                SseEvent::FunctionCallOutputItemDone { call_id, name, arguments } => {
+                    let mut arguments = arguments;
+                    if let Some((_, pending_args)) = pending_calls.remove(&call_id) {
+                        if arguments.is_empty() {
+                            arguments = pending_args;
+                        }
+                    }
+                    upsert_tool_call(
+                        &mut tool_calls,
+                        call_id,
+                        name,
+                        arguments,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        tool_calls
+            .into_iter()
+            .map(|(id, name, arguments)| ToolCall {
+                id,
+                name,
+                arguments,
+            })
+            .collect()
+    }
+
+    fn sse_event(line: &str) -> SseEvent {
+        parse_sse_line(line).expect("valid SSE test event")
+    }
+
+    #[test]
+    fn function_call_order_is_preserved() {
+        let events = vec![
+            sse_event(
+                "data: {\"type\":\"response.function_call_arguments.done\",\"call_id\":\"call_1\",\"name\":\"first\",\"arguments\":\"{\\\"a\\\":1}\"}",
+            ),
+            sse_event(
+                "data: {\"type\":\"response.function_call_arguments.done\",\"call_id\":\"call_2\",\"name\":\"second\",\"arguments\":\"{\\\"b\\\":2}\"}",
+            ),
+            sse_event(
+                "data: {\"type\":\"response.function_call_arguments.done\",\"call_id\":\"call_3\",\"name\":\"third\",\"arguments\":\"{\\\"c\\\":3}\"}",
+            ),
+        ];
+        let calls = collect_tool_calls_from_events(events);
+
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "first");
+        assert_eq!(calls[1].id, "call_2");
+        assert_eq!(calls[1].name, "second");
+        assert_eq!(calls[2].id, "call_3");
+        assert_eq!(calls[2].name, "third");
+    }
+
+    #[test]
+    fn function_calls_interleaved_deltas_are_kept_isolated() {
+        let events = vec![
+            SseEvent::FunctionCallArgumentsDelta {
+                call_id: Some("call_1".to_string()),
+                name: Some("first".to_string()),
+                delta: Some("{\"a\":".to_string()),
+            },
+            SseEvent::FunctionCallArgumentsDelta {
+                call_id: Some("call_2".to_string()),
+                name: Some("second".to_string()),
+                delta: Some("{\"b\":".to_string()),
+            },
+            SseEvent::FunctionCallArgumentsDelta {
+                call_id: Some("call_1".to_string()),
+                name: None,
+                delta: Some("1}".to_string()),
+            },
+            SseEvent::FunctionCallArgumentsDone {
+                call_id: Some("call_1".to_string()),
+                name: None,
+                arguments: None,
+            },
+            SseEvent::FunctionCallArgumentsDone {
+                call_id: Some("call_2".to_string()),
+                name: None,
+                arguments: Some("{\"b\":2}".to_string()),
+            },
+        ];
+
+        let calls = collect_tool_calls_from_events(events);
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "first");
+        assert_eq!(calls[0].arguments, "{\"a\":1}");
+        assert_eq!(calls[1].id, "call_2");
+        assert_eq!(calls[1].name, "second");
+        assert_eq!(calls[1].arguments, "{\"b\":2}");
     }
 
     #[test]
@@ -502,11 +656,10 @@ impl LlmProvider for OpenAIProvider {
             .await
             .context("failed to read streamed completion response")?;
 
-        // Track tool calls as they arrive: call_id -> (name, args).
-        let mut pending_calls: HashMap<String, (String, String)> = HashMap::new();
+        // Track tool calls as they arrive in stream order.
+        let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+        let mut pending_calls: HashMap<String, (Option<String>, String)> = HashMap::new();
         let mut current_call_id: Option<String> = None;
-        let mut current_call_name: Option<String> = None;
-        let mut current_call_args = String::new();
         let mut stop_reason = StopReason::Stop;
         let mut completion_meta = None;
         let mut assistant_content = String::new();
@@ -520,36 +673,48 @@ impl LlmProvider for OpenAIProvider {
                     on_token(delta);
                 }
                 Some(SseEvent::FunctionCallArgumentsDelta { call_id, name, delta }) => {
-                    if let Some(delta) = delta {
-                        current_call_args.push_str(&delta);
+                    let call_id = match call_id {
+                        Some(id) => {
+                            current_call_id = Some(id.clone());
+                            id
+                        }
+                        None => match current_call_id.clone() {
+                            Some(id) => id,
+                            None => continue,
+                        },
+                    };
+
+                    let entry = pending_calls.entry(call_id).or_insert((None, String::new()));
+                    if let Some(tool_name) = name {
+                        entry.0 = Some(tool_name);
                     }
 
-                    if current_call_id.is_none()
-                        && let Some(id) = call_id
-                    {
-                        current_call_id = Some(id);
-                    }
-                    if current_call_name.is_none()
-                        && let Some(tool_name) = name
-                    {
-                        current_call_name = Some(tool_name);
+                    if let Some(delta) = delta {
+                        entry.1.push_str(&delta);
                     }
                 }
                 Some(SseEvent::FunctionCallArgumentsDone { call_id, name, arguments }) => {
                     let call_id = call_id
-                        .or_else(|| current_call_id.take())
+                        .or_else(|| current_call_id.clone())
                         .unwrap_or_else(|| "unknown".to_string());
-                    let name = name
-                        .or_else(|| current_call_name.take())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let arguments = arguments.unwrap_or_else(|| std::mem::take(&mut current_call_args));
+                    let mut entry = pending_calls.remove(&call_id).unwrap_or((None, String::new()));
+                    if let Some(tool_name) = name {
+                        entry.0 = Some(tool_name);
+                    }
+                    let name = entry.0.unwrap_or_else(|| "unknown".to_string());
+                    let arguments = arguments.unwrap_or(entry.1);
 
-                    pending_calls.insert(call_id, (name, arguments));
-                    current_call_args.clear();
+                    upsert_tool_call(&mut tool_calls, call_id, name, arguments);
                     stop_reason = StopReason::ToolCalls;
                 }
                 Some(SseEvent::FunctionCallOutputItemDone { call_id, name, arguments }) => {
-                    pending_calls.insert(call_id, (name, arguments));
+                    let mut arguments = arguments;
+                    if let Some((_, pending_args)) = pending_calls.remove(&call_id) {
+                        if arguments.is_empty() {
+                            arguments = pending_args;
+                        }
+                    }
+                    upsert_tool_call(&mut tool_calls, call_id, name, arguments);
                     stop_reason = StopReason::ToolCalls;
                 }
                 Some(SseEvent::Completed { meta }) => {
@@ -557,7 +722,7 @@ impl LlmProvider for OpenAIProvider {
                         completion_meta = Some(meta);
                     }
 
-                    if pending_calls.is_empty() {
+                    if tool_calls.is_empty() {
                         stop_reason = StopReason::Stop;
                     }
                 }
@@ -567,9 +732,9 @@ impl LlmProvider for OpenAIProvider {
         }
 
         // Build tool calls from pending events.
-        let tool_calls: Vec<ToolCall> = pending_calls
+        let tool_calls: Vec<ToolCall> = tool_calls
             .into_iter()
-            .map(|(id, (name, arguments))| ToolCall {
+            .map(|(id, name, arguments)| ToolCall {
                 id,
                 name,
                 arguments,

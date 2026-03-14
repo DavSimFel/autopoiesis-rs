@@ -3,24 +3,10 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use std::io::{self, BufRead, Write};
-
-mod agent;
-mod auth;
-mod config;
-mod llm;
-mod identity;
-mod util;
-mod template;
-mod session;
-mod tools;
+use autopoiesis::{agent, auth, config, identity, llm, session, tools};
 
 use std::collections::HashMap;
 use std::env;
-
-use crate::agent::run_agent_loop;
-use crate::config::Config;
-use crate::llm::openai::OpenAIProvider;
-use crate::session::Session;
 
 #[derive(Parser)]
 #[command(name = "autopoiesis", version, about = "MVP Rust agent runtime")]
@@ -85,7 +71,7 @@ async fn main() -> Result<()> {
             }
         },
         None => {
-            let config = Config::load("agents.toml")
+            let config = config::Config::load("agents.toml")
                 .map_err(|error| anyhow!("failed to load configuration: {error}"))?;
 
             let cwd = env::current_dir()
@@ -106,7 +92,7 @@ async fn main() -> Result<()> {
             let system_prompt = identity::load_system_prompt("identity", &vars)
                 .unwrap_or(config.system_prompt.clone());
 
-            let mut session = Session::new(system_prompt, "sessions")?;
+            let mut session = session::Session::new(system_prompt, "sessions")?;
             session.load_today()?;
             let provider_config = config.clone();
 
@@ -116,7 +102,7 @@ async fn main() -> Result<()> {
 
                 async move {
                     let api_key = auth::get_valid_token().await?;
-                    Ok::<OpenAIProvider, anyhow::Error>(OpenAIProvider::new(
+                    Ok::<llm::openai::OpenAIProvider, anyhow::Error>(llm::openai::OpenAIProvider::new(
                         api_key,
                         provider_config.base_url,
                         provider_config.model,
@@ -143,11 +129,11 @@ async fn main() -> Result<()> {
                     if prompt == "exit" || prompt == "quit" {
                         break;
                     }
-                    run_agent_loop(&mut provider_factory, &mut session, prompt.to_string()).await?;
+                    agent::run_agent_loop(&mut provider_factory, &mut session, prompt.to_string()).await?;
                     println!();
                 }
             } else {
-                run_agent_loop(&mut provider_factory, &mut session, cli.prompt.join(" ")).await?;
+                agent::run_agent_loop(&mut provider_factory, &mut session, cli.prompt.join(" ")).await?;
             }
         }
     }

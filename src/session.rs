@@ -196,7 +196,7 @@ impl Session {
     }
 
     /// Load today's session from disk if it exists.
-    pub fn load_today(&mut self) -> Result<()> {
+        pub fn load_today(&mut self) -> Result<()> {
         let path = self.today_path();
         if !path.exists() {
             return Ok(());
@@ -224,6 +224,8 @@ impl Session {
                 self.message_tokens.push(token_delta);
             }
         }
+
+        self.trim_context();
 
         Ok(())
     }
@@ -421,6 +423,33 @@ mod tests {
         // Should not error — just starts empty
         session.load_today().unwrap();
         assert_eq!(session.history().len(), 1); // just system prompt
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_today_trims_context_after_restore() {
+        let dir = temp_sessions_dir("load_trim");
+
+        let mut seed = Session::new("system", &dir).unwrap();
+        let meta = TurnMeta {
+            input_tokens: Some(50),
+            output_tokens: Some(50),
+            ..Default::default()
+        };
+
+        for _ in 0..2 {
+            seed
+                .append(ChatMessage::with_role(crate::llm::ChatRole::Assistant), Some(meta.clone()))
+                .unwrap();
+        }
+
+        let mut session = Session::new("system", &dir).unwrap();
+        session.max_context_tokens = 50;
+        session.load_today().unwrap();
+
+        assert_eq!(session.history().len(), 1);
+        assert_eq!(session.total_tokens(), 0);
 
         fs::remove_dir_all(&dir).unwrap();
     }
