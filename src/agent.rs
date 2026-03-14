@@ -35,6 +35,7 @@ where
     let mut executed: Vec<ToolCall> = Vec::new();
 
     loop {
+        session.ensure_context_within_limit();
         let mut messages = session.history().to_vec();
         match pipeline.run_inbound(&mut messages) {
             GateResult::Allow => {}
@@ -144,5 +145,102 @@ where
                 return Ok(TurnVerdict::ExecuteAll(executed));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::llm::FunctionTool;
+    use crate::llm::StreamedTurn;
+
+    #[derive(Clone)]
+    struct InspectingProvider {
+        observed_message_counts: Arc<Mutex<Vec<usize>>>,
+    }
+
+    #[allow(dead_code)]
+    impl InspectingProvider {
+        fn new() -> (Self, Arc<Mutex<Vec<usize>>>) {
+            let observed_message_counts = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    observed_message_counts: observed_message_counts.clone(),
+                },
+                observed_message_counts,
+            )
+        }
+    }
+
+    #[allow(dead_code)]
+    impl LlmProvider for InspectingProvider {
+        async fn stream_completion(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[FunctionTool],
+            _on_token: &mut (dyn FnMut(String) + Send),
+        ) -> Result<StreamedTurn> {
+            self.observed_message_counts
+                .lock()
+                .expect("observed message count mutex poisoned")
+                .push(messages.len());
+
+            Ok(StreamedTurn {
+                assistant_message: ChatMessage::system("ok"),
+                tool_calls: vec![],
+                meta: None,
+                stop_reason: StopReason::Stop,
+            })
+        }
+    }
+
+    fn temp_sessions_dir(prefix: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "aprs_agent_test_{prefix}_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn trims_context_before_stream_completion_when_over_estimated_limit() {
+        let dir = temp_sessions_dir("pre_call_trim");
+        let (provider, observed_message_counts) = InspectingProvider::new();
+        let mut session = Session::new("system", &dir).unwrap();
+        session.set_max_context_tokens(1);
+
+        session.add_user_message("one").unwrap();
+        session.add_user_message("two").unwrap();
+        session.add_user_message("three").unwrap();
+
+        let _verdict = run_agent_loop(
+            {
+                let provider = provider.clone();
+                move || {
+                    let provider = provider.clone();
+                    async move { Ok::<_, anyhow::Error>(provider) }
+                }
+            },
+            &mut session,
+            "new command".to_string(),
+            &Pipeline::new(),
+        )
+        .await
+        .unwrap();
+
+        let observed = observed_message_counts.lock().expect("observed mutex poisoned");
+        assert!(
+            observed.first().cloned().is_some_and(|count| count <= 3),
+            "expected pre-call trimming to run before stream completion"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

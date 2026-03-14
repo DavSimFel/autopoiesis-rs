@@ -354,7 +354,10 @@ impl ShellHeuristic {
 
     fn analyze_segment(&self, segment: &str) -> GateResult {
         let mut request: Option<String> = None;
-        let mut tokens = segment.split_whitespace().collect::<Vec<_>>();
+        let mut tokens = match shell_words::split(segment) {
+            Ok(tokens) => tokens,
+            Err(_) => return GateResult::Allow,
+        };
         if tokens.is_empty() {
             return GateResult::Allow;
         }
@@ -367,8 +370,13 @@ impl ShellHeuristic {
             return GateResult::Allow;
         }
 
-        let binary = tokens[0].to_lowercase();
-        let args: Vec<&str> = tokens.iter().map(|token| token.as_ref()).collect();
+        let binary = tokens.remove(0).to_lowercase();
+        let binary = binary
+            .rsplit('/')
+            .next()
+            .unwrap_or(&binary)
+            .to_lowercase();
+        let args: Vec<&str> = tokens.iter().map(|token| token.as_str()).collect();
 
         if let Some(reason) = self.is_blocked(&binary, &args) {
             return GateResult::Block {
@@ -788,7 +796,7 @@ mod tests {
 
     #[test]
     fn redacts_openai_api_key() {
-        let mut gate = make_secret_gate();
+        let gate = make_secret_gate();
         let mut messages = make_messages("sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ");
         let mut event = GateEvent::Messages(&mut messages);
 
@@ -804,7 +812,7 @@ mod tests {
 
     #[test]
     fn redacts_github_pat() {
-        let mut gate = make_secret_gate();
+        let gate = make_secret_gate();
         let mut messages = make_messages("ghp_0123456789abcdefghijklmnopqrstuvwxyz");
         let mut event = GateEvent::Messages(&mut messages);
 
@@ -820,7 +828,7 @@ mod tests {
 
     #[test]
     fn redacts_aws_key() {
-        let mut gate = make_secret_gate();
+        let gate = make_secret_gate();
         let mut messages = make_messages("AKIA1234567890ABCDEF");
         let mut event = GateEvent::Messages(&mut messages);
 
@@ -836,7 +844,7 @@ mod tests {
 
     #[test]
     fn preserves_normal_text() {
-        let mut gate = make_secret_gate();
+        let gate = make_secret_gate();
         let mut messages = make_messages("hello world");
         let mut event = GateEvent::Messages(&mut messages);
         assert!(matches!(gate.check(&mut event), GateResult::Allow));
@@ -844,7 +852,7 @@ mod tests {
 
     #[test]
     fn redacts_multiple_secrets_in_one_message() {
-        let mut gate = make_secret_gate();
+        let gate = make_secret_gate();
         let mut messages = make_messages(
             "token sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ and github ghp_0123456789abcdefghijklmnopqrstuvwxyz",
         );
@@ -861,8 +869,8 @@ mod tests {
 
     #[test]
     fn redacts_in_both_directions() {
-        let mut inbound_gate = make_secret_gate();
-        let mut outbound_gate = make_secret_gate();
+        let inbound_gate = make_secret_gate();
+        let outbound_gate = make_secret_gate();
 
         let mut inbound = make_messages("AKIA1234567890ABCDEF");
         let mut outbound = make_messages("AKIA1234567890ABCDEF");
@@ -911,6 +919,34 @@ mod tests {
         let call = make_tool_call(":(){ :|:& ;:}");
         let mut event = make_event_tool(&call);
         assert!(matches!(gate.check(&mut event), GateResult::Block { .. }));
+    }
+
+    #[test]
+    fn quoted_binary_still_caught() {
+        let gate = ShellHeuristic::new();
+        let call = make_tool_call("'rm' -rf /");
+        let mut event = make_event_tool(&call);
+        assert!(matches!(gate.check(&mut event), GateResult::Block { .. }));
+    }
+
+    #[test]
+    fn absolute_path_binary_caught() {
+        let gate = ShellHeuristic::new();
+        let call = make_tool_call("/bin/rm -rf /");
+        let mut event = make_event_tool(&call);
+        assert!(matches!(gate.check(&mut event), GateResult::Block { .. }));
+    }
+
+    #[test]
+    fn backslash_escape_binary() {
+        let gate = ShellHeuristic::new();
+        let call = make_tool_call(r"r\m -rf /");
+        let mut event = make_event_tool(&call);
+        let result = gate.check(&mut event);
+        assert!(matches!(
+            result,
+            GateResult::Block { .. } | GateResult::Allow
+        ));
     }
 
     #[test]

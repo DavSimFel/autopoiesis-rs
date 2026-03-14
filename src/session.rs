@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tiktoken_rs::cl100k_base_singleton;
 
 use crate::llm::{ChatMessage, ChatRole, MessageContent, TurnMeta};
 use crate::util::utc_timestamp;
@@ -167,6 +168,28 @@ impl Session {
         (message, token_delta)
     }
 
+    fn message_text_for_estimation(message: &ChatMessage) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                MessageContent::Text { text } => Some(text.as_str()),
+                MessageContent::ToolResult { result } => Some(result.content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn estimate_message_tokens(message: &ChatMessage) -> u64 {
+        let text = Self::message_text_for_estimation(message);
+        if text.is_empty() {
+            0
+        } else {
+            cl100k_base_singleton().encode_ordinary(&text).len() as u64
+        }
+    }
+
     /// Append a message and persist it to today's JSONL file.
     pub fn append(&mut self, message: ChatMessage, meta: Option<TurnMeta>) -> Result<()> {
         let token_delta = Self::token_total(meta.as_ref());
@@ -238,7 +261,14 @@ impl Session {
 
     /// Trim oldest non-system messages when over token limit.
     fn trim_context(&mut self) {
-        while self.total_tokens > self.max_context_tokens {
+        let use_estimation = self.total_tokens == 0;
+        let mut estimated_tokens = if use_estimation {
+            self.estimate_context_tokens() as u64
+        } else {
+            self.total_tokens
+        };
+
+        while estimated_tokens > self.max_context_tokens {
             if self.messages.len() <= 1 {
                 break;
             }
@@ -249,8 +279,15 @@ impl Session {
                     break;
                 }
 
-                let token_delta = self.message_tokens.remove(1);
+                let token_delta = if use_estimation {
+                    Self::estimate_message_tokens(&self.messages[1])
+                } else {
+                    self.message_tokens.remove(1)
+                };
                 self.messages.remove(1);
+                if use_estimation {
+                    self.message_tokens.remove(1);
+                }
                 removed += token_delta;
             }
 
@@ -258,7 +295,24 @@ impl Session {
                 break;
             }
 
-            self.total_tokens = self.total_tokens.saturating_sub(removed);
+            estimated_tokens = estimated_tokens.saturating_sub(removed);
+        }
+
+        self.total_tokens = estimated_tokens;
+    }
+
+    /// Estimate context tokens using cl100k_base tokenizer.
+    pub fn estimate_context_tokens(&self) -> usize {
+        self.messages
+            .iter()
+            .map(Self::estimate_message_tokens)
+            .sum::<u64>() as usize
+    }
+
+    /// Ensure context is trimmed before sending to the LLM when metadata is missing.
+    pub fn ensure_context_within_limit(&mut self) {
+        if self.estimate_context_tokens() as u64 > self.max_context_tokens {
+            self.trim_context();
         }
     }
 
@@ -288,6 +342,12 @@ impl Session {
 
         paths.sort_by_key(|path| path.file_name().map(ToOwned::to_owned));
         Ok(paths)
+    }
+
+    /// Update max context tokens for a session.
+    #[allow(dead_code)]
+    pub fn set_max_context_tokens(&mut self, max_context_tokens: u64) {
+        self.max_context_tokens = max_context_tokens;
     }
 }
 
@@ -482,6 +542,48 @@ mod tests {
             .unwrap();
 
         assert_eq!(session.total_tokens(), 180); // 50+10+100+20
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn estimate_tokens_returns_nonzero() {
+        let dir = temp_sessions_dir("estimate_nonzero");
+        let mut session = Session::new("system", &dir).unwrap();
+
+        session.add_user_message("hello world").unwrap();
+        assert!(session.estimate_context_tokens() > 0);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn trim_uses_estimation_when_no_metadata() {
+        let dir = temp_sessions_dir("trim_estimate");
+        let mut session = Session::new("system", &dir).unwrap();
+        session.set_max_context_tokens(1);
+
+        session.add_user_message("one").unwrap();
+        session.add_user_message("two").unwrap();
+        session.add_user_message("three").unwrap();
+        session.trim_context();
+
+        assert_eq!(session.history().len(), 1);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn estimation_is_roughly_accurate() {
+        let dir = temp_sessions_dir("estimate_rough");
+        let mut session = Session::new("", &dir).unwrap();
+
+        session.add_user_message("hello world").unwrap();
+        let tokens = session.estimate_context_tokens();
+        assert!(
+            (2..=4).contains(&tokens),
+            "expected roughly 2-4 tokens, got {tokens}"
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }
