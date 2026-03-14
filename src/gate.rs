@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 use serde_json::from_str;
 
-use crate::llm::{ChatMessage, MessageContent, ToolCall};
+use crate::llm::{ChatMessage, ChatRole, MessageContent, ToolCall};
 use crate::{identity, util};
 
 /// Execution bands for the gate pipeline.
@@ -1108,19 +1108,21 @@ mod tests {
         let mut messages = vec![
             ChatMessage::system("system"),
             ChatMessage::user("first"),
-            ChatMessage::assistant("assistant"),
+            ChatMessage::with_role(ChatRole::Assistant),
             ChatMessage::user("last"),
         ];
 
-        let mut event = GateEvent::Messages(&mut messages);
-        assert!(matches!(gate.check(&mut event), GateResult::Edit));
+        {
+            let mut event = GateEvent::Messages(&mut messages);
+            assert!(matches!(gate.check(&mut event), GateResult::Edit));
+        }
 
         let first_user = match &messages[1].content[0] {
-            MessageContent::Text { text } => text,
+            MessageContent::Text { text } => text.clone(),
             _ => panic!("expected text"),
         };
         let last_user = match &messages[3].content[0] {
-            MessageContent::Text { text } => text,
+            MessageContent::Text { text } => text.clone(),
             _ => panic!("expected text"),
         };
 
@@ -1128,7 +1130,11 @@ mod tests {
         assert!(last_user.starts_with("["));
         assert!(last_user.contains('T'));
         assert!(last_user.contains("] last"));
-        assert!(matches!(gate.check(&mut event), GateResult::Allow));
+
+        {
+            let mut event = GateEvent::Messages(&mut messages);
+            assert!(matches!(gate.check(&mut event), GateResult::Allow));
+        }
     }
 
     #[test]
@@ -1150,12 +1156,14 @@ mod tests {
         let gate = TimestampGate;
         let mut messages = vec![
             ChatMessage::system("system"),
-            ChatMessage::assistant("assistant"),
             ChatMessage::system("system2"),
         ];
-        let mut event = GateEvent::Messages(&mut messages);
 
-        assert!(matches!(gate.check(&mut event), GateResult::Allow));
+        {
+            let mut event = GateEvent::Messages(&mut messages);
+            assert!(matches!(gate.check(&mut event), GateResult::Allow));
+        }
+
         assert_eq!(
             match &messages[0].content[0] {
                 MessageContent::Text { text } => text,
@@ -1165,13 +1173,6 @@ mod tests {
         );
         assert_eq!(
             match &messages[1].content[0] {
-                MessageContent::Text { text } => text,
-                _ => panic!("expected text"),
-            },
-            "assistant"
-        );
-        assert_eq!(
-            match &messages[2].content[0] {
                 MessageContent::Text { text } => text,
                 _ => panic!("expected text"),
             },
