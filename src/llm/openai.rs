@@ -146,10 +146,6 @@ impl LlmProvider for OpenAIProvider {
             request["tools"] = json!(tools_json);
         }
 
-        if let Some(max_tokens) = self.max_output_tokens {
-            request["max_output_tokens"] = json!(max_tokens);
-        }
-
         if let Some(ref effort) = self.reasoning_effort {
             request["reasoning"] = json!({"effort": effort});
         }
