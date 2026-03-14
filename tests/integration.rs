@@ -2,7 +2,7 @@
 use autopoiesis::{
     auth,
     config::Config,
-    llm::{openai::OpenAIProvider, ChatMessage, StopReason},
+    llm::{openai::OpenAIProvider, ChatMessage, LlmProvider, StopReason},
     tools,
 };
 #[cfg(feature = "integration")]
@@ -35,7 +35,7 @@ async fn simple_prompt() -> Result<()> {
 
     let turn = provider
         .stream_completion(
-            &[ChatMessage::user("Say hi in 3 words")],
+            &[ChatMessage::system("You are a helpful assistant."), ChatMessage::user("Say hi in 3 words")],
             &[],
             &mut on_token,
         )
@@ -67,7 +67,7 @@ async fn tool_call_roundtrip() -> Result<()> {
 
     let turn = provider
         .stream_completion(
-            &[ChatMessage::user("Run: echo hello123")],
+            &[ChatMessage::system("You are a helpful assistant. Use tools when asked."), ChatMessage::user("Run: echo hello123")],
             &tool_defs,
             &mut on_token,
         )
