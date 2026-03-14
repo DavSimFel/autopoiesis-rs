@@ -1,10 +1,12 @@
 pub mod agent;
 pub mod auth;
 pub mod config;
+pub mod context;
+pub mod guard;
 pub mod util;
 pub mod identity;
 pub mod llm;
-pub mod gate;
+pub mod turn;
 pub mod session;
 pub mod template;
-pub mod tools;
+pub mod tool;

@@ -5,10 +5,10 @@ use std::io::{self, Write};
 use anyhow::Result;
 use serde_json::{from_str, Value};
 
-use crate::gate::{GateResult, Pipeline, Severity};
+use crate::guard::{Severity, Verdict};
 use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall};
 use crate::session::Session;
-use crate::tools;
+use crate::turn::Turn;
 use crate::util::utc_timestamp;
 
 pub enum TurnVerdict {
@@ -51,10 +51,10 @@ fn append_hard_deny(session: &mut Session, by: &str, reason: &str) -> Result<()>
 
 /// Run the agent loop until the model emits a non-tool stop reason.
 pub async fn run_agent_loop<F, Fut, P>(
-    mut make_provider: F,
+    make_provider: &mut F,
     session: &mut Session,
     user_prompt: String,
-    pipeline: &mut Pipeline,
+    turn: &Turn,
 ) -> Result<TurnVerdict>
 where
     F: FnMut() -> Fut,
@@ -62,7 +62,7 @@ where
     P: LlmProvider,
 {
     let user_prompt = format!("[{}] {}", utc_timestamp(), user_prompt);
-    let tools = vec![tools::execute_tool_definition()];
+    let tools = turn.tool_definitions();
     session.add_user_message(user_prompt)?;
 
     let mut executed: Vec<ToolCall> = Vec::new();
@@ -70,16 +70,18 @@ where
 
     'agent_turn: loop {
         session.ensure_context_within_limit();
-        pipeline.update_context(session.history());
-        let mut messages = Vec::new();
-        match pipeline.run_inbound(&mut messages) {
-            GateResult::Allow => {}
-            GateResult::Edit => {}
-            GateResult::Deny { reason, gate_id } => {
-                session.append(ChatMessage::system(format!("Message hard-denied by {gate_id}: {reason}")), None)?;
+        let mut messages = session.history().to_vec();
+        match turn.check_inbound(&mut messages) {
+            Verdict::Allow => {}
+            Verdict::Modify => {}
+            Verdict::Deny { reason, gate_id } => {
+                session.append(
+                    ChatMessage::system(format!("Message hard-denied by {gate_id}: {reason}")),
+                    None,
+                )?;
                 continue;
             }
-            GateResult::Approve { reason, gate_id: _, severity } => {
+            Verdict::Approve { reason, gate_id: _, severity } => {
                 let command = messages
                     .iter()
                     .find_map(|message| {
@@ -92,9 +94,9 @@ where
                             })
                     })
                     .unwrap_or("<inbound message>");
-                let approved = prompt_approval(&severity, &reason, &command);
+                let approved = prompt_approval(&severity, &reason, command);
                 if !approved {
-                    append_approval_denied(session, &reason, &command)?;
+                    append_approval_denied(session, &reason, command)?;
                     continue;
                 }
             }
@@ -105,33 +107,33 @@ where
         }
 
         let mut on_token = |token: String| {
-            print!("{}", token);
+            print!("{token}");
             if let Err(err) = io::stdout().flush() {
                 eprintln!("failed to flush stdout: {err}");
             }
         };
 
         let provider = make_provider().await?;
-        let turn = provider
+        let turn_reply = provider
             .stream_completion(&messages, &tools, &mut on_token)
             .await?;
-        let turn_meta = turn.meta;
+        let turn_meta = turn_reply.meta;
 
-        match turn.stop_reason {
+        match turn_reply.stop_reason {
             // The model produced tool calls; append assistant turn and execute each in order.
             StopReason::ToolCalls => {
-                let tool_calls = turn.tool_calls.clone();
-                session.append(turn.assistant_message, turn_meta)?;
+                let tool_calls = turn_reply.tool_calls.clone();
+                session.append(turn_reply.assistant_message, turn_meta)?;
 
                 for call in &tool_calls {
-                    match pipeline.check_tool_call(call) {
-                        GateResult::Allow => {}
-                        GateResult::Edit => {}
-                        GateResult::Deny { reason, gate_id } => {
+                    match turn.check_tool_call(call) {
+                        Verdict::Allow => {}
+                        Verdict::Modify => {}
+                        Verdict::Deny { reason, gate_id } => {
                             append_hard_deny(session, &gate_id, &reason)?;
                             continue 'agent_turn;
                         }
-                        GateResult::Approve {
+                        Verdict::Approve {
                             reason,
                             gate_id: _,
                             severity,
@@ -140,11 +142,7 @@ where
                                 .unwrap_or_else(|| "<command unavailable>".to_string());
                             let approved = prompt_approval(&severity, &reason, &command);
                             if !approved {
-                                append_approval_denied(
-                                    session,
-                                    &reason,
-                                    &command,
-                                )?;
+                                append_approval_denied(session, &reason, &command)?;
                                 continue 'agent_turn;
                             }
                             had_user_approval = true;
@@ -152,14 +150,14 @@ where
                     }
                 }
 
-                match pipeline.check_tool_batch(&tool_calls) {
-                    GateResult::Allow => {}
-                    GateResult::Edit => {}
-                    GateResult::Deny { reason, gate_id } => {
+                match turn.check_tool_batch(&tool_calls) {
+                    Verdict::Allow => {}
+                    Verdict::Modify => {}
+                    Verdict::Deny { reason, gate_id } => {
                         append_hard_deny(session, &gate_id, &reason)?;
                         continue 'agent_turn;
                     }
-                    GateResult::Approve {
+                    Verdict::Approve {
                         reason,
                         gate_id: _,
                         severity,
@@ -177,7 +175,7 @@ where
                 }
 
                 for call in &tool_calls {
-                    let result = match tools::execute_tool_call(call).await {
+                    let result = match turn.execute_tool(&call.name, &call.arguments) {
                         Ok(output) => output,
                         Err(err) => format!(r#"{{"error": "{err}"}}"#),
                     };
@@ -190,7 +188,7 @@ where
             // Final text output is appended and execution returns to caller.
             StopReason::Stop => {
                 println!();
-                session.append(turn.assistant_message, turn_meta)?;
+                session.append(turn_reply.assistant_message, turn_meta)?;
                 if had_user_approval {
                     return Ok(TurnVerdict::Approved { tool_calls: executed });
                 }
@@ -203,21 +201,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::llm::FunctionTool;
-    use crate::llm::StreamedTurn;
+    use crate::context::History;
+    use crate::guard::SecretRedactor;
+    use crate::llm::{FunctionTool, StreamedTurn};
+    use crate::tool::Shell;
+    use crate::turn::Turn;
 
     #[derive(Clone)]
     struct InspectingProvider {
-        observed_message_counts: Arc<Mutex<Vec<usize>>>,
+        observed_message_counts: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
     }
 
     #[allow(dead_code)]
     impl InspectingProvider {
-        fn new() -> (Self, Arc<Mutex<Vec<usize>>>) {
-            let observed_message_counts = Arc::new(Mutex::new(Vec::new()));
+        fn new() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<usize>>>) {
+            let observed_message_counts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             (
                 Self {
                     observed_message_counts: observed_message_counts.clone(),
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    impl LlmProvider for InspectingProvider {
+    impl crate::llm::LlmProvider for InspectingProvider {
         async fn stream_completion(
             &self,
             messages: &[ChatMessage],
@@ -254,7 +254,7 @@ mod tests {
             "aprs_agent_test_{prefix}_{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_nanos(),
         ));
         std::fs::create_dir_all(&path).unwrap();
@@ -262,18 +262,21 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // hangs on tiktoken singleton init in test context
+    #[ignore]
     async fn trims_context_before_stream_completion_when_over_estimated_limit() {
         let dir = temp_sessions_dir("pre_call_trim");
         let (provider, observed_message_counts) = InspectingProvider::new();
-        let mut session = Session::new(&dir).unwrap();
+        let mut session = crate::session::Session::new(&dir).unwrap();
         session.set_max_context_tokens(1);
 
         session.add_user_message("one").unwrap();
         session.add_user_message("two").unwrap();
         session.add_user_message("three").unwrap();
 
-        let mut pipeline = Pipeline::new();
+        let turn = Turn::new()
+            .context(History::new(1_000))
+            .tool(Shell::new())
+            .guard(SecretRedactor::new(&[]));
         let _verdict = run_agent_loop(
             {
                 let provider = provider.clone();
@@ -284,12 +287,14 @@ mod tests {
             },
             &mut session,
             "new command".to_string(),
-            &mut pipeline,
+            &turn,
         )
         .await
         .unwrap();
 
-        let observed = observed_message_counts.lock().expect("observed mutex poisoned");
+        let observed = observed_message_counts
+            .lock()
+            .expect("observed mutex poisoned");
         assert!(
             observed.first().cloned().is_some_and(|count| count <= 3),
             "expected pre-call trimming to run before stream completion"

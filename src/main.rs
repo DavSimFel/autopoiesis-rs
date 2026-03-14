@@ -2,11 +2,11 @@
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use std::io::{self, BufRead, Write};
-use autopoiesis::{agent, auth, config, gate, llm, session, tools};
+use autopoiesis::{agent, auth, config, context, guard, llm, session, tool, turn};
 
 use std::collections::HashMap;
 use std::env;
+use std::io::{self, BufRead, Write};
 
 #[derive(Parser)]
 #[command(name = "autopoiesis", version, about = "MVP Rust agent runtime")]
@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
             let mut session = session::Session::new("sessions")?;
             session.load_today()?;
             let provider_config = config.clone();
-            let mut pipeline = default_pipeline(&config);
+            let turn = default_turn(&config);
 
             // Build a fresh provider per turn so the auth token can be refreshed mid-session.
             let mut provider_factory = move || {
@@ -85,12 +85,14 @@ async fn main() -> Result<()> {
 
                 async move {
                     let api_key = auth::get_valid_token().await?;
-                    Ok::<llm::openai::OpenAIProvider, anyhow::Error>(llm::openai::OpenAIProvider::new(
-                        api_key,
-                        provider_config.base_url,
-                        provider_config.model,
-                        provider_config.reasoning_effort,
-                    ))
+                    Ok::<llm::openai::OpenAIProvider, anyhow::Error>(
+                        llm::openai::OpenAIProvider::new(
+                            api_key,
+                            provider_config.base_url,
+                            provider_config.model,
+                            provider_config.reasoning_effort,
+                        ),
+                    )
                 }
             };
 
@@ -106,9 +108,9 @@ async fn main() -> Result<()> {
                         break;
                     }
                     let prompt = line.trim();
-                if prompt.is_empty() {
-                    continue;
-                }
+                    if prompt.is_empty() {
+                        continue;
+                    }
                     if prompt == "exit" || prompt == "quit" {
                         break;
                     }
@@ -116,7 +118,7 @@ async fn main() -> Result<()> {
                         &mut provider_factory,
                         &mut session,
                         prompt.to_string(),
-                        &mut pipeline,
+                        &turn,
                     )
                     .await?;
                     match verdict {
@@ -135,7 +137,7 @@ async fn main() -> Result<()> {
                     &mut provider_factory,
                     &mut session,
                     cli.prompt.join(" "),
-                    &mut pipeline,
+                    &turn,
                 )
                 .await?;
                 match verdict {
@@ -154,12 +156,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn default_pipeline(config: &config::Config) -> gate::Pipeline {
+fn default_turn(config: &config::Config) -> turn::Turn {
     let cwd = env::current_dir()
         .ok()
         .and_then(|path| path.to_str().map(ToString::to_string))
         .unwrap_or_else(String::new);
-    let tools = vec![tools::execute_tool_definition()];
+    let tools = vec![tool::Shell::new().definition()];
     let tools_list = tools
         .iter()
         .map(|tool| tool.name.as_str())
@@ -170,14 +172,15 @@ fn default_pipeline(config: &config::Config) -> gate::Pipeline {
     vars.insert("cwd".to_string(), cwd);
     vars.insert("tools".to_string(), tools_list);
 
-    gate::Pipeline::new()
-        .assemble(gate::IdentityGate::new("identity", vars, &config.system_prompt))
-        .context(gate::HistoryGate::new(100_000))
-        .sanitize(gate::SecretRedactor::new(&[
+    turn::Turn::new()
+        .context(context::Identity::new("identity", vars, &config.system_prompt))
+        .context(context::History::new(100_000))
+        .tool(tool::Shell::new())
+        .guard(guard::SecretRedactor::new(&[
             r"sk-[a-zA-Z0-9_-]{20,}",
             r"ghp_[a-zA-Z0-9]{36}",
             r"AKIA[0-9A-Z]{16}",
         ]))
-        .validate(gate::ShellHeuristic::new())
-        .validate(gate::ExfiltrationDetector::new())
+        .guard(guard::ShellSafety::new())
+        .guard(guard::ExfilDetector::new())
 }

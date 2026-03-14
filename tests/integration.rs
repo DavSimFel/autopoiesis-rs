@@ -3,7 +3,8 @@ use autopoiesis::{
     auth,
     config::Config,
     llm::{openai::OpenAIProvider, ChatMessage, LlmProvider, StopReason},
-    tools,
+    turn::Turn,
+    tool::Shell,
 };
 #[cfg(feature = "integration")]
 use anyhow::Result;
@@ -88,13 +89,14 @@ async fn tool_call_roundtrip() -> Result<()> {
         config.reasoning_effort,
     );
 
+    let shell_turn = Turn::new().tool(Shell::new());
+    let tool_defs = shell_turn.tool_definitions();
     let mut tokens = Vec::<String>::new();
     let mut on_token = |token: String| {
         tokens.push(token);
     };
-    let tool_defs = vec![tools::execute_tool_definition()];
 
-    let turn = provider
+    let completion = provider
         .stream_completion(
             &[
                 ChatMessage::system("You are a helpful assistant. Use tools when asked."),
@@ -107,14 +109,14 @@ async fn tool_call_roundtrip() -> Result<()> {
         )
         .await?;
 
-    assert_eq!(turn.stop_reason, StopReason::ToolCalls);
-    let call = turn
+    assert_eq!(completion.stop_reason, StopReason::ToolCalls);
+    let call = completion
         .tool_calls
         .iter()
         .find(|call| call.name == "execute")
         .expect("expected execute tool call");
 
-    let output = tools::execute_tool_call(call).await?;
+    let output = shell_turn.execute_tool(&call.name, &call.arguments)?;
     assert!(output.contains("hello123"));
     Ok(())
 }
