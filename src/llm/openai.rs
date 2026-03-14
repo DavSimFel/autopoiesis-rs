@@ -119,6 +119,76 @@ impl OpenAIProvider {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::{ChatMessage, ChatRole, MessageContent, ToolCall};
+
+    #[test]
+    fn build_input_extracts_system_message_as_instructions() {
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello"),
+        ];
+        let (instructions, input) = OpenAIProvider::build_input(&messages);
+        assert_eq!(instructions, Some("You are helpful".to_string()));
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "Hello");
+    }
+
+    #[test]
+    fn build_input_converts_tool_calls_to_function_call_with_call_id() {
+        let messages = vec![ChatMessage {
+            role: ChatRole::Assistant,
+            content: vec![MessageContent::ToolCall {
+                call: ToolCall {
+                    id: "tc-1".to_string(),
+                    name: "execute".to_string(),
+                    arguments: "{\"command\":\"echo hi\"}".to_string(),
+                },
+            }],
+        }];
+        let (_, input) = OpenAIProvider::build_input(&messages);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "tc-1");
+        assert_eq!(input[0]["name"], "execute");
+    }
+
+    #[test]
+    fn build_input_converts_tool_results_to_function_call_output_with_call_id() {
+        let messages = vec![ChatMessage {
+            role: ChatRole::Tool,
+            content: vec![MessageContent::tool_result("tc-1", "execute", "ok")],
+        }];
+        let (_, input) = OpenAIProvider::build_input(&messages);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["call_id"], "tc-1");
+        assert_eq!(input[0]["output"], "ok");
+    }
+
+    #[test]
+    fn build_tools_produces_flat_format_not_nested_under_function() {
+        let tools = vec![FunctionTool {
+            name: "execute".to_string(),
+            description: "Run a command".to_string(),
+            parameters: json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+        }];
+        let result = OpenAIProvider::build_tools(&tools);
+        assert_eq!(result[0]["type"], "function");
+        assert_eq!(result[0]["name"], "execute");
+        assert!(result[0].get("function").is_none());
+    }
+
+    #[test]
+    fn build_tools_empty_vector_returns_empty_vector() {
+        let result = OpenAIProvider::build_tools(&[]);
+        assert!(result.is_empty());
+    }
+}
+
 impl LlmProvider for OpenAIProvider {
     /// Stream a completion and parse SSE events from the OpenAI Responses API.
     ///

@@ -64,7 +64,7 @@ where
     Ok(())
 }
 
-fn utc_timestamp() -> String {
+pub(crate) fn utc_timestamp() -> String {
     const SECS_PER_MINUTE: i64 = 60;
     const SECS_PER_HOUR: i64 = 3_600;
     const SECS_PER_DAY: i64 = 86_400;
@@ -103,4 +103,28 @@ fn utc_timestamp() -> String {
         minute,
         second
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utc_timestamp_matches_utc_pattern() {
+        let value = utc_timestamp();
+        let bytes: Vec<u8> = value.bytes().collect();
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(&value[4..5], "-");
+        assert_eq!(&value[7..8], "-");
+        assert_eq!(&value[10..11], "T");
+        assert_eq!(&value[13..14], ":");
+        assert_eq!(&value[16..17], ":");
+        assert_eq!(&value[19..20], "Z");
+        assert!(value[..4].chars().all(|ch| ch.is_ascii_digit()));
+        assert!(value[5..7].chars().all(|ch| ch.is_ascii_digit()));
+        assert!(value[8..10].chars().all(|ch| ch.is_ascii_digit()));
+        assert!(value[11..13].chars().all(|ch| ch.is_ascii_digit()));
+        assert!(value[14..16].chars().all(|ch| ch.is_ascii_digit()));
+        assert!(value[17..19].chars().all(|ch| ch.is_ascii_digit()));
+    }
 }

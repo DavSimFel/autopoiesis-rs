@@ -59,6 +59,76 @@ impl Config {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::fs::File;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_toml_path(prefix: &str, contents: &str) -> String {
+        let mut path = env::temp_dir();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be valid")
+            .as_nanos();
+        path.push(format!("autopoiesis_test_{prefix}_{now}.toml"));
+        let mut file = File::create(&path).expect("failed to create temp toml file");
+        file.write_all(contents.as_bytes())
+            .expect("failed to write temp toml");
+        path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn loads_valid_agents_toml_with_all_fields() {
+        let path = temp_toml_path(
+            "all_fields",
+            "[agent]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning_effort='low'\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(config.model, "gpt-5.1");
+        assert_eq!(config.system_prompt, "All good");
+        assert_eq!(config.base_url, "https://example.test/api");
+        assert_eq!(config.reasoning_effort, Some("low".to_string()));
+    }
+
+    #[test]
+    fn loads_minimal_agents_toml_with_just_model() {
+        let path = temp_toml_path("minimal", "[agent]\nmodel='gpt-minimal'\n");
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(config.model, "gpt-minimal");
+        assert_eq!(
+            config.system_prompt,
+            "You are a direct and capable coding agent. Execute tasks efficiently."
+        );
+    }
+
+    #[test]
+    fn uses_defaults_when_file_missing() {
+        let config = Config::load("/does/not/exist.toml").expect("expected defaults to be used");
+        assert_eq!(config.model, "gpt-5.4");
+        assert_eq!(config.base_url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(config.reasoning_effort, None);
+    }
+
+    #[test]
+    fn uses_defaults_for_missing_optional_fields() {
+        let path = temp_toml_path("missing_optional", "[agent]\nmodel='gpt-only'\n");
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(config.model, "gpt-only");
+        assert_eq!(config.base_url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(
+            config.system_prompt,
+            "You are a direct and capable coding agent. Execute tasks efficiently."
+        );
+        assert_eq!(config.reasoning_effort, None);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AgentFileConfig {
     agent: AgentFileSection,

@@ -78,3 +78,15 @@ pub async fn execute_tool_call(call: &ToolCall) -> Result<String> {
 fn parse_execute_args(raw: &str) -> Result<Value> {
     serde_json::from_str(raw).context("failed to decode tool call arguments")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execute_tool_definition_has_execute_name() {
+        let schema = execute_tool_definition();
+        assert_eq!(schema.name, "execute");
+        assert_eq!(schema.parameters["type"], "object");
+    }
+}
