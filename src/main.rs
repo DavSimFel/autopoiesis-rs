@@ -112,23 +112,41 @@ async fn main() -> Result<()> {
                     if prompt == "exit" || prompt == "quit" {
                         break;
                     }
-                    agent::run_agent_loop(
+                    let verdict = agent::run_agent_loop(
                         &mut provider_factory,
                         &mut session,
                         prompt.to_string(),
                         &mut pipeline,
                     )
                     .await?;
+                    match verdict {
+                        agent::TurnVerdict::Executed(_) => {}
+                        agent::TurnVerdict::Approved { tool_calls: _ } => {
+                            eprintln!("Command approved by user and executed.");
+                        }
+                        agent::TurnVerdict::Denied { reason, gate_id } => {
+                            eprintln!("Command hard-denied by {gate_id}: {reason}");
+                        }
+                    }
                     println!();
                 }
             } else {
-                agent::run_agent_loop(
+                let verdict = agent::run_agent_loop(
                     &mut provider_factory,
                     &mut session,
                     cli.prompt.join(" "),
                     &mut pipeline,
                 )
                 .await?;
+                match verdict {
+                    agent::TurnVerdict::Executed(_) => {}
+                    agent::TurnVerdict::Approved { tool_calls: _ } => {
+                        eprintln!("Command approved by user and executed.");
+                    }
+                    agent::TurnVerdict::Denied { reason, gate_id } => {
+                        eprintln!("Command hard-denied by {gate_id}: {reason}");
+                    }
+                }
             }
         }
     }

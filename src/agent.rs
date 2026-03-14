@@ -3,17 +3,50 @@
 use std::io::{self, Write};
 
 use anyhow::Result;
+use serde_json::{from_str, Value};
 
-use crate::gate::{GateResult, Pipeline};
-use crate::llm::{ChatMessage, LlmProvider, StopReason, ToolCall};
+use crate::gate::{GateResult, Pipeline, Severity};
+use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall};
 use crate::session::Session;
 use crate::tools;
 use crate::util::utc_timestamp;
 
 pub enum TurnVerdict {
-    ExecuteAll(Vec<ToolCall>),
-    Blocked { reason: String, blocked_by: String },
-    RequestApproval { prompt: String, pending: Vec<ToolCall> },
+    Executed(Vec<ToolCall>),
+    Denied { reason: String, gate_id: String },
+    Approved { tool_calls: Vec<ToolCall> },
+}
+
+fn prompt_approval(severity: &Severity, reason: &str, command: &str) -> bool {
+    let prefix = match severity {
+        Severity::Low => "⚠️",
+        Severity::High => "🔴",
+    };
+
+    eprintln!("\n{prefix} {reason}");
+    eprintln!("  Command: {command}");
+    eprint!("  Approve? [y/n]: ");
+    io::stdout().flush().expect("failed to flush prompt");
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap_or(0);
+    input.trim().eq_ignore_ascii_case("y")
+}
+
+fn command_from_tool_call(call: &ToolCall) -> Option<String> {
+    let value = from_str::<Value>(&call.arguments).ok()?;
+    value.get("command").and_then(Value::as_str).map(ToString::to_string)
+}
+
+fn append_approval_denied(session: &mut Session, reason: &str, command: &str) -> Result<()> {
+    session.append(
+        ChatMessage::system(format!("Tool execution rejected by user: {reason}. Command: {command}")),
+        None,
+    )
+}
+
+fn append_hard_deny(session: &mut Session, by: &str, reason: &str) -> Result<()> {
+    session.append(ChatMessage::system(format!("Tool execution hard-denied by {by}: {reason}")), None)
 }
 
 /// Run the agent loop until the model emits a non-tool stop reason.
@@ -33,28 +66,42 @@ where
     session.add_user_message(user_prompt)?;
 
     let mut executed: Vec<ToolCall> = Vec::new();
+    let mut had_user_approval = false;
 
-    loop {
+    'agent_turn: loop {
         session.ensure_context_within_limit();
         pipeline.update_context(session.history());
         let mut messages = Vec::new();
         match pipeline.run_inbound(&mut messages) {
             GateResult::Allow => {}
             GateResult::Edit => {}
-            GateResult::Block { reason, gate_id } => {
-                session.append(ChatMessage::system(format!("Message blocked by {gate_id}: {reason}")), None)?;
-                return Ok(TurnVerdict::Blocked {
-                    reason,
-                    blocked_by: gate_id,
-                });
+            GateResult::Deny { reason, gate_id } => {
+                session.append(ChatMessage::system(format!("Message hard-denied by {gate_id}: {reason}")), None)?;
+                continue;
             }
-            GateResult::Request { prompt, gate_id: _ } => {
-                session.append(ChatMessage::system(format!("Input request from validator: {prompt}")), None)?;
-                return Ok(TurnVerdict::RequestApproval {
-                    prompt,
-                    pending: Vec::new(),
-                });
+            GateResult::Approve { reason, gate_id: _, severity } => {
+                let command = messages
+                    .iter()
+                    .find_map(|message| {
+                        message
+                            .content
+                            .iter()
+                            .find_map(|block| match block {
+                                MessageContent::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                    })
+                    .unwrap_or("<inbound message>");
+                let approved = prompt_approval(&severity, &reason, &command);
+                if !approved {
+                    append_approval_denied(session, &reason, &command)?;
+                    continue;
+                }
             }
+        }
+
+        if messages.is_empty() {
+            continue;
         }
 
         let mut on_token = |token: String| {
@@ -80,25 +127,27 @@ where
                     match pipeline.check_tool_call(call) {
                         GateResult::Allow => {}
                         GateResult::Edit => {}
-                        GateResult::Block { reason, gate_id } => {
-                            session.append(
-                                ChatMessage::system(format!("Tool call blocked by {gate_id}: {reason}")),
-                                None,
-                            )?;
-                            return Ok(TurnVerdict::Blocked {
-                                reason,
-                                blocked_by: gate_id,
-                            });
+                        GateResult::Deny { reason, gate_id } => {
+                            append_hard_deny(session, &gate_id, &reason)?;
+                            continue 'agent_turn;
                         }
-                        GateResult::Request { prompt, gate_id: _ } => {
-                            session.append(
-                                ChatMessage::system(format!("Tool call request from validator: {prompt}")),
-                                None,
-                            )?;
-                            return Ok(TurnVerdict::RequestApproval {
-                                prompt,
-                                pending: tool_calls,
-                            });
+                        GateResult::Approve {
+                            reason,
+                            gate_id: _,
+                            severity,
+                        } => {
+                            let command = command_from_tool_call(call)
+                                .unwrap_or_else(|| "<command unavailable>".to_string());
+                            let approved = prompt_approval(&severity, &reason, &command);
+                            if !approved {
+                                append_approval_denied(
+                                    session,
+                                    &reason,
+                                    &command,
+                                )?;
+                                continue 'agent_turn;
+                            }
+                            had_user_approval = true;
                         }
                     }
                 }
@@ -106,25 +155,24 @@ where
                 match pipeline.check_tool_batch(&tool_calls) {
                     GateResult::Allow => {}
                     GateResult::Edit => {}
-                    GateResult::Block { reason, gate_id } => {
-                        session.append(
-                            ChatMessage::system(format!("Tool batch blocked by {gate_id}: {reason}")),
-                            None,
-                        )?;
-                        return Ok(TurnVerdict::Blocked {
-                            reason,
-                            blocked_by: gate_id,
-                        });
+                    GateResult::Deny { reason, gate_id } => {
+                        append_hard_deny(session, &gate_id, &reason)?;
+                        continue 'agent_turn;
                     }
-                    GateResult::Request { prompt, gate_id: _ } => {
-                        session.append(
-                            ChatMessage::system(format!("Tool batch request from validator: {prompt}")),
-                            None,
-                        )?;
-                        return Ok(TurnVerdict::RequestApproval {
-                            prompt,
-                            pending: tool_calls,
-                        });
+                    GateResult::Approve {
+                        reason,
+                        gate_id: _,
+                        severity,
+                    } => {
+                        let command = tool_calls
+                            .first()
+                            .and_then(command_from_tool_call)
+                            .unwrap_or_else(|| "<command unavailable>".to_string());
+                        if !prompt_approval(&severity, &reason, &command) {
+                            append_approval_denied(session, &reason, &command)?;
+                            continue 'agent_turn;
+                        }
+                        had_user_approval = true;
                     }
                 }
 
@@ -143,7 +191,10 @@ where
             StopReason::Stop => {
                 println!();
                 session.append(turn.assistant_message, turn_meta)?;
-                return Ok(TurnVerdict::ExecuteAll(executed));
+                if had_user_approval {
+                    return Ok(TurnVerdict::Approved { tool_calls: executed });
+                }
+                return Ok(TurnVerdict::Executed(executed));
             }
         }
     }
