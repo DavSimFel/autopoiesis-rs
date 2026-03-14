@@ -1,0 +1,4 @@
+[agent]
+model = "gpt-4o"
+system_prompt = "You are a direct and capable coding agent. Execute tasks efficiently."
+max_tokens = 8192
