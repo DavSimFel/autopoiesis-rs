@@ -88,5 +88,19 @@ mod tests {
         let schema = execute_tool_definition();
         assert_eq!(schema.name, "execute");
         assert_eq!(schema.parameters["type"], "object");
+        let required = schema
+            .parameters
+            .get("required")
+            .and_then(|value| value.as_array())
+            .expect("schema must define required");
+        assert!(required.iter().any(|value| value == "command"));
+
+        let command_type = schema
+            .parameters
+            .get("properties")
+            .and_then(|value| value.get("command"))
+            .and_then(|value| value.get("type"))
+            .expect("command property should define type");
+        assert_eq!(command_type, "string");
     }
 }

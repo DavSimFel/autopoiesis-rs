@@ -35,7 +35,17 @@ mod tests {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_identity_dir(prefix: &str) -> std::path::PathBuf {
+    struct TempIdentityDir {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for TempIdentityDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn temp_identity_dir(prefix: &str) -> TempIdentityDir {
         let mut path = env::temp_dir();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -43,27 +53,33 @@ mod tests {
             .as_nanos();
         path.push(format!("autopoiesis_test_{prefix}_{now}"));
         fs::create_dir_all(&path).expect("failed to create temp identity dir");
-        path
+        TempIdentityDir { path }
+    }
+
+    impl TempIdentityDir {
+        fn path(&self) -> &Path {
+            &self.path
+        }
     }
 
     #[test]
     fn loads_and_concatenates_three_files() {
         let dir = temp_identity_dir("load_concat");
 
-        File::create(dir.join("constitution.md"))
+        File::create(dir.path().join("constitution.md"))
             .expect("failed to create constitution")
             .write_all(b"A")
             .expect("failed to write constitution");
-        File::create(dir.join("identity.md"))
+        File::create(dir.path().join("identity.md"))
             .expect("failed to create identity")
             .write_all(b"B")
             .expect("failed to write identity");
-        File::create(dir.join("context.md"))
+        File::create(dir.path().join("context.md"))
             .expect("failed to create context")
             .write_all(b"C")
             .expect("failed to write context");
 
-        let prompt = load_system_prompt(dir.to_str().expect("temp path should be utf8"), &HashMap::new())
+        let prompt = load_system_prompt(dir.path().to_str().expect("temp path should be utf8"), &HashMap::new())
             .expect("expected prompt load to succeed");
         assert_eq!(prompt, "A\n\nB\n\nC");
     }
@@ -72,15 +88,15 @@ mod tests {
     fn applies_template_vars_to_concatenated_result() {
         let dir = temp_identity_dir("template_vars");
 
-        File::create(dir.join("constitution.md"))
+        File::create(dir.path().join("constitution.md"))
             .expect("failed to create constitution")
             .write_all(b"name: {{name}}")
             .expect("failed to write constitution");
-        File::create(dir.join("identity.md"))
+        File::create(dir.path().join("identity.md"))
             .expect("failed to create identity")
             .write_all(b"cwd: {{cwd}}")
             .expect("failed to write identity");
-        File::create(dir.join("context.md"))
+        File::create(dir.path().join("context.md"))
             .expect("failed to create context")
             .write_all(b"done")
             .expect("failed to write context");
@@ -89,9 +105,29 @@ mod tests {
         vars.insert("name".to_string(), "Ada".to_string());
         vars.insert("cwd".to_string(), "/tmp".to_string());
 
-        let prompt = load_system_prompt(dir.to_str().expect("temp path should be utf8"), &vars)
+        let prompt = load_system_prompt(dir.path().to_str().expect("temp path should be utf8"), &vars)
             .expect("expected prompt load to succeed");
         assert_eq!(prompt, "name: Ada\n\ncwd: /tmp\n\ndone");
+    }
+
+    #[test]
+    fn empty_constitution_file_is_kept_as_empty_section() {
+        let dir = temp_identity_dir("empty_constitution");
+
+        File::create(dir.path().join("constitution.md"))
+            .expect("failed to create constitution");
+        File::create(dir.path().join("identity.md"))
+            .expect("failed to create identity")
+            .write_all(b"identity")
+            .expect("failed to write identity");
+        File::create(dir.path().join("context.md"))
+            .expect("failed to create context")
+            .write_all(b"context")
+            .expect("failed to write context");
+
+        let prompt = load_system_prompt(dir.path().to_str().expect("temp path should be utf8"), &HashMap::new())
+            .expect("expected prompt load to succeed");
+        assert_eq!(prompt, "\n\nidentity\n\ncontext");
     }
 
     #[test]
@@ -103,16 +139,16 @@ mod tests {
     #[test]
     fn errors_when_file_is_missing() {
         let dir = temp_identity_dir("missing_file");
-        File::create(dir.join("identity.md"))
+        File::create(dir.path().join("identity.md"))
             .expect("failed to create identity")
             .write_all(b"identity")
             .expect("failed to write identity");
-        File::create(dir.join("context.md"))
+        File::create(dir.path().join("context.md"))
             .expect("failed to create context")
             .write_all(b"context")
             .expect("failed to write context");
 
-        let result = load_system_prompt(dir.to_str().expect("temp path should be utf8"), &HashMap::new());
+        let result = load_system_prompt(dir.path().to_str().expect("temp path should be utf8"), &HashMap::new());
         assert!(result.is_err());
     }
 }

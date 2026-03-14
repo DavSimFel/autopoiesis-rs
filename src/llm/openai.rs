@@ -119,10 +119,187 @@ impl OpenAIProvider {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum SseEvent {
+    TextDelta(String),
+    FunctionCallArgumentsDelta {
+        call_id: Option<String>,
+        name: Option<String>,
+        delta: Option<String>,
+    },
+    FunctionCallArgumentsDone {
+        call_id: Option<String>,
+        name: Option<String>,
+        arguments: Option<String>,
+    },
+    FunctionCallOutputItemDone {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    Completed,
+    Done,
+}
+
+fn parse_sse_line(line: &str) -> Option<SseEvent> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with(':') {
+        return None;
+    }
+    if line == "data: [DONE]" {
+        return Some(SseEvent::Done);
+    }
+
+    let data = match line.strip_prefix("data: ") {
+        Some(data) => data,
+        None => return None,
+    };
+
+    let event: Value = serde_json::from_str(data).ok()?;
+    let event_type = event.get("type").and_then(|value| value.as_str())?;
+
+    match event_type {
+        "response.output_text.delta" => {
+            event.get("delta").and_then(Value::as_str).map(|delta| {
+                SseEvent::TextDelta(delta.to_string())
+            })
+        }
+        "response.function_call_arguments.delta" => Some(SseEvent::FunctionCallArgumentsDelta {
+            call_id: event
+                .get("call_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            name: event
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            delta: event
+                .get("delta")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        }),
+        "response.function_call_arguments.done" => Some(SseEvent::FunctionCallArgumentsDone {
+            call_id: event
+                .get("call_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            name: event
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            arguments: event
+                .get("arguments")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        }),
+        "response.output_item.done" => {
+            let item = event.get("item")?;
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                return None;
+            }
+            Some(SseEvent::FunctionCallOutputItemDone {
+                call_id: item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                name: item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                arguments: item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}")
+                    .to_string(),
+            })
+        }
+        "response.completed" => Some(SseEvent::Completed),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::llm::{ChatMessage, ChatRole, MessageContent, ToolCall};
+
+    fn collect_tokens_from_sse_chunks(chunks: &[&[u8]]) -> (Vec<String>, bool) {
+        let mut buffer = String::new();
+        let mut tokens = Vec::new();
+        let mut done = false;
+
+        for chunk in chunks {
+            let chunk = std::str::from_utf8(chunk).expect("mock SSE chunks should be valid utf-8");
+            buffer.push_str(chunk);
+
+            loop {
+                let line_end = match buffer.find('\n') {
+                    Some(index) => index,
+                    None => break,
+                };
+
+                let line = buffer[..line_end].to_string();
+                buffer.drain(..line_end + 1);
+
+                match parse_sse_line(&line) {
+                    Some(SseEvent::TextDelta(delta)) => tokens.push(delta),
+                    Some(SseEvent::Done) => {
+                        done = true;
+                        break;
+                    }
+                    Some(_) | None => {}
+                }
+            }
+
+            if done {
+                break;
+            }
+        }
+
+        (tokens, done)
+    }
+
+    #[test]
+    fn parse_sse_line_single_clean_output_text_event() {
+        let (tokens, done) = collect_tokens_from_sse_chunks(&[
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+        ]);
+
+        assert_eq!(tokens, vec!["hello".to_string()]);
+        assert!(!done);
+    }
+
+    #[test]
+    fn parse_sse_line_multiple_events_in_one_chunk() {
+        let (tokens, _) = collect_tokens_from_sse_chunks(&[
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\" world\"}\n",
+        ]);
+
+        assert_eq!(tokens, vec!["hello".to_string(), " world".to_string()]);
+    }
+
+    #[test]
+    fn parse_sse_line_partial_chunk_split_across_reads() {
+        let (tokens, done) = collect_tokens_from_sse_chunks(&[
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel",
+            b"lo\"}\n\ndata: [DONE]\n",
+        ]);
+
+        assert_eq!(tokens, vec!["hello".to_string()]);
+        assert!(done);
+    }
+
+    #[test]
+    fn parse_sse_line_done_terminates_stream() {
+        let (tokens, done) = collect_tokens_from_sse_chunks(&[
+            b"data: [DONE]\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n",
+        ]);
+
+        assert!(done);
+        assert!(tokens.is_empty());
+    }
 
     #[test]
     fn build_input_extracts_system_message_as_instructions() {
@@ -186,6 +363,44 @@ mod tests {
     fn build_tools_empty_vector_returns_empty_vector() {
         let result = OpenAIProvider::build_tools(&[]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn build_input_keeps_system_instructions_for_multi_turn_tool_roundtrip() {
+        let messages = vec![
+            ChatMessage::system("System directive"),
+            ChatMessage::user("Run the command"),
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: vec![MessageContent::ToolCall {
+                    call: ToolCall {
+                        id: "call-1".to_string(),
+                        name: "execute".to_string(),
+                        arguments: "{\"command\":\"echo hello\"}".to_string(),
+                    },
+                }],
+            },
+            ChatMessage {
+                role: ChatRole::Tool,
+                content: vec![MessageContent::tool_result(
+                    "call-1",
+                    "execute",
+                    "{\"stdout\":\"ok\"}",
+                )],
+            },
+        ];
+
+        let (instructions, input) = OpenAIProvider::build_input(&messages);
+        assert_eq!(instructions, Some("System directive".to_string()));
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "Run the command");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call-1");
+        assert_eq!(input[1]["name"], "execute");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call-1");
+        assert_eq!(input[2]["output"], "{\"stdout\":\"ok\"}");
     }
 }
 
@@ -258,117 +473,51 @@ impl LlmProvider for OpenAIProvider {
         // Parse SSE frame-by-frame.
         // Each line is either an empty heartbeat, comment, [DONE], or `data: {json}`.
         for raw_line in stream_text.lines() {
-            let line = raw_line.trim();
-
-            if line.is_empty() || line.starts_with(':') {
-                continue;
-            }
-            if line == "data: [DONE]" {
-                break;
-            }
-
-            let data = match line.strip_prefix("data: ") {
-                Some(data) => data,
-                None => continue,
-            };
-
-            let event: Value = match serde_json::from_str(data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-            match event_type {
-                // Streamed assistant text chunks.
-                "response.output_text.delta" => {
-                    if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
-                        assistant_content.push_str(delta);
-                        on_token(delta.to_string());
-                    }
+            match parse_sse_line(raw_line) {
+                Some(SseEvent::TextDelta(delta)) => {
+                    assistant_content.push_str(&delta);
+                    on_token(delta);
                 }
-
-                // Tool call argument stream: accumulates one JSON argument blob.
-                "response.function_call_arguments.delta" => {
-                    if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
-                        current_call_args.push_str(delta);
+                Some(SseEvent::FunctionCallArgumentsDelta { call_id, name, delta }) => {
+                    if let Some(delta) = delta {
+                        current_call_args.push_str(&delta);
                     }
 
                     if current_call_id.is_none()
-                        && let Some(id) = event.get("call_id").and_then(|v| v.as_str())
+                        && let Some(id) = call_id
                     {
-                        current_call_id = Some(id.to_string());
+                        current_call_id = Some(id);
                     }
                     if current_call_name.is_none()
-                        && let Some(name) = event.get("name").and_then(|v| v.as_str())
+                        && let Some(tool_name) = name
                     {
-                        current_call_name = Some(name.to_string());
+                        current_call_name = Some(tool_name);
                     }
                 }
-
-                // Finalized arguments from a function call event.
-                "response.function_call_arguments.done" => {
-                    let call_id = event
-                        .get("call_id")
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
+                Some(SseEvent::FunctionCallArgumentsDone { call_id, name, arguments }) => {
+                    let call_id = call_id
                         .or_else(|| current_call_id.take())
                         .unwrap_or_else(|| "unknown".to_string());
-
-                    let name = event
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
+                    let name = name
                         .or_else(|| current_call_name.take())
                         .unwrap_or_else(|| "unknown".to_string());
-
-                    let arguments = event
-                        .get("arguments")
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                        .unwrap_or_else(|| std::mem::take(&mut current_call_args));
+                    let arguments = arguments.unwrap_or_else(|| std::mem::take(&mut current_call_args));
 
                     pending_calls.insert(call_id, (name, arguments));
                     current_call_args.clear();
                     stop_reason = StopReason::ToolCalls;
                 }
-
-                // Tool-call item completion can include full args directly.
-                "response.output_item.done" => {
-                    if let Some(item) = event.get("item")
-                        && item.get("type").and_then(|t| t.as_str()) == Some("function_call")
-                    {
-                        let call_id = item
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let name = item
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let arguments = item
-                            .get("arguments")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("{}")
-                            .to_string();
-
-                        pending_calls.insert(call_id, (name, arguments));
-                        stop_reason = StopReason::ToolCalls;
-                    }
+                Some(SseEvent::FunctionCallOutputItemDone { call_id, name, arguments }) => {
+                    pending_calls.insert(call_id, (name, arguments));
+                    stop_reason = StopReason::ToolCalls;
                 }
-
-                // Final signal used to decide if we got tool calls vs normal completion.
-                "response.completed" => {
+                Some(SseEvent::Completed) => {
                     if pending_calls.is_empty() {
                         stop_reason = StopReason::Stop;
                     }
                 }
-
-                _ => {
-                    // Ignore nonessential events such as response.created/response.in_progress.
-                }
+                Some(SseEvent::Done) => break,
+                None => {}
             }
         }
 
@@ -402,5 +551,3 @@ impl LlmProvider for OpenAIProvider {
         })
     }
 }
-
-

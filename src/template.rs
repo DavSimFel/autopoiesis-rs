@@ -57,4 +57,30 @@ mod tests {
         let rendered = render_template("{{name}} and {{name}}", &vars);
         assert_eq!(rendered, "Ada and Ada");
     }
+
+    #[test]
+    fn empty_template_returns_empty_string() {
+        let vars = HashMap::new();
+        let rendered = render_template("", &vars);
+        assert_eq!(rendered, "");
+    }
+
+    #[test]
+    fn recursive_like_values_do_not_expand_again() {
+        let mut vars = HashMap::new();
+        vars.insert("x".to_string(), "{{y}}".to_string());
+
+        let rendered = render_template("{{x}}", &vars);
+        assert_eq!(rendered, "{{y}}");
+    }
+
+    #[test]
+    fn special_char_key_supports_dots_and_spaces() {
+        let mut vars = HashMap::new();
+        vars.insert("my.key".to_string(), "dot-key".to_string());
+        vars.insert("my key".to_string(), "space-key".to_string());
+
+        let rendered = render_template("{{my.key}} {{my key}}", &vars);
+        assert_eq!(rendered, "dot-key space-key");
+    }
 }

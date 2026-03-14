@@ -127,6 +127,14 @@ mod tests {
         );
         assert_eq!(config.reasoning_effort, None);
     }
+
+    #[test]
+    fn malformed_toml_returns_error() {
+        let path = temp_toml_path("malformed", "[agent]\nmodel = ");
+
+        let result = Config::load(&path);
+        assert!(result.is_err());
+    }
 }
 
 #[derive(Debug, Deserialize)]

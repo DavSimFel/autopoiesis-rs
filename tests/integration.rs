@@ -49,6 +49,35 @@ async fn simple_prompt() -> Result<()> {
 
 #[cfg(feature = "integration")]
 #[tokio::test]
+async fn invalid_model_returns_error() -> anyhow::Result<()> {
+    let config = Config::load("agents.toml")?;
+    let token = auth::get_valid_token().await?;
+    let provider = OpenAIProvider::new(
+        token,
+        config.base_url,
+        "nonexistent-model-xyz",
+        config.reasoning_effort,
+    );
+
+    let mut on_token = |token: String| {
+        // keep behavior consistent with other tests while proving the call can produce output before failing.
+        let _ = token;
+    };
+
+    let result = provider
+        .stream_completion(
+            &[ChatMessage::system("You are a helpful assistant."), ChatMessage::user("Hello")],
+            &[],
+            &mut on_token,
+        )
+        .await;
+
+    assert!(result.is_err());
+    Ok(())
+}
+
+#[cfg(feature = "integration")]
+#[tokio::test]
 async fn tool_call_roundtrip() -> Result<()> {
     let config = Config::load("agents.toml")?;
     let token = auth::get_valid_token().await?;
@@ -67,7 +96,12 @@ async fn tool_call_roundtrip() -> Result<()> {
 
     let turn = provider
         .stream_completion(
-            &[ChatMessage::system("You are a helpful assistant. Use tools when asked."), ChatMessage::user("Run: echo hello123")],
+            &[
+                ChatMessage::system("You are a helpful assistant. Use tools when asked."),
+                ChatMessage::user(
+                    "You MUST use the execute tool to run this shell command: echo hello123. Do not respond with text, only use the tool.",
+                ),
+            ],
             &tool_defs,
             &mut on_token,
         )
