@@ -1,3 +1,5 @@
+//! Agent orchestration loop coordinating model turns and tool execution.
+
 use std::io::{self, Write};
 
 use anyhow::Result;
@@ -6,6 +8,7 @@ use crate::llm::{ChatMessage, LlmProvider, StopReason};
 use crate::session::Session;
 use crate::tools;
 
+/// Run the agent loop until the model emits a non-tool stop reason.
 pub async fn run_agent_loop<F, Fut, P>(
     mut make_provider: F,
     session: &mut Session,
@@ -17,7 +20,6 @@ where
     P: LlmProvider,
 {
     let tools = vec![tools::execute_tool_definition()];
-
     session.add_user_message(user_prompt);
 
     loop {
@@ -29,25 +31,27 @@ where
         };
 
         let provider = make_provider().await?;
-
         let turn = provider
             .stream_completion(session.history(), &tools, &mut on_token)
             .await?;
 
         match turn.stop_reason {
+            // The model produced tool calls; append assistant turn and execute each in order.
             StopReason::ToolCalls => {
                 session.append(turn.assistant_message);
 
                 for call in turn.tool_calls {
                     let result = match tools::execute_tool_call(&call).await {
                         Ok(output) => output,
-                        Err(err) => format!("{{\"error\": \"{err}\"}}"),
+                        Err(err) => format!(r#"{{\"error\": \"{err}\"}}"#),
                     };
 
                     session.append(ChatMessage::tool_result(&call.id, &call.name, result));
                 }
             }
-            _ => {
+
+            // Final text output is appended and execution returns to caller.
+            StopReason::Stop => {
                 println!();
                 session.append(turn.assistant_message);
                 break;

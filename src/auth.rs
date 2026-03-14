@@ -1,9 +1,10 @@
+//! OpenAI device authorization flow for local token management.
+
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::{Client, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
@@ -14,35 +15,43 @@ const DEVICE_AUTH_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/u
 const POLL_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
+const REFRESH_WINDOW_SECONDS: u64 = 300;
 
+/// Stored OAuth credentials and refresh metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthTokens {
+    /// Short-lived bearer token used for API calls.
     pub access_token: String,
+    /// Refresh token used to mint a new access token.
     pub refresh_token: String,
+    /// Opaque token returned by the provider for identity use.
     pub id_token: String,
-    pub expires_at: DateTime<Utc>,
+    /// Unix timestamp (seconds) when `access_token` expires.
+    pub expires_at: u64,
 }
 
+/// Resolve the auth token file path from `$HOME` with a safe fallback.
 pub fn token_file_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".autopoiesis")
-        .join("auth.json")
+    let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home_dir).join(".autopoiesis").join("auth.json")
 }
 
+/// Read persisted tokens from disk.
 pub fn read_tokens() -> Result<AuthTokens> {
     load_tokens()
 }
 
+/// Run the device-code OAuth flow used by `autopoiesis auth login`.
+///
+/// Flow:
+/// 1) request a user code from the auth server,
+/// 2) ask the user to open the verification URL,
+/// 3) poll until authorization succeeds, then
+/// 4) exchange the returned code for access/refresh tokens.
 pub async fn device_code_login() -> Result<AuthTokens> {
     let client = Client::new();
 
-    let response: DeviceCodeResponse = post_json(
-        &client,
-        DEVICE_AUTH_URL,
-        &json!({"client_id": CLIENT_ID}),
-    )
-    .await?;
+    let response: DeviceCodeResponse = post_json(&client, DEVICE_AUTH_URL, &json!({"client_id": CLIENT_ID})).await?;
 
     let user_code = response
         .user_code
@@ -55,13 +64,15 @@ pub async fn device_code_login() -> Result<AuthTokens> {
     );
     println!("Waiting for device authorization...");
 
-    let authorization = poll_for_authorization(&client, &response.device_auth_id, &user_code, interval).await?;
+    let authorization =
+        poll_for_authorization(&client, &response.device_auth_id, &user_code, interval).await?;
     let tokens = exchange_authorization_code(&client, authorization.authorization_code, authorization.code_verifier).await?;
 
     save_tokens(&tokens)?;
     Ok(tokens)
 }
 
+/// Refresh stored tokens using a refresh token.
 pub async fn refresh_tokens(refresh_token: &str) -> Result<AuthTokens> {
     let form = [
         ("grant_type", "refresh_token"),
@@ -74,25 +85,20 @@ pub async fn refresh_tokens(refresh_token: &str) -> Result<AuthTokens> {
     Ok(tokens)
 }
 
+/// Return a valid access token, refreshing it if it is near expiry.
 pub async fn get_valid_token() -> Result<String> {
-    let tokens = read_tokens();
+    let tokens = read_tokens().context("no stored token found; run: autopoiesis auth login")?;
 
-    if tokens.is_err() {
-        return Err(anyhow!("Run: autopoiesis auth login"));
-    }
-
-    let tokens = tokens?;
-    let refresh_window = ChronoDuration::minutes(5);
-
-    if tokens.expires_at <= Utc::now() + refresh_window {
-            match refresh_tokens(&tokens.refresh_token).await {
-            Ok(refreshed) => return Ok(refreshed.access_token),
-            Err(error) => {
+    if token_is_near_expiry(tokens.expires_at)? {
+        let refreshed = refresh_tokens(&tokens.refresh_token)
+            .await
+            .map_err(|error| {
                 eprintln!("Failed to refresh token: {error}");
                 eprintln!("Run: autopoiesis auth login");
-                return Err(error);
-            }
-        }
+                error
+            })?;
+
+        return Ok(refreshed.access_token);
     }
 
     Ok(tokens.access_token)
@@ -113,6 +119,7 @@ async fn poll_for_authorization(
             return Err(anyhow!("authorization timed out after 15 minutes"));
         }
 
+        // Polling too aggressively can return transient errors; small interval keeps UX responsive.
         let poll_body = json!({
             "device_auth_id": device_auth_id,
             "user_code": user_code,
@@ -142,7 +149,10 @@ async fn poll_for_authorization(
             }
             _ => {
                 let status = response.status();
-                let body = response.text().await.unwrap_or_default();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| String::from("<failed to read response body>"));
                 println!();
                 return Err(anyhow!("authorization request failed ({status}): {body}"));
             }
@@ -160,7 +170,10 @@ async fn request_token(client: &Client, form: &[(&str, &str)]) -> Result<AuthTok
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| String::from("<failed to read response body>"));
         return Err(anyhow!("OAuth token request failed ({status}): {body}"));
     }
 
@@ -169,7 +182,12 @@ async fn request_token(client: &Client, form: &[(&str, &str)]) -> Result<AuthTok
         .await
         .context("failed to parse OAuth token response")?;
 
-    let expires_at = Utc::now() + ChronoDuration::seconds(token_response.expires_in.max(0));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX epoch")?
+        .as_secs();
+    let expires_in_seconds = token_response.expires_in.max(0) as u64;
+    let expires_at = now.saturating_add(expires_in_seconds);
 
     Ok(AuthTokens {
         access_token: token_response.access_token,
@@ -195,6 +213,15 @@ async fn exchange_authorization_code(
     request_token(client, &form).await
 }
 
+fn token_is_near_expiry(expires_at: u64) -> Result<bool> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX epoch")?
+        .as_secs();
+
+    Ok(expires_at <= now.saturating_add(REFRESH_WINDOW_SECONDS))
+}
+
 fn save_tokens(tokens: &AuthTokens) -> Result<()> {
     let path = token_file_path();
 
@@ -218,8 +245,7 @@ fn load_tokens() -> Result<AuthTokens> {
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
 
-    serde_json::from_str::<AuthTokens>(&raw)
-        .with_context(|| format!("failed to parse {}", path.display()))
+    serde_json::from_str::<AuthTokens>(&raw).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 fn format_user_code(code: &str) -> String {
@@ -244,7 +270,10 @@ async fn post_json<T: DeserializeOwned>(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| String::from("<failed to read response body>"));
         return Err(anyhow!("request failed ({status}): {body}"));
     }
 
@@ -269,6 +298,7 @@ where
 {
     use serde::de::Error;
     let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    // OpenAI sends `interval` inconsistently as either a number or a string depending on API path/version.
     match value {
         None => Ok(None),
         Some(serde_json::Value::Number(n)) => Ok(n.as_u64()),

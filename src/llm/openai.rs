@@ -1,22 +1,23 @@
+//! OpenAI Responses API client for streaming completions and tool calls.
+
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use futures::TryStreamExt;
 use reqwest::Client;
-// serde used by tests
+// serde is used by tests and by request/response payload assembly.
 use serde_json::{json, Value};
 
 use crate::llm::{
-    ChatMessage, ChatRole, FunctionTool, LlmProvider, MessageContent, StopReason, StreamedTurn,
+    ChatMessage, ChatRole, FunctionTool, LlmProvider, MessageContent, StreamedTurn, StopReason,
     ToolCall,
 };
 
+/// HTTP client and request settings for the OpenAI-compatible Responses API.
 #[derive(Debug, Clone)]
 pub struct OpenAIProvider {
     api_key: String,
     base_url: String,
     model: String,
-    max_output_tokens: Option<u32>,
     reasoning_effort: Option<String>,
     client: Client,
 }
@@ -26,20 +27,18 @@ impl OpenAIProvider {
         api_key: impl Into<String>,
         base_url: impl Into<String>,
         model: impl Into<String>,
-        max_output_tokens: Option<u32>,
         reasoning_effort: Option<String>,
     ) -> Self {
         Self {
             api_key: api_key.into(),
             base_url: base_url.into(),
             model: model.into(),
-            max_output_tokens,
             reasoning_effort,
             client: Client::new(),
         }
     }
 
-    /// Extract system prompt from messages and convert remaining to Responses API input format
+    /// Extract the system prompt and convert prior messages to the responses API item format.
     fn build_input(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
         let mut instructions = None;
         let mut input = Vec::new();
@@ -47,7 +46,7 @@ impl OpenAIProvider {
         for msg in messages {
             match msg.role {
                 ChatRole::System => {
-                    // Extract system prompt as instructions
+                    // Keep only the latest system instruction message.
                     for block in &msg.content {
                         if let MessageContent::Text { text } = block {
                             instructions = Some(text.clone());
@@ -65,7 +64,7 @@ impl OpenAIProvider {
                     }
                 }
                 ChatRole::Assistant => {
-                    // Assistant messages may contain text and/or tool calls
+                    // Assistant messages may include text chunks and/or prior tool call stubs.
                     for block in &msg.content {
                         match block {
                             MessageContent::Text { text } => {
@@ -87,7 +86,7 @@ impl OpenAIProvider {
                     }
                 }
                 ChatRole::Tool => {
-                    // Tool results become function_call_output
+                    // Tool results map to function_call_output in the responses API format.
                     for block in &msg.content {
                         if let MessageContent::ToolResult { result } = block {
                             input.push(json!({
@@ -104,7 +103,7 @@ impl OpenAIProvider {
         (instructions, input)
     }
 
-    /// Convert FunctionTool to Responses API tool format
+    /// Convert internal tool descriptions into Responses API `tools` payloads.
     fn build_tools(tools: &[FunctionTool]) -> Vec<Value> {
         tools
             .iter()
@@ -120,8 +119,13 @@ impl OpenAIProvider {
     }
 }
 
-#[async_trait::async_trait]
 impl LlmProvider for OpenAIProvider {
+    /// Stream a completion and parse SSE events from the OpenAI Responses API.
+    ///
+    /// The parser understands the minimal event set needed by the current agent:
+    /// - partial assistant output
+    /// - tool call argument streaming and completion
+    /// - final completion signal
     async fn stream_completion(
         &self,
         messages: &[ChatMessage],
@@ -161,142 +165,144 @@ impl LlmProvider for OpenAIProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| String::from("<failed to read response body>"));
             anyhow::bail!("API error {status}: {body}");
         }
 
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
-        let mut assistant_content = String::new();
+        let stream_text = response
+            .text()
+            .await
+            .context("failed to read streamed completion response")?;
 
-        // Track function calls: call_id -> (name, arguments)
+        // Track tool calls as they arrive: call_id -> (name, args).
         let mut pending_calls: HashMap<String, (String, String)> = HashMap::new();
         let mut current_call_id: Option<String> = None;
         let mut current_call_name: Option<String> = None;
         let mut current_call_args = String::new();
         let mut stop_reason = StopReason::Stop;
+        let mut assistant_content = String::new();
 
-        while let Some(chunk) = stream.try_next().await.context("stream read error")? {
-            let chunk_text = std::str::from_utf8(&chunk)
-                .context("received non-utf8 data from stream")?;
-            buffer.push_str(chunk_text);
+        // Parse SSE frame-by-frame.
+        // Each line is either an empty heartbeat, comment, [DONE], or `data: {json}`.
+        for raw_line in stream_text.lines() {
+            let line = raw_line.trim();
 
-            while let Some(line_break) = buffer.find('\n') {
-                let line = buffer[..line_break].trim().to_string();
-                buffer.drain(0..line_break + 1);
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+            if line == "data: [DONE]" {
+                break;
+            }
 
-                if line.is_empty() || line.starts_with(':') {
-                    continue;
+            let data = match line.strip_prefix("data: ") {
+                Some(data) => data,
+                None => continue,
+            };
+
+            let event: Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            match event_type {
+                // Streamed assistant text chunks.
+                "response.output_text.delta" => {
+                    if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
+                        assistant_content.push_str(delta);
+                        on_token(delta.to_string());
+                    }
                 }
 
-                if line == "data: [DONE]" {
-                    break;
+                // Tool call argument stream: accumulates one JSON argument blob.
+                "response.function_call_arguments.delta" => {
+                    if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
+                        current_call_args.push_str(delta);
+                    }
+
+                    if current_call_id.is_none()
+                        && let Some(id) = event.get("call_id").and_then(|v| v.as_str())
+                    {
+                        current_call_id = Some(id.to_string());
+                    }
+                    if current_call_name.is_none()
+                        && let Some(name) = event.get("name").and_then(|v| v.as_str())
+                    {
+                        current_call_name = Some(name.to_string());
+                    }
                 }
 
-                let data = if let Some(stripped) = line.strip_prefix("data: ") {
-                    stripped
-                } else {
-                    continue;
-                };
+                // Finalized arguments from a function call event.
+                "response.function_call_arguments.done" => {
+                    let call_id = event
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .or_else(|| current_call_id.take())
+                        .unwrap_or_else(|| "unknown".to_string());
 
-                let event: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
+                    let name = event
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .or_else(|| current_call_name.take())
+                        .unwrap_or_else(|| "unknown".to_string());
 
-                let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    let arguments = event
+                        .get("arguments")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .unwrap_or_else(|| std::mem::take(&mut current_call_args));
 
-                match event_type {
-                    "response.output_text.delta" => {
-                        if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
-                            assistant_content.push_str(delta);
-                            on_token(delta.to_string());
-                        }
-                    }
+                    pending_calls.insert(call_id, (name, arguments));
+                    current_call_args.clear();
+                    stop_reason = StopReason::ToolCalls;
+                }
 
-                    "response.function_call_arguments.delta" => {
-                        if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
-                            current_call_args.push_str(delta);
-                        }
-                        // Capture call_id and name from the first delta if present
-                        if current_call_id.is_none() {
-                            if let Some(id) = event.get("call_id").and_then(|v| v.as_str()) {
-                                current_call_id = Some(id.to_string());
-                            }
-                        }
-                        if current_call_name.is_none() {
-                            if let Some(name) = event.get("name").and_then(|v| v.as_str()) {
-                                current_call_name = Some(name.to_string());
-                            }
-                        }
-                    }
-
-                    "response.function_call_arguments.done" => {
-                        let call_id = event
-                            .get("call_id")
+                // Tool-call item completion can include full args directly.
+                "response.output_item.done" => {
+                    if let Some(item) = event.get("item")
+                        && item.get("type").and_then(|t| t.as_str()) == Some("function_call")
+                    {
+                        let call_id = item
+                            .get("id")
                             .and_then(|v| v.as_str())
-                            .map(String::from)
-                            .or(current_call_id.take())
-                            .unwrap_or_else(|| "unknown".to_string());
-
-                        let name = event
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let name = item
                             .get("name")
                             .and_then(|v| v.as_str())
-                            .map(String::from)
-                            .or(current_call_name.take())
-                            .unwrap_or_else(|| "unknown".to_string());
-
-                        let arguments = event
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let arguments = item
                             .get("arguments")
                             .and_then(|v| v.as_str())
-                            .map(String::from)
-                            .unwrap_or_else(|| std::mem::take(&mut current_call_args));
+                            .unwrap_or("{}")
+                            .to_string();
 
                         pending_calls.insert(call_id, (name, arguments));
-                        current_call_args.clear();
                         stop_reason = StopReason::ToolCalls;
                     }
+                }
 
-                    "response.output_item.done" => {
-                        if let Some(item) = event.get("item") {
-                            if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                                let call_id = item
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown")
-                                    .to_string();
-                                let name = item
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown")
-                                    .to_string();
-                                let arguments = item
-                                    .get("arguments")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("{}")
-                                    .to_string();
-
-                                pending_calls.insert(call_id, (name, arguments));
-                                stop_reason = StopReason::ToolCalls;
-                            }
-                        }
+                // Final signal used to decide if we got tool calls vs normal completion.
+                "response.completed" => {
+                    if pending_calls.is_empty() {
+                        stop_reason = StopReason::Stop;
                     }
+                }
 
-                    "response.completed" => {
-                        // Final event — we can extract output from here too if needed
-                        if pending_calls.is_empty() {
-                            stop_reason = StopReason::Stop;
-                        }
-                    }
-
-                    _ => {
-                        // Ignore other event types (response.created, response.in_progress, etc.)
-                    }
+                _ => {
+                    // Ignore nonessential events such as response.created/response.in_progress.
                 }
             }
         }
 
-        // Build tool calls from pending
+        // Build tool calls from pending events.
         let tool_calls: Vec<ToolCall> = pending_calls
             .into_iter()
             .map(|(id, (name, arguments))| ToolCall {
@@ -306,7 +312,7 @@ impl LlmProvider for OpenAIProvider {
             })
             .collect();
 
-        // Build assistant message
+        // Build assistant message for session history.
         let mut assistant_msg = ChatMessage::with_role(ChatRole::Assistant);
         if !assistant_content.is_empty() {
             assistant_msg

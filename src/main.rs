@@ -1,3 +1,5 @@
+//! Binary entrypoint for the `autopoiesis` CLI.
+
 use anyhow::{anyhow, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 
@@ -87,26 +89,21 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let mut session = Session::new(config.system_prompt);
+            let mut session = Session::new(config.system_prompt.clone());
             let prompt = cli.prompt.join(" ");
-            let base_url = config.base_url.clone();
-            let model = config.model.clone();
-            let max_output_tokens = config.max_output_tokens;
-            let reasoning_effort = config.reasoning_effort.clone();
+            let provider_config = config.clone();
 
+            // Build a fresh provider per turn so the auth token can be refreshed mid-session.
             let provider_factory = move || {
-                let base_url = base_url.clone();
-                let model = model.clone();
-                let reasoning_effort = reasoning_effort.clone();
+                let provider_config = provider_config.clone();
 
                 async move {
                     let api_key = auth::get_valid_token().await?;
                     Ok::<OpenAIProvider, anyhow::Error>(OpenAIProvider::new(
                         api_key,
-                        base_url,
-                        model,
-                        max_output_tokens,
-                        reasoning_effort,
+                        provider_config.base_url,
+                        provider_config.model,
+                        provider_config.reasoning_effort,
                     ))
                 }
             };

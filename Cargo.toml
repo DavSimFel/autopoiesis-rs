@@ -2,18 +2,14 @@
 name = "autopoiesis"
 version = "0.1.0"
 edition = "2024"
+description = "A lightweight Rust agent runtime with an LLM loop and shell tooling."
+license = "MIT"
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "brotli", "gzip", "deflate", "zstd"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "brotli", "gzip", "deflate", "zstd"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-futures = "0.3"
 anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = "0.3"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
-async-trait = "0.1"
-chrono = { version = "0.4", features = ["serde"] }
-dirs = "5"

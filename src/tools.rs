@@ -1,3 +1,5 @@
+//! Tool execution layer exposed to the LLM.
+
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -9,6 +11,7 @@ use crate::llm::{FunctionTool, ToolCall};
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 
+/// Definition of the only built-in tool: run shell commands.
 pub fn execute_tool_definition() -> FunctionTool {
     FunctionTool {
         name: "execute".to_string(),
@@ -31,6 +34,7 @@ pub fn execute_tool_definition() -> FunctionTool {
     }
 }
 
+/// Execute a single tool call returned by the model.
 pub async fn execute_tool_call(call: &ToolCall) -> Result<String> {
     let args = parse_execute_args(&call.arguments)?;
     let command = args
@@ -44,6 +48,7 @@ pub async fn execute_tool_call(call: &ToolCall) -> Result<String> {
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_TIMEOUT_SECONDS * 1000);
 
+    // Keep command execution non-blocking and avoid hanging sessions.
     let output = timeout(
         Duration::from_millis(timeout_ms),
         Command::new("sh").arg("-lc").arg(&command).output(),
