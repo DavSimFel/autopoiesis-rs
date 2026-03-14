@@ -77,7 +77,7 @@ impl OpenAIProvider {
                             MessageContent::ToolCall { call } => {
                                 input.push(json!({
                                     "type": "function_call",
-                                    "id": call.id,
+                                    "call_id": call.id,
                                     "name": call.name,
                                     "arguments": call.arguments
                                 }));

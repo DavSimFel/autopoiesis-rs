@@ -1,5 +1,4 @@
 [agent]
-model = "gpt-5.4"
+model = "gpt-5.3-codex-spark"
 system_prompt = "You are a direct and capable coding agent. Execute tasks efficiently."
-max_output_tokens = 16384
-reasoning_effort = "high"  # low, medium, high
+reasoning_effort = "high"
