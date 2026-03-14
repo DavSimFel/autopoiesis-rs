@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use serde_json::Value;
 use serde_json::from_str;
 
 use crate::llm::{ChatMessage, MessageContent, ToolCall};
+use crate::{identity, util};
 
 /// Execution bands for the gate pipeline.
 #[derive(Clone, Copy)]
@@ -42,6 +44,126 @@ pub enum GateResult {
     Block { reason: String, gate_id: String },
     Edit,
     Request { prompt: String, gate_id: String },
+}
+
+/// Gate that assembles the system prompt from identity files.
+pub struct IdentityGate {
+    identity_dir: String,
+    vars: HashMap<String, String>,
+    fallback_prompt: String,
+}
+
+impl IdentityGate {
+    pub fn new(identity_dir: &str, vars: HashMap<String, String>, fallback: &str) -> Self {
+        Self {
+            identity_dir: identity_dir.to_string(),
+            vars,
+            fallback_prompt: fallback.to_string(),
+        }
+    }
+
+    fn load_prompt(&self) -> String {
+        identity::load_system_prompt(&self.identity_dir, &self.vars)
+            .unwrap_or_else(|_| self.fallback_prompt.clone())
+    }
+}
+
+impl Gate for IdentityGate {
+    fn id(&self) -> &str {
+        "identity"
+    }
+
+    fn band(&self) -> Band {
+        Band::Assemble
+    }
+
+    fn direction(&self) -> Direction {
+        Direction::In
+    }
+
+    fn check(&self, event: &mut GateEvent) -> GateResult {
+        let GateEvent::Messages(messages) = event else {
+            return GateResult::Allow;
+        };
+
+        if messages.is_empty() {
+            return GateResult::Allow;
+        }
+
+        let first = &mut messages[0];
+        if first.role != crate::llm::ChatRole::System {
+            return GateResult::Allow;
+        }
+
+        let rendered = self.load_prompt();
+        let replacement = MessageContent::text(rendered.clone());
+        let needs_edit = match &first.content[..] {
+            [MessageContent::Text { text }] if text == &rendered => false,
+            _ => true,
+        };
+
+        if needs_edit {
+            first.content.clear();
+            first.content.push(replacement);
+            GateResult::Edit
+        } else {
+            GateResult::Allow
+        }
+    }
+}
+
+/// Gate that prepends a UTC timestamp to the last inbound user message.
+pub struct TimestampGate;
+
+impl TimestampGate {
+    fn is_already_timestamped(text: &str) -> bool {
+        text.starts_with('[') && text.contains('T') && text.contains('Z')
+    }
+}
+
+impl Gate for TimestampGate {
+    fn id(&self) -> &str {
+        "timestamp"
+    }
+
+    fn band(&self) -> Band {
+        Band::Enrich
+    }
+
+    fn direction(&self) -> Direction {
+        Direction::In
+    }
+
+    fn check(&self, event: &mut GateEvent) -> GateResult {
+        let GateEvent::Messages(messages) = event else {
+            return GateResult::Allow;
+        };
+
+        for message in messages.iter_mut().rev() {
+            if message.role != crate::llm::ChatRole::User {
+                continue;
+            }
+
+            let Some(text) = message.content.iter_mut().find_map(|block| {
+                if let MessageContent::Text { text } = block {
+                    Some(text)
+                } else {
+                    None
+                }
+            }) else {
+                return GateResult::Allow;
+            };
+
+            if Self::is_already_timestamped(text) {
+                return GateResult::Allow;
+            }
+
+            *text = format!("[{}] {}", util::utc_timestamp(), text.clone());
+            return GateResult::Edit;
+        }
+
+        GateResult::Allow
+    }
 }
 
 /// Interface for all gates.
@@ -575,6 +697,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+    use std::{env, fs, time::{SystemTime, UNIX_EPOCH}};
 
     fn make_secret_gate() -> SecretRedactor {
         SecretRedactor::new(&[
@@ -586,6 +709,40 @@ mod tests {
 
     fn make_messages(text: &str) -> Vec<ChatMessage> {
         vec![ChatMessage::user(text)]
+    }
+
+    struct TempIdentityDir {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for TempIdentityDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    impl TempIdentityDir {
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    fn temp_identity_dir(prefix: &str) -> TempIdentityDir {
+        let path = env::temp_dir().join(format!(
+            "autopoiesis_gate_identity_test_{prefix}_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).expect("failed to create temp identity directory");
+        TempIdentityDir { path }
+    }
+
+    fn make_identity_files(dir: &TempIdentityDir, files: &[(&str, &str)]) {
+        for (name, contents) in files {
+            fs::write(dir.path().join(name), contents).expect("failed to write identity file");
+        }
     }
 
     fn make_tool_call(cmd: &str) -> ToolCall {
@@ -865,6 +1022,161 @@ mod tests {
         };
         assert!(!redacted.contains("sk-proj-"));
         assert!(!redacted.contains("ghp_"));
+    }
+
+    #[test]
+    fn identity_gate_replaces_system_message() {
+        let dir = temp_identity_dir("replaces");
+        make_identity_files(
+            &dir,
+            &[
+                ("constitution.md", "constitution"),
+                ("identity.md", "identity"),
+                ("context.md", "context"),
+            ],
+        );
+
+        let mut vars = HashMap::new();
+        vars.insert("model".to_string(), "gpt-5.4".to_string());
+        let gate = IdentityGate::new(dir.path().to_str().expect("temp path should be utf-8"), vars, "fallback");
+        let mut messages = vec![
+            ChatMessage::system("old"),
+            ChatMessage::user("ask"),
+        ];
+        let mut event = GateEvent::Messages(&mut messages);
+
+        assert!(matches!(gate.check(&mut event), GateResult::Edit));
+        let content = match &messages[0].content[0] {
+            MessageContent::Text { text } => text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(content, "constitution\n\nidentity\n\ncontext");
+    }
+
+    #[test]
+    fn identity_gate_uses_fallback_on_missing_dir() {
+        let mut vars = HashMap::new();
+        vars.insert("model".to_string(), "gpt-5.4".to_string());
+        let gate = IdentityGate::new(
+            "/does/not/exist",
+            vars,
+            "fallback prompt",
+        );
+
+        let mut messages = vec![ChatMessage::system("old prompt")];
+        let mut event = GateEvent::Messages(&mut messages);
+
+        assert!(matches!(gate.check(&mut event), GateResult::Edit));
+        let content = match &messages[0].content[0] {
+            MessageContent::Text { text } => text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(content, "fallback prompt");
+    }
+
+    #[test]
+    fn identity_gate_applies_template_vars() {
+        let dir = temp_identity_dir("template_vars");
+        make_identity_files(
+            &dir,
+            &[
+                ("constitution.md", "model: {{model}}"),
+                ("identity.md", "cwd: {{cwd}}"),
+                ("context.md", "tool: {{tool}}"),
+            ],
+        );
+
+        let mut vars = HashMap::new();
+        vars.insert("model".to_string(), "gpt-4".to_string());
+        vars.insert("cwd".to_string(), "/tmp/proj".to_string());
+        vars.insert("tool".to_string(), "execute".to_string());
+        let gate = IdentityGate::new(dir.path().to_str().expect("temp path should be utf-8"), vars, "fallback");
+        let mut messages = vec![ChatMessage::system("old")];
+        let mut event = GateEvent::Messages(&mut messages);
+
+        assert!(matches!(gate.check(&mut event), GateResult::Edit));
+        let content = match &messages[0].content[0] {
+            MessageContent::Text { text } => text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(content, "model: gpt-4\n\ncwd: /tmp/proj\n\ntool: execute");
+    }
+
+    #[test]
+    fn timestamp_gate_prepends_to_last_user_message() {
+        let gate = TimestampGate;
+        let mut messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("first"),
+            ChatMessage::assistant("assistant"),
+            ChatMessage::user("last"),
+        ];
+
+        let mut event = GateEvent::Messages(&mut messages);
+        assert!(matches!(gate.check(&mut event), GateResult::Edit));
+
+        let first_user = match &messages[1].content[0] {
+            MessageContent::Text { text } => text,
+            _ => panic!("expected text"),
+        };
+        let last_user = match &messages[3].content[0] {
+            MessageContent::Text { text } => text,
+            _ => panic!("expected text"),
+        };
+
+        assert_eq!(first_user, "first");
+        assert!(last_user.starts_with("["));
+        assert!(last_user.contains('T'));
+        assert!(last_user.contains("] last"));
+        assert!(matches!(gate.check(&mut event), GateResult::Allow));
+    }
+
+    #[test]
+    fn timestamp_gate_skips_already_timestamped() {
+        let gate = TimestampGate;
+        let mut messages = vec![ChatMessage::user("[2026-03-14T12:00:00Z] already")];
+        let mut event = GateEvent::Messages(&mut messages);
+
+        assert!(matches!(gate.check(&mut event), GateResult::Allow));
+        let text = match &messages[0].content[0] {
+            MessageContent::Text { text } => text,
+            _ => panic!("expected text"),
+        };
+        assert_eq!(text, "[2026-03-14T12:00:00Z] already");
+    }
+
+    #[test]
+    fn timestamp_gate_ignores_non_user_messages() {
+        let gate = TimestampGate;
+        let mut messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::assistant("assistant"),
+            ChatMessage::system("system2"),
+        ];
+        let mut event = GateEvent::Messages(&mut messages);
+
+        assert!(matches!(gate.check(&mut event), GateResult::Allow));
+        assert_eq!(
+            match &messages[0].content[0] {
+                MessageContent::Text { text } => text,
+                _ => panic!("expected text"),
+            },
+            "system"
+        );
+        assert_eq!(
+            match &messages[1].content[0] {
+                MessageContent::Text { text } => text,
+                _ => panic!("expected text"),
+            },
+            "assistant"
+        );
+        assert_eq!(
+            match &messages[2].content[0] {
+                MessageContent::Text { text } => text,
+                _ => panic!("expected text"),
+            },
+            "system2"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use std::io::{self, BufRead, Write};
-use autopoiesis::{agent, auth, config, gate, identity, llm, session, tools};
+use autopoiesis::{agent, auth, config, gate, llm, session, tools};
 
 use std::collections::HashMap;
 use std::env;
@@ -74,28 +74,10 @@ async fn main() -> Result<()> {
             let config = config::Config::load("agents.toml")
                 .map_err(|error| anyhow!("failed to load configuration: {error}"))?;
 
-            let cwd = env::current_dir()
-                .ok()
-                .and_then(|path| path.to_str().map(ToString::to_string))
-                .unwrap_or_else(String::new);
-            let tools = vec![tools::execute_tool_definition()];
-            let tool_names = tools
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
-            let mut vars = HashMap::new();
-            vars.insert("model".to_string(), config.model.clone());
-            vars.insert("cwd".to_string(), cwd);
-            vars.insert("tools".to_string(), tool_names);
-
-            let system_prompt = identity::load_system_prompt("identity", &vars)
-                .unwrap_or(config.system_prompt.clone());
-
-            let mut session = session::Session::new(system_prompt, "sessions")?;
+            let mut session = session::Session::new("You are a helpful assistant.", "sessions")?;
             session.load_today()?;
             let provider_config = config.clone();
-            let pipeline = default_pipeline();
+            let pipeline = default_pipeline(&config);
 
             // Build a fresh provider per turn so the auth token can be refreshed mid-session.
             let mut provider_factory = move || {
@@ -124,9 +106,9 @@ async fn main() -> Result<()> {
                         break;
                     }
                     let prompt = line.trim();
-                    if prompt.is_empty() {
-                        continue;
-                    }
+                if prompt.is_empty() {
+                    continue;
+                }
                     if prompt == "exit" || prompt == "quit" {
                         break;
                     }
@@ -154,8 +136,25 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn default_pipeline() -> gate::Pipeline {
+fn default_pipeline(config: &config::Config) -> gate::Pipeline {
+    let cwd = env::current_dir()
+        .ok()
+        .and_then(|path| path.to_str().map(ToString::to_string))
+        .unwrap_or_else(String::new);
+    let tools = vec![tools::execute_tool_definition()];
+    let tools_list = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut vars = HashMap::new();
+    vars.insert("model".to_string(), config.model.clone());
+    vars.insert("cwd".to_string(), cwd);
+    vars.insert("tools".to_string(), tools_list);
+
     gate::Pipeline::new()
+        .assemble(gate::IdentityGate::new("identity", vars, &config.system_prompt))
+        .enrich(gate::TimestampGate)
         .sanitize(gate::SecretRedactor::new(&[
             r"sk-[a-zA-Z0-9_-]{20,}",
             r"ghp_[a-zA-Z0-9]{36}",

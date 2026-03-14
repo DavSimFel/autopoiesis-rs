@@ -8,7 +8,6 @@ use crate::gate::{GateResult, Pipeline};
 use crate::llm::{ChatMessage, LlmProvider, StopReason, ToolCall};
 use crate::session::Session;
 use crate::tools;
-use crate::util::utc_timestamp;
 
 pub enum TurnVerdict {
     ExecuteAll(Vec<ToolCall>),
@@ -29,8 +28,7 @@ where
     P: LlmProvider,
 {
     let tools = vec![tools::execute_tool_definition()];
-    let stamped_prompt = format!("[{}] {}", utc_timestamp(), user_prompt);
-    session.add_user_message(stamped_prompt)?;
+    session.add_user_message(user_prompt)?;
 
     let mut executed: Vec<ToolCall> = Vec::new();
 
