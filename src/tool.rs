@@ -1,15 +1,47 @@
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::process::Command as StdCommand;
 use std::time::Duration;
-use std::{process::Command, thread};
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+use tokio::time::timeout;
+use tokio::process::Command as TokioCommand;
 
 use crate::llm::FunctionTool;
+
+#[cfg(unix)]
+fn set_resource_limits() -> io::Result<()> {
+    let limits = [
+        (libc::RLIMIT_NPROC, 512u64),
+        (libc::RLIMIT_FSIZE, 16 * 1024 * 1024),
+        (libc::RLIMIT_CPU, 30u64),
+    ];
+
+    for (resource, value) in limits {
+        let limit = libc::rlimit {
+            rlim_cur: value as libc::rlim_t,
+            rlim_max: value as libc::rlim_t,
+        };
+
+        // SAFETY: `setrlimit` is safe to call in the child process pre-exec.
+        if unsafe { libc::setrlimit(resource, &limit as *const _) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    Ok(())
+}
+
+pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
 
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn definition(&self) -> FunctionTool;
-    fn execute(&self, arguments: &str) -> Result<String>;
+    fn execute(&self, arguments: &str) -> ToolFuture<'_>;
 }
 
 pub struct Shell;
@@ -59,58 +91,66 @@ impl Tool for Shell {
         }
     }
 
-    fn execute(&self, arguments: &str) -> Result<String> {
-        let args = Self::parse_execute_args(arguments)?;
-        let command = args
-            .get("command")
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-            .context("tool call requires a non-empty 'command' argument")?;
-        let timeout_ms = args
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_TIMEOUT_SECONDS * 1000);
+    fn execute(&self, arguments: &str) -> ToolFuture<'_> {
+        let arguments = arguments.to_string();
+        Box::pin(async move {
+            let args = Self::parse_execute_args(&arguments)?;
+            let command = args
+                .get("command")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .context("tool call requires a non-empty 'command' argument")?;
+            let timeout_ms = args
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_TIMEOUT_SECONDS * 1000);
 
-        // Keep command execution synchronous and bounded by timeout.
-        let output = Self::run_with_timeout(&command, timeout_ms)
-            .context("failed to run shell command")?;
+            // Keep command execution async and bounded by timeout.
+            let output = Self::run_with_timeout(&command, timeout_ms)
+                .await
+                .context("failed to run shell command")?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
 
-        let mut result = String::new();
-        result.push_str("stdout:\n");
-        if !stdout.is_empty() {
-            result.push_str(&stdout);
-        }
-        result.push_str("\nstderr:\n");
-        if !stderr.is_empty() {
-            result.push_str(&stderr);
-        }
-        result.push_str("\nexit_code=");
-        result.push_str(&output.status.code().unwrap_or(-1).to_string());
+            let mut result = String::new();
+            result.push_str("stdout:\n");
+            if !stdout.is_empty() {
+                result.push_str(&stdout);
+            }
+            result.push_str("\nstderr:\n");
+            if !stderr.is_empty() {
+                result.push_str(&stderr);
+            }
+            result.push_str("\nexit_code=");
+            result.push_str(&output.status.code().unwrap_or(-1).to_string());
 
-        Ok(result)
+            Ok(result)
+        })
     }
 }
 
 impl Shell {
-    fn run_with_timeout(command: &str, timeout_ms: u64) -> Result<std::process::Output> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let command = command.to_string();
+    async fn run_with_timeout(
+        command_text: &str,
+        timeout_ms: u64,
+    ) -> Result<std::process::Output> {
+        let mut command = StdCommand::new("sh");
+        command.arg("-lc").arg(command_text);
 
-        thread::spawn(move || {
-            let output = Command::new("sh")
-                .arg("-lc")
-                .arg(&command)
-                .output();
-            let _ = tx.send(output);
-        });
+        #[cfg(unix)]
+        unsafe {
+            // SAFETY: pre_exec is required by the request to configure per-command limits.
+            command.pre_exec(set_resource_limits);
+        }
+
+        let mut command = TokioCommand::from(command);
 
         let duration = Duration::from_millis(timeout_ms);
-        rx.recv_timeout(duration)
-            .map_err(|_| anyhow!("tool execute timed out after {timeout_ms}ms"))?
-            .map_err(|e| anyhow!(e))
+        let output = timeout(duration, command.output())
+            .await
+            .map_err(|_| anyhow!("tool execute timed out after {timeout_ms}ms"))?;
+        output.map_err(|e: std::io::Error| anyhow!(e))
     }
 
     fn _default_timeout_ms() -> u64 {

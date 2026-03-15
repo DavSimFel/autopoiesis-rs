@@ -49,141 +49,63 @@ impl Turn {
     pub fn check_inbound(&self, messages: &mut Vec<ChatMessage>) -> Verdict {
         let baseline = messages.clone();
         self.assemble_context(messages);
-        let mut verdict = verdict_from_mutations(messages, &baseline);
-        let mut approved: Option<(String, String, Severity)> = None;
-
-        let mut event = GuardEvent::Inbound(messages);
-        for guard in &self.guards {
-            match guard.check(&mut event) {
-                Verdict::Allow => {}
-                Verdict::Modify => verdict = true,
-                Verdict::Deny { reason, gate_id } => {
-                    return Verdict::Deny { reason, gate_id };
-                }
-                Verdict::Approve {
-                    reason,
-                    gate_id,
-                    severity,
-                } => {
-                    if approved.is_none()
-                        || approved
-                            .as_ref()
-                            .is_some_and(|(_, _, current)| {
-                                *current == Severity::Low && severity == Severity::High
-                            })
-                    {
-                        approved = Some((reason, gate_id, severity));
-                    }
-                }
-            }
-        }
-
-        if let Some((reason, gate_id, severity)) = approved {
-            Verdict::Approve {
-                reason,
-                gate_id,
-                severity,
-            }
-        } else if verdict {
-            Verdict::Modify
-        } else {
-            Verdict::Allow
-        }
+        let verdict = verdict_from_mutations(messages, &baseline);
+        resolve_verdict(&self.guards, GuardEvent::Inbound(messages), verdict)
     }
 
     pub fn check_tool_call(&self, call: &ToolCall) -> Verdict {
-        let mut approved: Option<(String, String, Severity)> = None;
-        let mut modified = false;
-        let mut event = GuardEvent::ToolCall(call);
-
-        for guard in &self.guards {
-            match guard.check(&mut event) {
-                Verdict::Allow => {}
-                Verdict::Modify => modified = true,
-                Verdict::Deny { reason, gate_id } => {
-                    return Verdict::Deny { reason, gate_id };
-                }
-                Verdict::Approve {
-                    reason,
-                    gate_id,
-                    severity,
-                } => {
-                    if approved.is_none()
-                        || approved
-                            .as_ref()
-                            .is_some_and(|(_, _, current)| {
-                                *current == Severity::Low && severity == Severity::High
-                            })
-                    {
-                        approved = Some((reason, gate_id, severity));
-                    }
-                }
-            }
-        }
-
-        if let Some((reason, gate_id, severity)) = approved {
-            Verdict::Approve {
-                reason,
-                gate_id,
-                severity,
-            }
-        } else if modified {
-            Verdict::Modify
-        } else {
-            Verdict::Allow
-        }
+        resolve_verdict(&self.guards, GuardEvent::ToolCall(call), false)
     }
 
     pub fn check_tool_batch(&self, calls: &[ToolCall]) -> Verdict {
-        let mut approved: Option<(String, String, Severity)> = None;
-        let mut modified = false;
-        let mut event = GuardEvent::ToolBatch(calls);
-
-        for guard in &self.guards {
-            match guard.check(&mut event) {
-                Verdict::Allow => {}
-                Verdict::Modify => modified = true,
-                Verdict::Deny { reason, gate_id } => {
-                    return Verdict::Deny { reason, gate_id };
-                }
-                Verdict::Approve {
-                    reason,
-                    gate_id,
-                    severity,
-                } => {
-                    if approved.is_none()
-                        || approved
-                            .as_ref()
-                            .is_some_and(|(_, _, current)| {
-                                *current == Severity::Low && severity == Severity::High
-                            })
-                    {
-                        approved = Some((reason, gate_id, severity));
-                    }
-                }
-            }
-        }
-
-        if let Some((reason, gate_id, severity)) = approved {
-            Verdict::Approve {
-                reason,
-                gate_id,
-                severity,
-            }
-        } else if modified {
-            Verdict::Modify
-        } else {
-            Verdict::Allow
-        }
+        resolve_verdict(&self.guards, GuardEvent::ToolBatch(calls), false)
     }
 
-    pub fn execute_tool(&self, name: &str, arguments: &str) -> Result<String> {
+    pub async fn execute_tool(&self, name: &str, arguments: &str) -> Result<String> {
         let tool = self
             .tools
             .iter()
             .find(|tool| tool.name() == name)
             .ok_or_else(|| anyhow!("tool '{name}' not found"))?;
-        tool.execute(arguments)
+        tool.execute(arguments).await
+    }
+}
+
+fn resolve_verdict(guards: &[Box<dyn Guard>], mut event: GuardEvent, modified: bool) -> Verdict {
+    let mut approved: Option<(String, String, Severity)> = None;
+    let mut verdict = if modified { Verdict::Modify } else { Verdict::Allow };
+
+    for guard in guards {
+        match guard.check(&mut event) {
+            Verdict::Allow => {}
+            Verdict::Modify => verdict = Verdict::Modify,
+            Verdict::Deny { reason, gate_id } => {
+                return Verdict::Deny { reason, gate_id };
+            }
+            Verdict::Approve {
+                reason,
+                gate_id,
+                severity,
+            } => {
+                if approved.is_none()
+                    || approved.as_ref().is_some_and(|(_, _, current)| {
+                        *current == Severity::Low && severity == Severity::High
+                    })
+                {
+                    approved = Some((reason, gate_id, severity));
+                }
+            }
+        }
+    }
+
+    if let Some((reason, gate_id, severity)) = approved {
+        Verdict::Approve {
+            reason,
+            gate_id,
+            severity,
+        }
+    } else {
+        verdict
     }
 }
 

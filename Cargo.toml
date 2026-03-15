@@ -6,7 +6,7 @@ description = "A lightweight Rust agent runtime with an LLM loop and shell tooli
 license = "MIT"
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "brotli", "gzip", "deflate", "zstd"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "brotli", "gzip", "deflate", "zstd", "stream"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -16,6 +16,8 @@ clap = { version = "4", features = ["derive"] }
 regex = "1"
 shell-words = "1"
 tiktoken-rs = "0.9.1"
+futures-util = "0.3"
+libc = "0.2"
 
 [features]
 integration = []

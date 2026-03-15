@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use reqwest::Client;
 // serde is used by tests and by request/response payload assembly.
 use serde_json::{json, Value};
@@ -35,6 +36,22 @@ impl OpenAIProvider {
             model: model.into(),
             reasoning_effort,
             client: Client::new(),
+        }
+    }
+
+    pub fn with_client(
+        client: Client,
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        reasoning_effort: Option<String>,
+    ) -> Self {
+        Self {
+            api_key: api_key.into(),
+            base_url: base_url.into(),
+            model: model.into(),
+            reasoning_effort,
+            client,
         }
     }
 
@@ -653,11 +670,6 @@ impl LlmProvider for OpenAIProvider {
             anyhow::bail!("API error {status}: {body}");
         }
 
-        let stream_text = response
-            .text()
-            .await
-            .context("failed to read streamed completion response")?;
-
         // Track tool calls as they arrive in stream order.
         let mut tool_calls: Vec<(String, String, String)> = Vec::new();
         let mut pending_calls: HashMap<String, (Option<String>, String)> = HashMap::new();
@@ -665,71 +677,103 @@ impl LlmProvider for OpenAIProvider {
         let mut stop_reason = StopReason::Stop;
         let mut completion_meta = None;
         let mut assistant_content = String::new();
+        let mut stream_buffer = String::new();
+        let mut done = false;
 
-        // Parse SSE frame-by-frame.
-        // Each line is either an empty heartbeat, comment, [DONE], or `data: {json}`.
-        for raw_line in stream_text.lines() {
-            match parse_sse_line(raw_line) {
-                Some(SseEvent::TextDelta(delta)) => {
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("failed to read streamed completion response chunk")?;
+            let chunk = String::from_utf8_lossy(&chunk);
+            stream_buffer.push_str(&chunk);
+
+            while let Some(line_end) = stream_buffer.find('\n') {
+                let raw_line = stream_buffer[..line_end].to_string();
+                stream_buffer.drain(..line_end + 1);
+                match parse_sse_line(&raw_line) {
+                    Some(SseEvent::TextDelta(delta)) => {
+                        assistant_content.push_str(&delta);
+                        on_token(delta);
+                    }
+                    Some(SseEvent::FunctionCallArgumentsDelta { call_id, name, delta }) => {
+                        let call_id = match call_id {
+                            Some(id) => {
+                                current_call_id = Some(id.clone());
+                                id
+                            }
+                            None => match current_call_id.clone() {
+                                Some(id) => id,
+                                None => continue,
+                            },
+                        };
+
+                        let entry =
+                            pending_calls.entry(call_id).or_insert((None, String::new()));
+                        if let Some(tool_name) = name {
+                            entry.0 = Some(tool_name);
+                        }
+
+                        if let Some(delta) = delta {
+                            entry.1.push_str(&delta);
+                        }
+                    }
+                    Some(SseEvent::FunctionCallArgumentsDone { call_id, name, arguments }) => {
+                        let call_id = call_id
+                            .or_else(|| current_call_id.clone())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let mut entry = pending_calls.remove(&call_id).unwrap_or((None, String::new()));
+                        if let Some(tool_name) = name {
+                            entry.0 = Some(tool_name);
+                        }
+                        let name = entry.0.unwrap_or_else(|| "unknown".to_string());
+                        let arguments = arguments.unwrap_or(entry.1);
+
+                        upsert_tool_call(&mut tool_calls, call_id, name, arguments);
+                        stop_reason = StopReason::ToolCalls;
+                    }
+                    Some(SseEvent::FunctionCallOutputItemDone { call_id, name, arguments }) => {
+                        let mut arguments = arguments;
+                        if let Some((_, pending_args)) = pending_calls.remove(&call_id) {
+                            if arguments.is_empty() {
+                                arguments = pending_args;
+                            }
+                        }
+                        upsert_tool_call(&mut tool_calls, call_id, name, arguments);
+                        stop_reason = StopReason::ToolCalls;
+                    }
+                    Some(SseEvent::Completed { meta }) => {
+                        if let Some(meta) = meta {
+                            completion_meta = Some(meta);
+                        }
+
+                        if tool_calls.is_empty() {
+                            stop_reason = StopReason::Stop;
+                        }
+                    }
+                    Some(SseEvent::Done) => {
+                        done = true;
+                        break;
+                    }
+                    None => {}
+                }
+            }
+
+            if done {
+                break;
+            }
+        }
+
+        if !stream_buffer.is_empty()
+            && let Some(event) = parse_sse_line(stream_buffer.trim_end()) {
+            match event {
+                SseEvent::TextDelta(delta) => {
                     assistant_content.push_str(&delta);
                     on_token(delta);
                 }
-                Some(SseEvent::FunctionCallArgumentsDelta { call_id, name, delta }) => {
-                    let call_id = match call_id {
-                        Some(id) => {
-                            current_call_id = Some(id.clone());
-                            id
-                        }
-                        None => match current_call_id.clone() {
-                            Some(id) => id,
-                            None => continue,
-                        },
-                    };
-
-                    let entry = pending_calls.entry(call_id).or_insert((None, String::new()));
-                    if let Some(tool_name) = name {
-                        entry.0 = Some(tool_name);
-                    }
-
-                    if let Some(delta) = delta {
-                        entry.1.push_str(&delta);
-                    }
-                }
-                Some(SseEvent::FunctionCallArgumentsDone { call_id, name, arguments }) => {
-                    let call_id = call_id
-                        .or_else(|| current_call_id.clone())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let mut entry = pending_calls.remove(&call_id).unwrap_or((None, String::new()));
-                    if let Some(tool_name) = name {
-                        entry.0 = Some(tool_name);
-                    }
-                    let name = entry.0.unwrap_or_else(|| "unknown".to_string());
-                    let arguments = arguments.unwrap_or(entry.1);
-
-                    upsert_tool_call(&mut tool_calls, call_id, name, arguments);
-                    stop_reason = StopReason::ToolCalls;
-                }
-                Some(SseEvent::FunctionCallOutputItemDone { call_id, name, arguments }) => {
-                    let mut arguments = arguments;
-                    if let Some((_, pending_args)) = pending_calls.remove(&call_id) {
-                        if arguments.is_empty() {
-                            arguments = pending_args;
-                        }
-                    }
-                    upsert_tool_call(&mut tool_calls, call_id, name, arguments);
-                    stop_reason = StopReason::ToolCalls;
-                }
-                Some(SseEvent::Completed { meta }) => {
-                    if let Some(meta) = meta {
-                        completion_meta = Some(meta);
-                    }
-
-                    if tool_calls.is_empty() {
-                        stop_reason = StopReason::Stop;
-                    }
-                }
-                Some(SseEvent::Done) => break,
-                None => {}
+                SseEvent::FunctionCallArgumentsDelta { .. }
+                | SseEvent::FunctionCallArgumentsDone { .. }
+                | SseEvent::FunctionCallOutputItemDone { .. }
+                | SseEvent::Completed { .. }
+                | SseEvent::Done => {}
             }
         }
 
