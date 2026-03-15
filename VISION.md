@@ -16,6 +16,8 @@ A lightweight agent runtime. One binary. One tool (shell). Messages in, actions 
 
 **SQLite is the backbone.** Session state, message queue, history — one database file. ACID, concurrent-safe, crash-recoverable, shell-accessible (`sqlite3`). No external services.
 
+**Shell results are files.** Tool output is saved to dedicated files and linked in message history. The pipeline uses summaries or truncated results for context, but the agent can read the full result at any time. This keeps context lean while preserving full fidelity.
+
 ## Architecture
 
 ```
@@ -31,27 +33,36 @@ agent loop:
   3. call LLM (stream tokens to connected clients)
   4. if tool call → guard check → shell execute → loop
   5. if done → persist turn, mark message processed
+
+shell results:
+  - full output → sessions/{id}/results/{call_id}.txt
+  - summary/truncated → inline in message history
+  - agent reads full file on demand via shell
 ```
 
-## What exists
+## Done
 
 - [x] Agent loop (async, streaming)
-- [x] Shell tool (async, RLIMIT-sandboxed, timeout)
+- [x] Shell tool (async, RLIMIT-sandboxed, process-group kill on timeout)
 - [x] Guard pipeline (secret redactor, shell safety, exfil detector)
-- [x] Session persistence (JSONL — will migrate to SQLite)
+- [x] Session persistence (JSONL history + SQLite queue)
 - [x] Identity system (constitution + identity + context, template vars)
 - [x] OAuth device flow auth
 - [x] Token estimation + context trimming
+- [x] SQLite message queue + session store
+- [x] axum HTTP server + WebSocket
+- [x] API key auth middleware (header + WS query param)
+- [x] Decouple agent loop from stdin/stdout (TokenSink + ApprovalHandler callbacks)
+- [x] Kill child process on shell timeout (process-group aware)
 
-## What's next
+## Next
 
-- [ ] SQLite message queue + session store (replaces JSONL)
-- [ ] axum HTTP server + WebSocket
-- [ ] API key auth middleware
-- [ ] Decouple agent loop from stdin/stdout (callback interfaces)
-- [ ] Kill child process on shell timeout
 - [ ] CI pipeline (GitHub Actions)
+- [ ] PTY shell (interactive commands, not just batch)
+- [ ] Shell results → file storage (full output in files, summaries in history)
 - [ ] Provider abstraction (Anthropic, local models)
+- [ ] CLI as separate crate — full TUI with graceful degradation to plain terminal
+- [ ] Multiplatform GUI client (web, Windows, Linux, Android)
 
 ## Principles
 
@@ -60,3 +71,4 @@ agent loop:
 3. **Files over protocols.** Topics, subscriptions, config — editable files, not API calls.
 4. **Small surface.** Every line of code is a liability. Fewer lines, fewer bugs.
 5. **Crash and resume.** SQLite queue means nothing is lost. Restart and continue.
+6. **Full fidelity, lean context.** Shell results saved to files. Summaries in the pipeline. Full data always accessible.
