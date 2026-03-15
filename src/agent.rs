@@ -11,26 +11,95 @@ use crate::session::Session;
 use crate::turn::Turn;
 use crate::util::utc_timestamp;
 
+/// Receiver of streaming tokens emitted by the model during completion.
+pub trait TokenSink {
+    fn on_token(&mut self, token: String);
+    fn on_complete(&mut self) {}
+}
+
+impl<F> TokenSink for F
+where
+    F: FnMut(String),
+{
+    fn on_token(&mut self, token: String) {
+        self(token)
+    }
+}
+
+/// Request approval for execution paths that need user confirmation.
+pub trait ApprovalHandler {
+    fn request_approval(
+        &mut self,
+        severity: &Severity,
+        reason: &str,
+        command: &str,
+    ) -> bool;
+}
+
+impl<F> ApprovalHandler for F
+where
+    F: FnMut(&Severity, &str, &str) -> bool,
+{
+    fn request_approval(&mut self, severity: &Severity, reason: &str, command: &str) -> bool {
+        self(severity, reason, command)
+    }
+}
+
+/// CLI token sink implementation.
+pub struct CliTokenSink;
+
+impl CliTokenSink {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl TokenSink for CliTokenSink {
+    fn on_token(&mut self, token: String) {
+        print!("{token}");
+        if let Err(err) = io::stdout().flush() {
+            eprintln!("failed to flush stdout: {err}");
+        }
+    }
+
+    fn on_complete(&mut self) {
+        println!();
+    }
+}
+
+/// CLI approval handler implementation.
+pub struct CliApprovalHandler;
+
+impl CliApprovalHandler {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl ApprovalHandler for CliApprovalHandler {
+    fn request_approval(&mut self, severity: &Severity, reason: &str, command: &str) -> bool {
+        let prefix = match severity {
+            Severity::Low => "⚠️",
+            Severity::High => "🔴",
+        };
+
+        eprintln!("\n{prefix} {reason}");
+        eprintln!("  Command: {command}");
+        eprint!("  Approve? [y/n]: ");
+        if io::stdout().flush().is_err() {
+            return false;
+        }
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap_or(0);
+        input.trim().eq_ignore_ascii_case("y")
+    }
+}
+
 pub enum TurnVerdict {
     Executed(Vec<ToolCall>),
     Denied { reason: String, gate_id: String },
     Approved { tool_calls: Vec<ToolCall> },
-}
-
-fn prompt_approval(severity: &Severity, reason: &str, command: &str) -> bool {
-    let prefix = match severity {
-        Severity::Low => "⚠️",
-        Severity::High => "🔴",
-    };
-
-    eprintln!("\n{prefix} {reason}");
-    eprintln!("  Command: {command}");
-    eprint!("  Approve? [y/n]: ");
-    io::stdout().flush().expect("failed to flush prompt");
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap_or(0);
-    input.trim().eq_ignore_ascii_case("y")
 }
 
 fn command_from_tool_call(call: &ToolCall) -> Option<String> {
@@ -50,16 +119,20 @@ fn append_hard_deny(session: &mut Session, by: &str, reason: &str) -> Result<()>
 }
 
 /// Run the agent loop until the model emits a non-tool stop reason.
-pub async fn run_agent_loop<F, Fut, P>(
+pub async fn run_agent_loop<F, Fut, P, TS, AH>(
     make_provider: &mut F,
     session: &mut Session,
     user_prompt: String,
     turn: &Turn,
+    token_sink: &mut TS,
+    approval_handler: &mut AH,
 ) -> Result<TurnVerdict>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<P>>,
     P: LlmProvider,
+    TS: TokenSink + Send,
+    AH: ApprovalHandler,
 {
     let user_prompt = format!("[{}] {}", utc_timestamp(), user_prompt);
     let tools = turn.tool_definitions();
@@ -81,7 +154,11 @@ where
                 )?;
                 continue;
             }
-            Verdict::Approve { reason, gate_id: _, severity } => {
+            Verdict::Approve {
+                reason,
+                gate_id: _,
+                severity,
+            } => {
                 let command = messages
                     .iter()
                     .find_map(|message| {
@@ -94,7 +171,7 @@ where
                             })
                     })
                     .unwrap_or("<inbound message>");
-                let approved = prompt_approval(&severity, &reason, command);
+                let approved = approval_handler.request_approval(&severity, &reason, command);
                 if !approved {
                     append_approval_denied(session, &reason, command)?;
                     continue;
@@ -106,16 +183,9 @@ where
             continue;
         }
 
-        let mut on_token = |token: String| {
-            print!("{token}");
-            if let Err(err) = io::stdout().flush() {
-                eprintln!("failed to flush stdout: {err}");
-            }
-        };
-
         let provider = make_provider().await?;
         let turn_reply = provider
-            .stream_completion(&messages, &tools, &mut on_token)
+            .stream_completion(&messages, &tools, &mut |token| token_sink.on_token(token))
             .await?;
         let turn_meta = turn_reply.meta;
 
@@ -140,7 +210,7 @@ where
                         } => {
                             let command = command_from_tool_call(call)
                                 .unwrap_or_else(|| "<command unavailable>".to_string());
-                            let approved = prompt_approval(&severity, &reason, &command);
+                            let approved = approval_handler.request_approval(&severity, &reason, &command);
                             if !approved {
                                 append_approval_denied(session, &reason, &command)?;
                                 continue 'agent_turn;
@@ -166,7 +236,7 @@ where
                             .first()
                             .and_then(command_from_tool_call)
                             .unwrap_or_else(|| "<command unavailable>".to_string());
-                        if !prompt_approval(&severity, &reason, &command) {
+                        if !approval_handler.request_approval(&severity, &reason, &command) {
                             append_approval_denied(session, &reason, &command)?;
                             continue 'agent_turn;
                         }
@@ -187,8 +257,8 @@ where
 
             // Final text output is appended and execution returns to caller.
             StopReason::Stop => {
-                println!();
                 session.append(turn_reply.assistant_message, turn_meta)?;
+                token_sink.on_complete();
                 if had_user_approval {
                     return Ok(TurnVerdict::Approved { tool_calls: executed });
                 }
@@ -284,11 +354,15 @@ mod tests {
                 async move { Ok::<_, anyhow::Error>(provider) }
             }
         };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
         let _verdict = run_agent_loop(
             &mut make_provider,
             &mut session,
             "new command".to_string(),
             &turn,
+            &mut token_sink,
+            &mut approval_handler,
         )
         .await
         .unwrap();

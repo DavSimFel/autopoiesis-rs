@@ -2,12 +2,17 @@
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use autopoiesis::{agent, auth, config, context, guard, llm, session, tool, tool::Tool as _, turn};
+use autopoiesis::{
+    agent, auth, config, context, guard, llm, session, store, tool, turn,
+};
+use autopoiesis::tool::Tool;
+use autopoiesis::server;
 use reqwest::Client;
 
 use std::collections::HashMap;
 use std::env;
 use std::io::{self, BufRead, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(name = "autopoiesis", version, about = "MVP Rust agent runtime")]
@@ -24,6 +29,10 @@ enum Commands {
     Auth {
         #[command(subcommand)]
         action: AuthAction,
+    },
+    Serve {
+        #[arg(short, long, default_value_t = 8423)]
+        port: u16,
     },
 }
 
@@ -53,8 +62,7 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                let tokens =
-                    auth::read_tokens().map_err(|error| anyhow!("failed to read auth file: {error}"))?;
+                let tokens = auth::read_tokens().map_err(|error| anyhow!("failed to read auth file: {error}"))?;
                 println!("Logged in");
                 println!("Expires at: {}", tokens.expires_at);
             }
@@ -71,21 +79,33 @@ async fn main() -> Result<()> {
                 println!("Logged out from {}", auth_path.display());
             }
         },
+        Some(Commands::Serve { port }) => {
+            server::run(port).await?;
+        }
         None => {
             let config = config::Config::load("agents.toml")
                 .map_err(|error| anyhow!("failed to load configuration: {error}"))?;
 
-            let mut session = session::Session::new("sessions")?;
-            session.load_today()?;
+            let session_id = format!(
+                "cli-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros()
+            );
+            let session_root = format!("sessions/{session_id}");
+            let mut history = session::Session::new(&session_root)?;
+            history.load_today()?;
+
+            let mut queue = store::Store::new("sessions/queue.sqlite")?;
+            queue.create_session(&session_id, Some(r#"{"source":"cli"}"#))?;
+
             let provider_config = config.clone();
             let turn = default_turn(&config);
             let http_client = Client::new();
-
-            // Build a fresh provider per turn so the auth token can be refreshed mid-session.
             let mut provider_factory = move || {
                 let provider_config = provider_config.clone();
                 let client = http_client.clone();
-
                 async move {
                     let api_key = auth::get_valid_token().await?;
                     Ok::<llm::openai::OpenAIProvider, anyhow::Error>(
@@ -99,6 +119,9 @@ async fn main() -> Result<()> {
                     )
                 }
             };
+
+            let mut token_sink = agent::CliTokenSink::new();
+            let mut approval_handler = agent::CliApprovalHandler::new();
 
             if cli.prompt.is_empty() {
                 let stdin = io::stdin();
@@ -118,41 +141,32 @@ async fn main() -> Result<()> {
                     if prompt == "exit" || prompt == "quit" {
                         break;
                     }
-                    let verdict = agent::run_agent_loop(
-                        &mut provider_factory,
-                        &mut session,
-                        prompt.to_string(),
+
+                    queue.enqueue_message(&session_id, "user", prompt, "cli")?;
+                    process_queue(
+                        &mut queue,
+                        &session_id,
+                        &mut history,
                         &turn,
+                        &mut provider_factory,
+                        &mut token_sink,
+                        &mut approval_handler,
                     )
                     .await?;
-                    match verdict {
-                        agent::TurnVerdict::Executed(_) => {}
-                        agent::TurnVerdict::Approved { tool_calls: _ } => {
-                            eprintln!("Command approved by user and executed.");
-                        }
-                        agent::TurnVerdict::Denied { reason, gate_id } => {
-                            eprintln!("Command hard-denied by {gate_id}: {reason}");
-                        }
-                    }
-                    println!();
                 }
             } else {
-                let verdict = agent::run_agent_loop(
-                    &mut provider_factory,
-                    &mut session,
-                    cli.prompt.join(" "),
+                let prompt = cli.prompt.join(" ");
+                queue.enqueue_message(&session_id, "user", &prompt, "cli")?;
+                process_queue(
+                    &mut queue,
+                    &session_id,
+                    &mut history,
                     &turn,
+                    &mut provider_factory,
+                    &mut token_sink,
+                    &mut approval_handler,
                 )
                 .await?;
-                match verdict {
-                    agent::TurnVerdict::Executed(_) => {}
-                    agent::TurnVerdict::Approved { tool_calls: _ } => {
-                        eprintln!("Command approved by user and executed.");
-                    }
-                    agent::TurnVerdict::Denied { reason, gate_id } => {
-                        eprintln!("Command hard-denied by {gate_id}: {reason}");
-                    }
-                }
             }
         }
     }
@@ -187,4 +201,51 @@ fn default_turn(config: &config::Config) -> turn::Turn {
         ]))
         .guard(guard::ShellSafety::new())
         .guard(guard::ExfilDetector::new())
+}
+
+async fn process_queue<F, Fut, P, TS, AH>(
+    queue: &mut store::Store,
+    session_id: &str,
+    session: &mut session::Session,
+    turn: &turn::Turn,
+    provider_factory: &mut F,
+    token_sink: &mut TS,
+    approval_handler: &mut AH,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<P>>,
+    P: llm::LlmProvider,
+    TS: agent::TokenSink + Send,
+    AH: agent::ApprovalHandler,
+{
+    while let Some(message) = queue.dequeue_next_message(session_id)? {
+        if message.role != "user" {
+            queue.mark_processed(message.id)?;
+            continue;
+        }
+
+        let verdict = agent::run_agent_loop(
+            provider_factory,
+            session,
+            message.content,
+            turn,
+            token_sink,
+            approval_handler,
+        )
+        .await;
+
+        queue.mark_processed(message.id)?;
+        match verdict? {
+            agent::TurnVerdict::Executed(_) => {}
+            agent::TurnVerdict::Approved { .. } => {
+                eprintln!("Command approved by user and executed.");
+            }
+            agent::TurnVerdict::Denied { reason, gate_id } => {
+                eprintln!("Command hard-denied by {gate_id}: {reason}");
+            }
+        }
+    }
+
+    Ok(())
 }
