@@ -2,14 +2,17 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::process::Command as StdCommand;
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
+use tokio::io::AsyncReadExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use tokio::time::timeout;
+use tokio::process::Child as TokioChild;
 use tokio::process::Command as TokioCommand;
+use tokio::time::timeout;
 
 use crate::llm::FunctionTool;
 
@@ -131,6 +134,33 @@ impl Tool for Shell {
 }
 
 impl Shell {
+    async fn kill_with_fallback(child: &mut TokioChild, pid: Option<u32>) -> Result<()> {
+        if child.id().is_none() {
+            return Ok(());
+        }
+
+        if let Some(pid) = pid {
+            if let Err(error) = child.kill().await {
+                // SAFETY: final fallback if the normal kill path fails.
+                #[cfg(unix)]
+                unsafe {
+                    if libc::kill(pid as libc::pid_t, libc::SIGKILL) != 0 {
+                        return Err(anyhow!(
+                            "failed to terminate timed out process with SIGKILL: {error}"
+                        ));
+                    }
+                }
+                #[cfg(not(unix))]
+                return Err(anyhow!(
+                    "failed to terminate timed out process with graceful kill: {error}"
+                ));
+            }
+        }
+
+        let _ = child.wait().await;
+        Ok(())
+    }
+
     async fn run_with_timeout(
         command_text: &str,
         timeout_ms: u64,
@@ -143,14 +173,50 @@ impl Shell {
             // SAFETY: pre_exec is required by the request to configure per-command limits.
             command.pre_exec(set_resource_limits);
         }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut command = TokioCommand::from(command);
 
         let duration = Duration::from_millis(timeout_ms);
-        let output = timeout(duration, command.output())
-            .await
-            .map_err(|_| anyhow!("tool execute timed out after {timeout_ms}ms"))?;
-        output.map_err(|e: std::io::Error| anyhow!(e))
+        let mut child = command.spawn().context("failed to spawn shell command")?;
+        let child_id = child.id();
+
+        let stdout = child.stdout.take().context("failed to capture stdout")?;
+        let stderr = child.stderr.take().context("failed to capture stderr")?;
+
+        let output = match timeout(duration, async {
+            let mut stdout = stdout;
+            let mut stderr = stderr;
+
+            let mut stdout_buf = Vec::new();
+            let mut stderr_buf = Vec::new();
+
+            let (status_result, stdout_result, stderr_result) = tokio::join!(
+                child.wait(),
+                stdout.read_to_end(&mut stdout_buf),
+                stderr.read_to_end(&mut stderr_buf),
+            );
+
+            let status = status_result?;
+            stdout_result?;
+            stderr_result?;
+
+            Ok::<std::process::Output, io::Error>(std::process::Output {
+                status,
+                stdout: stdout_buf,
+                stderr: stderr_buf,
+            })
+        })
+        .await
+        {
+            Ok(result) => result.map_err(|error| anyhow!(error))?,
+            Err(_) => {
+                Self::kill_with_fallback(&mut child, child_id).await?;
+                return Err(anyhow!("tool execute timed out after {timeout_ms}ms"));
+            }
+        };
+
+        Ok(output)
     }
 
     fn _default_timeout_ms() -> u64 {

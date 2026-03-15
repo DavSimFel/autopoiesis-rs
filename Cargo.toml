@@ -18,6 +18,11 @@ shell-words = "1"
 tiktoken-rs = "0.9.1"
 futures-util = "0.3"
 libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+axum = { version = "0.7", features = ["ws", "json"] }
+axum-extra = "0.9"
+tower = "0.5"
+tower-http = "0.6"
 
 [features]
 integration = []

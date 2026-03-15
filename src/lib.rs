@@ -8,5 +8,7 @@ pub mod identity;
 pub mod llm;
 pub mod turn;
 pub mod session;
+pub mod store;
 pub mod template;
 pub mod tool;
+pub mod server;
