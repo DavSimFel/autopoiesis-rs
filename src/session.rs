@@ -280,6 +280,7 @@ impl Session {
         };
 
         while estimated_tokens > self.max_context_tokens {
+            // Keep one leading system instruction message intact and trim from oldest conversational history.
             if self.messages.len() <= 1 {
                 break;
             }
@@ -328,35 +329,11 @@ impl Session {
     }
 
     /// Get total token count from provider metadata.
-    #[allow(dead_code)]
     pub fn total_tokens(&self) -> u64 {
         self.total_tokens
     }
 
-    /// List available session files.
-    #[allow(dead_code)]
-    pub fn list_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
-        if !sessions_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut paths = Vec::new();
-        for entry in fs::read_dir(sessions_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file()
-                && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-            {
-                paths.push(path);
-            }
-        }
-
-        paths.sort_by_key(|path| path.file_name().map(ToOwned::to_owned));
-        Ok(paths)
-    }
-
     /// Update max context tokens for a session.
-    #[allow(dead_code)]
     pub fn set_max_context_tokens(&mut self, max_context_tokens: u64) {
         self.max_context_tokens = max_context_tokens;
     }
@@ -449,7 +426,6 @@ mod tests {
         let path = session.today_path();
 
         let filename = path.file_name().unwrap().to_str().unwrap();
-        // Format: YYYY-MM-DD.jsonl
         assert!(filename.ends_with(".jsonl"));
         assert_eq!(filename.len(), 16); // 2026-03-14.jsonl
         assert_eq!(&filename[4..5], "-");
@@ -458,13 +434,10 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    // --- Load / Resume ---
-
     #[test]
     fn load_today_restores_messages() {
         let dir = temp_sessions_dir("load_restore");
 
-        // Write a session
         {
             let mut session = Session::new(&dir).unwrap();
             session.add_user_message("first message").unwrap();
@@ -473,13 +446,11 @@ mod tests {
                 .unwrap();
         }
 
-        // Load it in a new session
         {
             let mut session = Session::new(&dir).unwrap();
             session.load_today().unwrap();
 
             let history = session.history();
-            // 2 user messages
             assert!(history.len() >= 2);
         }
 
@@ -491,7 +462,6 @@ mod tests {
         let dir = temp_sessions_dir("no_file");
         let mut session = Session::new(&dir).unwrap();
 
-        // Should not error — starts empty
         session.load_today().unwrap();
         assert_eq!(session.history().len(), 0);
 
@@ -519,14 +489,11 @@ mod tests {
         session.max_context_tokens = 50;
         session.load_today().unwrap();
 
-        // Trim preserves at least 1 message, so we get 1 not 0
         assert!(session.history().len() <= 1);
         assert!(session.total_tokens() <= 100);
 
         fs::remove_dir_all(&dir).unwrap();
     }
-
-    // --- Token Management ---
 
     #[test]
     fn total_tokens_accumulates_from_meta() {
@@ -604,10 +571,8 @@ mod tests {
     fn trim_drops_oldest_non_system_messages() {
         let dir = temp_sessions_dir("trim");
         let mut session = Session::new(&dir).unwrap();
-        // Set a very low limit to force trimming
         session.max_context_tokens = 50;
 
-        // Add messages with token metadata that exceeds the limit
         let big_meta = TurnMeta {
             input_tokens: Some(30),
             output_tokens: Some(30),
@@ -630,13 +595,10 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    // --- Reasoning Traces ---
-
     #[test]
     fn reasoning_trace_saved_but_not_in_loaded_context() {
         let dir = temp_sessions_dir("reasoning");
 
-        // Write a session with reasoning trace
         {
             let mut session = Session::new(&dir).unwrap();
             session.add_user_message("think hard").unwrap();
@@ -651,7 +613,6 @@ mod tests {
                 .unwrap();
         }
 
-        // Verify trace is in the file
         let content = fs::read_to_string({
             let s = Session::new(&dir).unwrap();
             s.today_path()
@@ -659,12 +620,10 @@ mod tests {
         .unwrap();
         assert!(content.contains("deep thoughts here"));
 
-        // Load session — reasoning trace should NOT be in the messages
         {
             let mut session = Session::new(&dir).unwrap();
             session.load_today().unwrap();
 
-            // The assistant message content should NOT contain the reasoning trace
             for msg in session.history() {
                 for block in &msg.content {
                     if let crate::llm::MessageContent::Text { text } = block {
@@ -680,24 +639,4 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    // --- Listing ---
-
-    #[test]
-    fn list_sessions_returns_jsonl_files_sorted() {
-        let dir = temp_sessions_dir("list");
-
-        // Create some fake session files
-        fs::write(dir.join("2026-03-12.jsonl"), "").unwrap();
-        fs::write(dir.join("2026-03-14.jsonl"), "").unwrap();
-        fs::write(dir.join("2026-03-13.jsonl"), "").unwrap();
-        fs::write(dir.join("not-a-session.txt"), "").unwrap();
-
-        let sessions = Session::list_sessions(&dir).unwrap();
-        assert_eq!(sessions.len(), 3);
-        // Should be sorted
-        assert!(sessions[0].to_str().unwrap().contains("2026-03-12"));
-        assert!(sessions[2].to_str().unwrap().contains("2026-03-14"));
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
 }
