@@ -152,6 +152,29 @@ impl Store {
             .context("failed to mark message processed")?;
         Ok(())
     }
+
+    pub fn mark_failed(&mut self, message_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE messages SET status = 'failed' WHERE id = ?1",
+                params![message_id],
+            )
+            .context("failed to mark message failed")?;
+        Ok(())
+    }
+
+    /// Recover messages stuck in 'processing' state (e.g., after a crash).
+    /// Resets them to 'pending' so they can be retried.
+    pub fn recover_stale_messages(&mut self) -> Result<u64> {
+        let count = self
+            .conn
+            .execute(
+                "UPDATE messages SET status = 'pending' WHERE status = 'processing'",
+                [],
+            )
+            .context("failed to recover stale messages")?;
+        Ok(count as u64)
+    }
 }
 
 #[cfg(test)]

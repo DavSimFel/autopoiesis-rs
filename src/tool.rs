@@ -140,20 +140,19 @@ impl Shell {
         }
 
         if let Some(pid) = pid {
-            if let Err(error) = child.kill().await {
-                // SAFETY: final fallback if the normal kill path fails.
+            // Kill the entire process group (child + all descendants)
+            #[cfg(unix)]
+            unsafe {
+                // Try SIGTERM on the process group first
+                libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+            }
+
+            if let Err(_) = child.kill().await {
+                // SAFETY: final fallback — SIGKILL the entire process group
                 #[cfg(unix)]
                 unsafe {
-                    if libc::kill(pid as libc::pid_t, libc::SIGKILL) != 0 {
-                        return Err(anyhow!(
-                            "failed to terminate timed out process with SIGKILL: {error}"
-                        ));
-                    }
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
                 }
-                #[cfg(not(unix))]
-                return Err(anyhow!(
-                    "failed to terminate timed out process with graceful kill: {error}"
-                ));
             }
         }
 
@@ -170,8 +169,13 @@ impl Shell {
 
         #[cfg(unix)]
         unsafe {
-            // SAFETY: pre_exec is required by the request to configure per-command limits.
-            command.pre_exec(set_resource_limits);
+            // SAFETY: pre_exec sets resource limits and creates a new process group
+            // so that timeout kill can terminate all descendant processes.
+            command.pre_exec(|| {
+                // New process group so killpg reaches all descendants
+                libc::setpgid(0, 0);
+                set_resource_limits()
+            });
         }
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
 

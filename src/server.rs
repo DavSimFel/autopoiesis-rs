@@ -83,7 +83,11 @@ pub async fn run(port: u16) -> Result<()> {
     let api_key = std::env::var("AUTOPOIESIS_API_KEY")
         .context("set AUTOPOIESIS_API_KEY before running serve")?;
 
-    let store = store::Store::new("sessions/queue.sqlite").context("failed to open session store")?;
+    let mut store = store::Store::new("sessions/queue.sqlite").context("failed to open session store")?;
+    let recovered = store.recover_stale_messages().unwrap_or(0);
+    if recovered > 0 {
+        eprintln!("recovered {recovered} stale messages from previous crash");
+    }
     let state = ServerState {
         store: Arc::new(Mutex::new(store)),
         sessions_dir: PathBuf::from("sessions"),
@@ -151,6 +155,9 @@ async fn enqueue_message(
     Path(session_id): Path<String>,
     Json(payload): Json<EnqueueMessageRequest>,
 ) -> impl IntoResponse {
+    if !validate_session_id(&session_id) {
+        return (StatusCode::BAD_REQUEST, "invalid session id").into_response();
+    }
     let mut store = state.store.lock().await;
     if let Err(error) = store.create_session(&session_id, None) {
         return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
@@ -176,7 +183,11 @@ async fn ws_session(
     Path(session_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    if !validate_session_id(&session_id) {
+        return (StatusCode::BAD_REQUEST, "invalid session id").into_response();
+    }
     ws.on_upgrade(move |socket| websocket_session(state, session_id, socket))
+        .into_response()
 }
 
 async fn websocket_session(state: ServerState, session_id: String, socket: WebSocket) {
@@ -338,26 +349,36 @@ fn generate_session_id() -> String {
     format!("session-{now}")
 }
 
+/// Reject session IDs containing path traversal or unsafe characters.
+fn validate_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 async fn authenticate(
     State(state): State<ServerState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    // Check header first
+    // Check header first (all routes)
     let from_header = request.headers().get(API_KEY_HEADER).and_then(|value| value.to_str().ok());
     if from_header.is_some_and(|value| value == state.api_key) {
         return next.run(request).await;
     }
 
-    // Fall back to query param (for WebSocket connections)
-    let from_query = request.uri().query().and_then(|q| {
-        q.split('&').find_map(|pair| {
-            let (key, value) = pair.split_once('=')?;
-            if key == "api_key" { Some(value) } else { None }
-        })
-    });
-    if from_query.is_some_and(|value| value == state.api_key) {
-        return next.run(request).await;
+    // Fall back to query param ONLY for WebSocket upgrade paths
+    let is_ws_path = request.uri().path().contains("/api/ws/");
+    if is_ws_path {
+        let from_query = request.uri().query().and_then(|q| {
+            q.split('&').find_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                if key == "api_key" { Some(value) } else { None }
+            })
+        });
+        if from_query.is_some_and(|value| value == state.api_key) {
+            return next.run(request).await;
+        }
     }
 
     (StatusCode::UNAUTHORIZED, "missing or invalid api key").into_response()
