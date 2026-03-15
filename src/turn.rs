@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 
 use crate::context::ContextSource;
 use crate::guard::{Guard, GuardEvent, Severity, Verdict};
@@ -49,7 +50,7 @@ impl Turn {
     pub fn check_inbound(&self, messages: &mut Vec<ChatMessage>) -> Verdict {
         let baseline = messages.clone();
         self.assemble_context(messages);
-        let verdict = verdict_from_mutations(messages, &baseline);
+        let verdict = messages.len() != baseline.len();
         resolve_verdict(&self.guards, GuardEvent::Inbound(messages), verdict)
     }
 
@@ -109,8 +110,32 @@ fn resolve_verdict(guards: &[Box<dyn Guard>], mut event: GuardEvent, modified: b
     }
 }
 
-fn verdict_from_mutations(messages: &[ChatMessage], baseline: &[ChatMessage]) -> bool {
-    messages.len() != baseline.len()
+/// Build the default turn used by both CLI and server execution paths.
+pub fn build_default_turn(config: &crate::config::Config) -> Turn {
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|path| path.to_str().map(ToString::to_string))
+        .unwrap_or_else(String::new);
+    let tool = crate::tool::Shell::new();
+    let tools = vec![tool.definition()];
+    let tools_list = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join(",");
+
+    let mut vars = HashMap::new();
+    vars.insert("model".to_string(), config.model.clone());
+    vars.insert("cwd".to_string(), cwd);
+    vars.insert("tools".to_string(), tools_list);
+
+    Turn::new()
+        .context(crate::context::Identity::new("identity", vars, &config.system_prompt))
+        .context(crate::context::History::new(100_000))
+        .tool(tool)
+        .guard(crate::guard::SecretRedactor::new(&[
+            r"sk-[a-zA-Z0-9_-]{20,}",
+            r"ghp_[a-zA-Z0-9]{36}",
+            r"AKIA[0-9A-Z]{16}",
+        ]))
+        .guard(crate::guard::ShellSafety::new())
+        .guard(crate::guard::ExfilDetector::new())
 }
 
 #[cfg(test)]
@@ -174,11 +199,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_pipeline_allows_everything() {
-        empty_turn_allows_everything();
-    }
-
-    #[test]
     fn guard_events_run_in_configuration_order() {
         let hits = Arc::new(Mutex::new(Vec::<&'static str>::new()));
         let turn = Turn::new()
@@ -197,11 +217,6 @@ mod tests {
         let _ = turn.check_inbound(&mut messages);
         let observed = hits.lock().expect("hit list mutex poisoned").clone();
         assert_eq!(observed, vec!["first", "second"]);
-    }
-
-    #[test]
-    fn edit_gates_run_in_config_order() {
-        guard_events_run_in_configuration_order();
     }
 
     #[test]
@@ -306,11 +321,6 @@ mod tests {
         let result = turn.check_inbound(&mut messages);
         assert!(matches!(result, GuardResult::Modify));
         assert!(messages.iter().any(|message| message.role == crate::llm::ChatRole::System));
-    }
-
-    #[test]
-    fn full_pipeline_builds_complete_context() {
-        full_turn_builds_complete_context();
     }
 
     fn make_tool_call(cmd: &str) -> ToolCall {

@@ -23,9 +23,8 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::{
-    agent, auth, config, context, guard, llm, session, store, tool, turn,
+    agent, auth, config, llm, session, store, turn,
 };
-use crate::tool::Tool;
 
 const API_KEY_HEADER: &str = "x-api-key";
 
@@ -221,13 +220,12 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
         }
     };
 
-    // Ensure session exists in store
     {
         let mut store = state.store.lock().await;
         let _ = store.create_session(&session_id, None);
     }
 
-    let turn = server_turn(&state.config);
+    let turn = turn::build_default_turn(&state.config);
     let mut provider_factory = {
         let client = state.http_client.clone();
         let config = state.config.clone();
@@ -249,7 +247,6 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
         }
     };
 
-    // Process: read WS messages from client, run agent loop, stream back
     while let Some(msg) = receiver.next().await {
         let msg = match msg {
             Ok(Message::Text(text)) => text,
@@ -258,7 +255,6 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
             _ => continue,
         };
 
-        // Parse incoming WS frame: {"op":"message","data":{"content":"..."}}
         let parsed: serde_json::Value = match serde_json::from_str(&msg) {
             Ok(v) => v,
             Err(_) => continue,
@@ -267,7 +263,6 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
         let content = match parsed.get("data").and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
             Some(c) => c.to_string(),
             None => {
-                // Also accept {"content":"..."} directly
                 match parsed.get("content").and_then(|c| c.as_str()) {
                     Some(c) => c.to_string(),
                     None => continue,
@@ -275,7 +270,6 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
             }
         };
 
-        // Enqueue to store for persistence
         {
             let mut store = state.store.lock().await;
             let _ = store.enqueue_message(&session_id, "user", &content, "ws");
@@ -314,31 +308,6 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
 
     drop(tx);
     let _ = writer.await;
-}
-
-fn server_turn(config: &config::Config) -> turn::Turn {
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|path| path.to_str().map(ToString::to_string))
-        .unwrap_or_else(String::new);
-    let tools = vec![tool::Shell::new().definition()];
-    let tools_list = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join(",");
-    let mut vars = std::collections::HashMap::new();
-    vars.insert("model".to_string(), config.model.clone());
-    vars.insert("cwd".to_string(), cwd);
-    vars.insert("tools".to_string(), tools_list);
-
-    turn::Turn::new()
-        .context(context::Identity::new("identity", vars, &config.system_prompt))
-        .context(context::History::new(100_000))
-        .tool(tool::Shell::new())
-        .guard(guard::SecretRedactor::new(&[
-            r"sk-[a-zA-Z0-9_-]{20,}",
-            r"ghp_[a-zA-Z0-9]{36}",
-            r"AKIA[0-9A-Z]{16}",
-        ]))
-        .guard(guard::ShellSafety::new())
-        .guard(guard::ExfilDetector::new())
 }
 
 fn generate_session_id() -> String {

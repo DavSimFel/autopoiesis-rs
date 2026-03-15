@@ -222,10 +222,6 @@ impl Shell {
 
         Ok(output)
     }
-
-    fn _default_timeout_ms() -> u64 {
-        DEFAULT_TIMEOUT_SECONDS * 1000
-    }
 }
 
 #[cfg(test)]
@@ -252,10 +248,5 @@ mod tests {
             .and_then(|value| value.get("type"))
             .expect("command property should define type");
         assert_eq!(command_type, "string");
-    }
-
-    #[test]
-    fn execute_tool_definition_has_execute_name() {
-        shell_tool_definition_has_execute_name();
     }
 }

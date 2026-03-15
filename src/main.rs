@@ -3,14 +3,11 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use autopoiesis::{
-    agent, auth, config, context, guard, llm, session, store, tool, turn,
+    agent, auth, config, llm, session, store, turn,
 };
-use autopoiesis::tool::Tool;
 use autopoiesis::server;
 use reqwest::Client;
 
-use std::collections::HashMap;
-use std::env;
 use std::io::{self, BufRead, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -101,7 +98,7 @@ async fn main() -> Result<()> {
             queue.create_session(&session_id, Some(r#"{"source":"cli"}"#))?;
 
             let provider_config = config.clone();
-            let turn = default_turn(&config);
+            let turn = turn::build_default_turn(&provider_config);
             let http_client = Client::new();
             let mut provider_factory = move || {
                 let provider_config = provider_config.clone();
@@ -172,36 +169,7 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-fn default_turn(config: &config::Config) -> turn::Turn {
-    let cwd = env::current_dir()
-        .ok()
-        .and_then(|path| path.to_str().map(ToString::to_string))
-        .unwrap_or_else(String::new);
-    let tools = vec![tool::Shell::new().definition()];
-    let tools_list = tools
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut vars = HashMap::new();
-    vars.insert("model".to_string(), config.model.clone());
-    vars.insert("cwd".to_string(), cwd);
-    vars.insert("tools".to_string(), tools_list);
-
-    turn::Turn::new()
-        .context(context::Identity::new("identity", vars, &config.system_prompt))
-        .context(context::History::new(100_000))
-        .tool(tool::Shell::new())
-        .guard(guard::SecretRedactor::new(&[
-            r"sk-[a-zA-Z0-9_-]{20,}",
-            r"ghp_[a-zA-Z0-9]{36}",
-            r"AKIA[0-9A-Z]{16}",
-        ]))
-        .guard(guard::ShellSafety::new())
-        .guard(guard::ExfilDetector::new())
-}
+    }
 
 async fn process_queue<F, Fut, P, TS, AH>(
     queue: &mut store::Store,

@@ -214,11 +214,6 @@ mod tests {
     }
 
     #[test]
-    fn identity_gate_replaces_system_message() {
-        identity_replaces_system_message();
-    }
-
-    #[test]
     fn identity_uses_fallback_on_missing_dir() {
         let mut vars = HashMap::new();
         vars.insert("model".to_string(), "gpt-5.4".to_string());
@@ -231,11 +226,6 @@ mod tests {
             _ => panic!("expected text"),
         };
         assert_eq!(content, "fallback prompt");
-    }
-
-    #[test]
-    fn identity_gate_uses_fallback_on_missing_dir() {
-        identity_uses_fallback_on_missing_dir();
     }
 
     #[test]
@@ -270,11 +260,6 @@ mod tests {
     }
 
     #[test]
-    fn identity_gate_applies_template_vars() {
-        identity_applies_template_vars();
-    }
-
-    #[test]
     fn history_adds_history_to_messages() {
         let mut source = History::new(1000);
         let history = vec![
@@ -294,11 +279,6 @@ mod tests {
     }
 
     #[test]
-    fn history_gate_adds_history_to_messages() {
-        history_adds_history_to_messages();
-    }
-
-    #[test]
     fn history_respects_token_budget() {
         let mut source = History::new(8);
         let history = vec![
@@ -314,11 +294,6 @@ mod tests {
         // Tiny budget should keep only the newest context message.
         assert_eq!(messages.len(), 1);
         assert_eq!(message_text(&messages[0]), "the quick brown fox jumps");
-    }
-
-    #[test]
-    fn history_gate_respects_token_budget() {
-        history_respects_token_budget();
     }
 
     #[test]
@@ -344,11 +319,6 @@ mod tests {
     }
 
     #[test]
-    fn history_gate_skips_system_messages() {
-        history_skips_system_messages();
-    }
-
-    #[test]
     fn history_newest_first() {
         let mut source = History::new(6);
         let history = vec![
@@ -364,11 +334,6 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(message_text(&messages[0]), "four five six");
         assert_eq!(message_text(&messages[1]), "seven eight nine");
-    }
-
-    #[test]
-    fn history_gate_newest_first() {
-        history_newest_first();
     }
 
     fn message_text(message: &ChatMessage) -> &str {

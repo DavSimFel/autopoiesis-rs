@@ -38,7 +38,14 @@ pub fn token_file_path() -> PathBuf {
 
 /// Read persisted tokens from disk.
 pub fn read_tokens() -> Result<AuthTokens> {
-    load_tokens()
+    let path = token_file_path();
+    if !path.exists() {
+        return Err(anyhow!("auth file not found at {}", path.display()));
+    }
+
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str::<AuthTokens>(&raw).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 /// Run the device-code OAuth flow used by `autopoiesis auth login`.
@@ -233,19 +240,6 @@ fn save_tokens(tokens: &AuthTokens) -> Result<()> {
     std::fs::write(&path, serialized)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
-}
-
-fn load_tokens() -> Result<AuthTokens> {
-    let path = token_file_path();
-
-    if !path.exists() {
-        return Err(anyhow!("auth file not found at {}", path.display()));
-    }
-
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-
-    serde_json::from_str::<AuthTokens>(&raw).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 fn format_user_code(code: &str) -> String {

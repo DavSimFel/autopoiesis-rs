@@ -190,7 +190,6 @@ where
         let turn_meta = turn_reply.meta;
 
         match turn_reply.stop_reason {
-            // The model produced tool calls; append assistant turn and execute each in order.
             StopReason::ToolCalls => {
                 let tool_calls = turn_reply.tool_calls.clone();
                 session.append(turn_reply.assistant_message, turn_meta)?;
@@ -255,7 +254,6 @@ where
                 }
             }
 
-            // Final text output is appended and execution returns to caller.
             StopReason::Stop => {
                 session.append(turn_reply.assistant_message, turn_meta)?;
                 token_sink.on_complete();
@@ -284,7 +282,6 @@ mod tests {
         observed_message_counts: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
     }
 
-    #[allow(dead_code)]
     impl InspectingProvider {
         fn new() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<usize>>>) {
             let observed_message_counts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -297,7 +294,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
     impl crate::llm::LlmProvider for InspectingProvider {
         async fn stream_completion(
             &self,
