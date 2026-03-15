@@ -180,14 +180,14 @@ async fn ws_session(
 }
 
 async fn websocket_session(state: ServerState, session_id: String, socket: WebSocket) {
-    let (mut sender, mut _receiver) = socket.split();
+    let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<WsFrame>();
     let writer = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             let payload = match serde_json::to_string(&frame) {
                 Ok(payload) => payload,
                 Err(error) => {
-                    format!(r#"{{\"op\":\"error\",\"data\":\"{error}\"}}"#)
+                    format!(r#"{{"op":"error","data":"{error}"}}"#)
                 }
             };
 
@@ -209,6 +209,12 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
             return;
         }
     };
+
+    // Ensure session exists in store
+    {
+        let mut store = state.store.lock().await;
+        let _ = store.create_session(&session_id, None);
+    }
 
     let turn = server_turn(&state.config);
     let mut provider_factory = {
@@ -232,27 +238,36 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
         }
     };
 
-    loop {
-        let message = {
-            let mut store = state.store.lock().await;
-            store.dequeue_next_message(&session_id)
+    // Process: read WS messages from client, run agent loop, stream back
+    while let Some(msg) = receiver.next().await {
+        let msg = match msg {
+            Ok(Message::Text(text)) => text,
+            Ok(Message::Close(_)) => break,
+            Err(_) => break,
+            _ => continue,
         };
 
-        let message = match message {
-            Ok(Some(message)) => message,
-            Ok(None) => break,
-            Err(error) => {
-                let _ = tx.send(WsFrame::Token {
-                    data: format!("{{\"error\":\"{error}\"}}"),
-                });
-                break;
+        // Parse incoming WS frame: {"op":"message","data":{"content":"..."}}
+        let parsed: serde_json::Value = match serde_json::from_str(&msg) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let content = match parsed.get("data").and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
+            Some(c) => c.to_string(),
+            None => {
+                // Also accept {"content":"..."} directly
+                match parsed.get("content").and_then(|c| c.as_str()) {
+                    Some(c) => c.to_string(),
+                    None => continue,
+                }
             }
         };
 
-        if message.role != "user" {
+        // Enqueue to store for persistence
+        {
             let mut store = state.store.lock().await;
-            let _ = store.mark_processed(message.id);
-            continue;
+            let _ = store.enqueue_message(&session_id, "user", &content, "ws");
         }
 
         let mut token_sink = WsTokenSink::new(tx.clone());
@@ -261,17 +276,12 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
         let verdict = agent::run_agent_loop(
             &mut provider_factory,
             &mut history,
-            message.content,
+            content,
             &turn,
             &mut token_sink,
             &mut approval_handler,
         )
         .await;
-
-        {
-            let mut store = state.store.lock().await;
-            let _ = store.mark_processed(message.id);
-        }
 
         match verdict {
             Ok(agent::TurnVerdict::Executed(tool_calls))
@@ -283,17 +293,16 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
             Ok(agent::TurnVerdict::Denied { .. }) => {}
             Err(error) => {
                 let _ = tx.send(WsFrame::Token {
-                    data: format!("{{\"error\":\"{error}\"}}"),
+                    data: format!("error: {error}"),
                 });
-                break;
             }
         }
+
+        let _ = tx.send(WsFrame::Done);
     }
 
-    let _ = tx.send(WsFrame::Done);
     drop(tx);
     let _ = writer.await;
-    let _ = _receiver.next().await;
 }
 
 fn server_turn(config: &config::Config) -> turn::Turn {
@@ -334,8 +343,20 @@ async fn authenticate(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let provided = request.headers().get(API_KEY_HEADER).and_then(|value| value.to_str().ok());
-    if provided.is_some_and(|value| value == state.api_key) {
+    // Check header first
+    let from_header = request.headers().get(API_KEY_HEADER).and_then(|value| value.to_str().ok());
+    if from_header.is_some_and(|value| value == state.api_key) {
+        return next.run(request).await;
+    }
+
+    // Fall back to query param (for WebSocket connections)
+    let from_query = request.uri().query().and_then(|q| {
+        q.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            if key == "api_key" { Some(value) } else { None }
+        })
+    });
+    if from_query.is_some_and(|value| value == state.api_key) {
         return next.run(request).await;
     }
 
