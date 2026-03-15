@@ -175,7 +175,7 @@ where
                 }
 
                 for call in &tool_calls {
-                    let result = match turn.execute_tool(&call.name, &call.arguments) {
+                    let result = match turn.execute_tool(&call.name, &call.arguments).await {
                         Ok(output) => output,
                         Err(err) => format!(r#"{{"error": "{err}"}}"#),
                     };

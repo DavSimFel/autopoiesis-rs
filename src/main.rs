@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use autopoiesis::{agent, auth, config, context, guard, llm, session, tool, tool::Tool as _, turn};
+use reqwest::Client;
 
 use std::collections::HashMap;
 use std::env;
@@ -78,15 +79,18 @@ async fn main() -> Result<()> {
             session.load_today()?;
             let provider_config = config.clone();
             let turn = default_turn(&config);
+            let http_client = Client::new();
 
             // Build a fresh provider per turn so the auth token can be refreshed mid-session.
             let mut provider_factory = move || {
                 let provider_config = provider_config.clone();
+                let client = http_client.clone();
 
                 async move {
                     let api_key = auth::get_valid_token().await?;
                     Ok::<llm::openai::OpenAIProvider, anyhow::Error>(
-                        llm::openai::OpenAIProvider::new(
+                        llm::openai::OpenAIProvider::with_client(
+                            client,
                             api_key,
                             provider_config.base_url,
                             provider_config.model,
