@@ -1,0 +1,11 @@
+{"role":"user","content":"[2026-03-15T09:37:07Z] Run 'echo vibe-check-42' using the execute tool","ts":"2026-03-15T09:37:07Z"}
+{"role":"assistant","content":"","ts":"2026-03-15T09:37:08Z","meta":{"model":"gpt-5.3-codex-spark","input_tokens":333,"output_tokens":116},"tool_calls":[{"id":"call_dT9cAQZ92DrXOmmrYvrqbXLr","name":"execute","arguments":"{\"command\":\"echo vibe-check-42\",\"timeout_ms\":100000}"}]}
+{"role":"tool","content":"stdout:\nvibe-check-42\n\nstderr:\n\nexit_code=0","ts":"2026-03-15T09:37:08Z","call_id":"call_dT9cAQZ92DrXOmmrYvrqbXLr","tool_name":"execute"}
+{"role":"assistant","content":"Done.","ts":"2026-03-15T09:37:09Z","meta":{"model":"gpt-5.3-codex-spark","input_tokens":384,"output_tokens":6}}
+{"role":"user","content":"[2026-03-15T09:37:12Z] What was the output of the command I just asked you to run?","ts":"2026-03-15T09:37:12Z"}
+{"role":"assistant","content":"The command output was:\n\n`vibe-check-42`","ts":"2026-03-15T09:37:14Z","meta":{"model":"gpt-5.3-codex-spark","input_tokens":425,"output_tokens":41}}
+{"role":"user","content":"[2026-03-15T09:37:19Z] Run 'cat /etc/hostname' and 'uptime' and give me a one-line status","ts":"2026-03-15T09:37:19Z"}
+{"role":"assistant","content":"","ts":"2026-03-15T09:37:20Z","meta":{"model":"gpt-5.3-codex-spark","input_tokens":482,"output_tokens":167},"tool_calls":[{"id":"call_HiqzdpPIrRLJbbllp7wmF4FN","name":"execute","arguments":"{\"command\":\"cat /etc/hostname\",\"timeout_ms\":100000}"},{"id":"call_9owDKmkEABGqDjEhKYZ65vmU","name":"execute","arguments":"{\"command\":\"uptime\",\"timeout_ms\":100000}"}]}
+{"role":"tool","content":"stdout:\nmodern-octopus\n\nstderr:\n\nexit_code=0","ts":"2026-03-15T09:37:20Z","call_id":"call_HiqzdpPIrRLJbbllp7wmF4FN","tool_name":"execute"}
+{"role":"tool","content":"stdout:\n 09:37:20 up 3 days,  3:17,  0 users,  load average: 5.55, 5.63, 4.97\n\nstderr:\n\nexit_code=0","ts":"2026-03-15T09:37:20Z","call_id":"call_9owDKmkEABGqDjEhKYZ65vmU","tool_name":"execute"}
+{"role":"assistant","content":"`modern-octopus` is up for 3 days 3:17 with load averages 5.55, 5.63, 4.97 and 0 users logged in.","ts":"2026-03-15T09:37:22Z","meta":{"model":"gpt-5.3-codex-spark","input_tokens":625,"output_tokens":58}}

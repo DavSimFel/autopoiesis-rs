@@ -33,6 +33,9 @@ pub struct SessionEntry {
     /// Tool name (only on tool messages).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// Tool calls made by the assistant (only on assistant messages with tool use).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<crate::llm::ToolCall>>,
 }
 
 /// Conversation state for one CLI session.
@@ -95,6 +98,15 @@ impl Session {
             _ => (None, None),
         };
 
+        let tool_calls: Vec<crate::llm::ToolCall> = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                MessageContent::ToolCall { call } => Some(call.clone()),
+                _ => None,
+            })
+            .collect();
+
         SessionEntry {
             role: role.to_string(),
             content,
@@ -102,6 +114,7 @@ impl Session {
             meta: meta.cloned(),
             call_id,
             tool_name,
+            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
         }
     }
 
@@ -134,14 +147,21 @@ impl Session {
         let message = match entry.role.as_str() {
             "system" => None,
             "user" => Some(ChatMessage::user(entry.content)),
-            "assistant" => Some(ChatMessage {
-                role: ChatRole::Assistant,
-                content: if entry.content.is_empty() {
-                    vec![]
-                } else {
-                    vec![MessageContent::text(entry.content)]
-                },
-            }),
+            "assistant" => {
+                let mut content = Vec::new();
+                if !entry.content.is_empty() {
+                    content.push(MessageContent::text(entry.content));
+                }
+                if let Some(calls) = entry.tool_calls {
+                    for call in calls {
+                        content.push(MessageContent::ToolCall { call });
+                    }
+                }
+                Some(ChatMessage {
+                    role: ChatRole::Assistant,
+                    content,
+                })
+            }
             "tool" => {
                 if entry.call_id.is_none() && entry.tool_name.is_none() && entry.content.is_empty() {
                     None

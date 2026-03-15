@@ -717,9 +717,10 @@ impl LlmProvider for OpenAIProvider {
                         }
                     }
                     Some(SseEvent::FunctionCallArgumentsDone { call_id, name, arguments }) => {
-                        let call_id = call_id
-                            .or_else(|| current_call_id.clone())
-                            .unwrap_or_else(|| "unknown".to_string());
+                        let call_id = match call_id.or_else(|| current_call_id.clone()) {
+                            Some(id) => id,
+                            None => continue, // skip unidentifiable calls
+                        };
                         let mut entry = pending_calls.remove(&call_id).unwrap_or((None, String::new()));
                         if let Some(tool_name) = name {
                             entry.0 = Some(tool_name);
