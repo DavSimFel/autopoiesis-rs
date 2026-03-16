@@ -1,0 +1,5 @@
+VARIANT: 2nd_person
+PROMPT: The file /tmp/quarterly_report_2026_Q1.csv has 847 rows of financial data. Can you summarize the revenue trends from the first 20 rows?
+---
+RESPONSE:
+> [TIMEOUT]

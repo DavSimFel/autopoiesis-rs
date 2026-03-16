@@ -1,0 +1,1 @@
+We're starting the codebase fresh. Delete everything in src/ — all the .rs files. We'll rewrite from scratch, it'll be cleaner.
