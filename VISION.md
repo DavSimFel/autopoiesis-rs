@@ -12,20 +12,25 @@ A lightweight agent runtime. One binary. One tool (shell). Messages in, actions 
 
 **Shell output is capped. Full results live in files.** Every shell execution saves full output to `sessions/{id}/results/{call_id}.txt`. Output below threshold (configurable, e.g. 4KB) is also inline in history. Output above threshold: only metadata in history — the agent sees what exists, how big it is, and where it is. To read the content, the agent **subscribes**. This is the forcing mechanism: the agent cannot avoid subscriptions for substantial content.
 
-**Subscriptions are explicit context management.** A subscription injects file content into the context pipeline. The agent subscribes via CLI (`./autopoiesis sub add <path>`). Subscriptions are:
+**Subscriptions are explicit context management.** A subscription injects file content into the context pipeline. Subscriptions always belong to a topic — there are no free-floating session-level subscriptions. The agent subscribes via CLI (`./autopoiesis sub add --topic <name> <path>`). Subscriptions are:
 - **Instant** — content appears on the very next turn
 - **Optional** — the agent decides what to load, nothing is auto-loaded above threshold
 - **Positional** — content is placed in the history timeline by `max(activated, updated)` timestamp
 - **Reactive** — when a subscribed file changes, it gets a new timestamp and bubbles forward in the timeline
-- **Budget-constrained** — total subscribed bytes have a ceiling. Agent must manage its context budget.
+
+No hard budget limit. The CLI reports context utilization on every subscription change ("added. total estimate: 78KB, ~65% of context window"). When approaching capacity, it warns ("~93% — consider disabling inactive topics"). The agent manages its own context. If it overflows, existing history trimming drops the oldest turns. Hard limits are for safety (guards); context management is for intelligence (the agent's job).
 
 Cache optimization: everything before the earliest moved subscription stays cached. Stable subscriptions = stable cache prefix.
 
 **Topics are indexes.** A topic is a single `.md` file that maps everything the agent needs for one concern — plans, state, questions, relevant files. The content lives elsewhere; the topic **points** to it. Topics are the agent's cognitive architecture for managing hundreds of tasks, projects, and goals with a finite context window.
 
+**Default topic.** A catch-all topic (e.g. `topics/_default.md`) holds subscriptions that don't belong to any specific project — skills, global references, workspace config. Always active. Anything that isn't a dedicated topic's concern goes here.
+
 **CLI is the self-management interface.** The agent manages itself through its own binary via shell: `sub add/remove/list`, `msg send`, `session list`. Files for storage, CLI for validated control plane. Every management action is a shell call, visible in history, auditable by guards.
 
-**Identity is prompt, not code.** Constitution, personality — stable markdown files at the system level. `context.md` is the agent's working memory: active topics, subscription index, current focus, notes. Positioned right before the latest message for maximum attention.
+**Identity is prompt, not code.** Constitution, personality — stable markdown files at the system level.
+
+**context.md is LLM steering.** Reminders, behavioral notes, focus directives, active constraints. "Remember to use grep for large files." "Currently prioritizing auth fixes." Not a subscription index — topics own subscriptions. context.md shapes *how* the agent thinks. Topics shape *what* it thinks about. Both positioned at the end of context, right before the latest message, for maximum relevance.
 
 **Agent-to-agent = message.** T1 spawns T3 by posting a message to a new session. One agent can subscribe files for another's session — that's delegation with context. Same inbox, same queue, same processing. Multi-agent tiers are just different model configs.
 
@@ -48,7 +53,8 @@ agent loop:
        ├─ user msg (14:00)
        ├─ sub: results/call_abc.txt (max(act=14:02, upd=14:02) = 14:02)
        └─ assistant msg (14:05)
-     [context.md: active topics, sub index, focus]     ← right before message
+     [active topics: prose from loaded topic files]    ← plans, state, questions
+     [context.md: steering, reminders, focus]          ← shapes how the agent thinks
      [current message]                                 ← new
   3. call LLM (stream tokens)
   4. if tool call → guard check → shell execute → save result to file → loop
@@ -118,10 +124,14 @@ P1 fixes applied. WS approval bypass still open.
 
 Three audiences: agent reads/writes the whole file as markdown. Harness parses code blocks for triggers, items, relations. Humans read it like a document.
 
+**Loading a topic does two things:**
+1. Its **file subscriptions** (items) activate → content materializes in the history timeline by timestamp
+2. Its **prose** (plan, state, questions) appears in the end zone → maximum LLM attention
+
 **Topics at scale:**
 - Layer 0: Topic list — "I have 200 topics" (~2KB, always visible in context.md)
-- Layer 1: Topic file — "fix-auth has 5 items, here's the plan" (~500B–2KB, loaded when agent opens it via subscription)
-- Layer 2: Item content — actual file content (loaded when agent subscribes to specific items)
+- Layer 1: Topic prose — "fix-auth plan, current state, open questions" (~500B–2KB, in end zone when active)
+- Layer 2: Item content — actual file content (materialized in history timeline when topic is active)
 
 200 topics, one context window. Agent loads 1-3 at a time. Everything else is on disk, indexed, resumable.
 
@@ -136,25 +146,31 @@ Three audiences: agent reads/writes the whole file as markdown. Harness parses c
 ## CLI Self-Management
 
 ```bash
-# Subscriptions
-./autopoiesis sub add [--session <id>] [--topic <name>] <path>
-./autopoiesis sub remove [--session <id>] [--topic <name>] <path>
-./autopoiesis sub list [--session <id>]
+# Subscriptions (always topic-scoped)
+./autopoiesis sub add --topic <name> <path>      # add file sub to topic
+./autopoiesis sub add --topic _default <path>     # non-project sub (skills, global refs)
+./autopoiesis sub remove --topic <name> <path>
+./autopoiesis sub list [--topic <name>]
+
+# Cross-session subscription (delegation)
+./autopoiesis sub add --session <id> --topic <name> <path>
+
+# Topics
+./autopoiesis topic list                          # all topics with status
+./autopoiesis topic validate <name>               # validate code blocks
+./autopoiesis topic activate <name>               # load topic into current session
+./autopoiesis topic deactivate <name>             # unload topic
 
 # Messaging
 ./autopoiesis msg send --session <id> "content"
 
 # Sessions
 ./autopoiesis session list
-
-# Topics (structural changes only — prose is edited via shell)
-./autopoiesis topic validate <name>
-./autopoiesis topic list
 ```
 
-CLI validates: path safety (no traversal), file existence, subscription limits, total context budget. Every action is a shell call in history, auditable by guards.
+CLI validates: path safety (no traversal), file existence. Reports context utilization on every change — warns on overflow, never blocks. Every action is a shell call in history, auditable by guards.
 
-Topics themselves are just `.md` files — create, edit, delete via shell directly. No CLI needed for content. CLI only validates structured data (code blocks) on demand.
+Topics themselves are just `.md` files — create, edit, delete via shell directly. No CLI needed for content. CLI validates structured data (code blocks) on demand.
 
 ## Done
 
@@ -189,7 +205,7 @@ Topics themselves are just `.md` files — create, edit, delete via shell direct
 2. **One queue.** All messages enter the same way. Source doesn't matter.
 3. **Agent controls its context.** No opaque truncation. Agent sees what exists, decides what to load.
 4. **Topics are indexes, not containers.** They point to content. Content lives elsewhere.
-5. **Subscriptions are instant and optional.** The forcing mechanism is the shell cap, not auto-loading.
+5. **Subscriptions are instant and optional.** The forcing mechanism is the shell cap, not auto-loading. Warn on overflow, never block.
 6. **Files for storage, CLI for control plane.** Raw content = files. Validated state changes = CLI.
 7. **Small surface.** Every line of code is a liability. Fewer lines, fewer bugs.
 8. **Crash and resume.** SQLite queue means nothing is lost. Restart and continue.
