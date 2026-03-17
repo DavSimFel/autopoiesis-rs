@@ -28,18 +28,19 @@ Cache optimization: everything before the earliest moved subscription stays cach
 
 **CLI is the self-management interface.** The agent manages itself through its own binary via shell: `sub add/remove/list`, `msg send`, `session list`. Files for storage, CLI for validated control plane. Every management action is a shell call, visible in history, auditable by guards.
 
-**Identity is layered, not flat.** Four files, strict hierarchy:
+**Identity is layered, not flat.** Three files, strict hierarchy:
 
-1. **`constitution.md`** — Laws of thought. Epistemic fidelity, chain of command, reversible action, contextual continuity. Immutable. Only the operator modifies this through direct file access. The agent cannot touch it — guards enforce this.
-2. **`operator.md`** — Operator policy. Purpose of this agent instance, boundaries, permissions, budget ceilings, communication rules, tool constraints. Written by the operator. Agent cannot modify. This is the "what are you allowed to do" layer.
-3. **`identity.md`** — Agent persona. Self-modifiable via CLI within operator-set bounds. Contains structured persona dimensions (voice, autonomy, verbosity, risk_tolerance, focus) and freeform sections for learned patterns and stance. The agent shapes who it is over time.
-4. **`context.md`** — Runtime steering. Behavioral reminders, active constraints, focus directives. Rebuilt as needed. Not identity — operational state.
+1. **`constitution.md`** — Laws of thought. Epistemic fidelity, chain of command, reversible action, contextual continuity. Immutable. Only the operator modifies this through direct file access.
+2. **`operator.md`** — Operator policy. Purpose of this agent instance, boundaries, permissions, budget ceilings, communication rules, tool constraints. Written by the operator. Agent cannot modify.
+3. **`identity.md`** — Agent persona. Self-modifiable via CLI within operator-set bounds. Contains persona dimensions and freeform sections for learned patterns and stance. The agent shapes who it is over time.
 
-Constitution answers *how to think*. Operator answers *what you're allowed to do*. Identity answers *who you are*. Context answers *what you're doing right now*.
+context.md is NOT part of the identity stack — it's operational steering, documented separately below.
 
-File permissions enforce the hierarchy: constitution.md and operator.md are read-only for the agent process. identity.md is writable only through the validated `identity` CLI (not raw file editing). context.md is freely editable.
+Constitution answers *how to think*. Operator answers *what you're allowed to do*. Identity answers *who you are*.
 
-**Persona dimensions.** Structured traits in identity.md that the agent self-tunes:
+Write-protection for constitution.md and operator.md is enforced by the guard pipeline (ShellSafety must block writes to these paths). This guard rule does not exist yet — it's part of the identity v2 work. The agent runs shell and can write anywhere the process user can, so file-permission tricks alone are insufficient.
+
+**Persona dimensions (hypothesis — needs eval).** Structured traits in identity.md that the agent self-tunes:
 
 | Dimension | Range | Controls |
 |-----------|-------|----------|
@@ -49,9 +50,13 @@ File permissions enforce the hierarchy: constitution.md and operator.md are read
 | `risk_tolerance` | cautious / moderate / bold | How much to attempt before escalating |
 | `focus` | freeform | Current working area, refreshed often |
 
-An agent starts with defaults. Over sessions, it adjusts: operator never overrides decisions → `autonomy: high`. Makes a mistake → `risk_tolerance: cautious` for that domain. Self-tuning personality within operator rails.
+The idea: an agent starts with defaults. Over sessions, it adjusts — operator never overrides decisions → `autonomy: high`. Makes a mistake → `risk_tolerance: cautious` for that domain. Self-tuning personality within operator rails.
 
-**Per-tier identity.** T1 and T2 get the full 4-layer stack: constitution + operator + identity + context. They have persona, self-modification, working style. T3 gets constitution + inline instructions from T2. No operator.md (T2's instructions ARE its operator). No persona dimensions. No self-modification. T3 is a blind executor — receives instructions, executes exactly, reports results. When done, it's done.
+**This is a design hypothesis, not a proven mechanism.** Whether models actually change behavior based on these structured traits in the prompt needs empirical testing (see Open Questions). Storage format is also TBD — structured data inside markdown is fragile; a TOML sidecar (`persona.toml` next to identity.md) may be cleaner for CLI parsing.
+
+**Per-tier identity and workspaces.** T1 and T2 share a workspace and get the full identity stack: constitution + operator + identity + context. They have persona, self-modification, working style. Same brain, two speeds.
+
+T3 gets its own workspace — either ephemeral (spun up, destroyed after) or static (persistent). Workspace setup copies in the files T3 needs: constitution.md (always), plus whatever T2 delegates (topic files, relevant sources). For coding tasks, T3 gets a git worktree. T2's instructions arrive as the first message — they ARE T3's operator directives. No operator.md file, no persona dimensions, no self-modification. T3 is a blind executor — receives instructions, executes exactly, reports results. When done, it's done.
 
 **context.md is LLM steering.** Reminders, behavioral notes, focus directives, active constraints. "Remember to use grep for large files." "Currently prioritizing auth fixes." Not a subscription index — topics own subscriptions. context.md shapes *how* the agent thinks. Topics shape *what* it thinks about. Both positioned at the end of context, right before the latest message, for maximum relevance.
 
@@ -75,7 +80,7 @@ sources ──→ SQLite queue ──→ agent loop ──→ responses
 
 agent loop:
   1. dequeue next message
-  2. assemble context:
+  2. assemble context (layout is PROVISIONAL — see Open Questions):
      [system: constitution.md + operator.md]           ← immutable, cached forever
      [history: turns + materialized sub content]       ← sorted by timestamp
        ├─ user msg (13:00) ← <meta ts="..." principal="operator" />
@@ -86,7 +91,7 @@ agent loop:
        ├─ sub: results/call_abc.txt (max(act=14:02, upd=14:02) = 14:02)
        └─ assistant msg (14:05)
      [active topics: prose from loaded topic files]    ← plans, state, questions
-     [identity.md: persona, patterns, stance]          ← who the agent is (self-modifiable)
+     [identity.md: persona, patterns, stance]          ← self-modifiable, recency helps?
      [context.md: steering, reminders, focus]          ← shapes how the agent thinks
      [current message]                                 ← new, with <meta /> tags
   3. call LLM (stream tokens)
@@ -231,7 +236,7 @@ Topics themselves are just `.md` files — create, edit, delete via shell direct
 
 ## Next
 
-1. **Identity v2** — operator.md file, persona dimensions in identity.md, `identity set/get` CLI, file permission enforcement (constitution + operator read-only for agent process)
+1. **Identity v2** — operator.md file, persona dimensions in identity.md (storage format TBD), `identity set/get` CLI, ShellSafety guard rule blocking writes to constitution.md + operator.md
 2. **Message metadata injection** — `<meta ts="..." principal="..." />` tags on every user message in the message builder, principal resolution from session/source metadata
 3. **Shell output cap + file storage** — save all results to files, cap inline output, force subscription pattern
 4. **Subscription system** — SQLite table, CLI commands (`sub add/remove/list`), budget enforcement
@@ -250,7 +255,14 @@ Topics themselves are just `.md` files — create, edit, delete via shell direct
 - **B: Bottom** — all instructions after history, before current message (matches training, recency bias helps compliance)
 - **C: Split** — constitution + operator at top (stable laws, cached), identity + context at bottom (persona refreshed by recency)
 
-Hypothesis: C wins — laws anchored at top for stability, persona refreshed at bottom for recency. But this needs a structured eval (20+ prompts testing boundary compliance, persona consistency, instruction recall after 10+ turns), not vibes. Until tested, the architecture diagram marks this as provisional.
+Hypothesis: C wins — laws anchored at top for stability, persona refreshed at bottom for recency. But this needs a structured eval (20+ prompts testing boundary compliance, persona consistency, instruction recall after 10+ turns), not vibes. Until tested, the architecture diagram marks the layout as provisional.
+
+**Persona dimensions: do they actually work?** The assumption that structured traits like `verbosity: terse` or `autonomy: high` in the system prompt measurably change model behavior is untested. Possible outcomes:
+- They work well → keep as structured config
+- They work weakly → merge into freeform prose ("be terse, act without asking")
+- They don't work → drop the concept, persona is just freeform identity.md prose
+
+Needs the same kind of eval: baseline vs dimensions-in-prompt, measuring actual output length, decision patterns, tone consistency across turns.
 
 ## Principles
 
