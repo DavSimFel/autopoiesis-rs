@@ -28,9 +28,41 @@ Cache optimization: everything before the earliest moved subscription stays cach
 
 **CLI is the self-management interface.** The agent manages itself through its own binary via shell: `sub add/remove/list`, `msg send`, `session list`. Files for storage, CLI for validated control plane. Every management action is a shell call, visible in history, auditable by guards.
 
-**Identity is prompt, not code.** Constitution, personality — stable markdown files at the system level.
+**Identity is layered, not flat.** Four files, strict hierarchy:
+
+1. **`constitution.md`** — Laws of thought. Epistemic fidelity, chain of command, reversible action, contextual continuity. Immutable. Only the operator modifies this through direct file access. The agent cannot touch it — guards enforce this.
+2. **`operator.md`** — Operator policy. Purpose of this agent instance, boundaries, permissions, budget ceilings, communication rules, tool constraints. Written by the operator. Agent cannot modify. This is the "what are you allowed to do" layer.
+3. **`identity.md`** — Agent persona. Self-modifiable via CLI within operator-set bounds. Contains structured persona dimensions (voice, autonomy, verbosity, risk_tolerance, focus) and freeform sections for learned patterns and stance. The agent shapes who it is over time.
+4. **`context.md`** — Runtime steering. Behavioral reminders, active constraints, focus directives. Rebuilt as needed. Not identity — operational state.
+
+Constitution answers *how to think*. Operator answers *what you're allowed to do*. Identity answers *who you are*. Context answers *what you're doing right now*.
+
+File permissions enforce the hierarchy: constitution.md and operator.md are read-only for the agent process. identity.md is writable only through the validated `identity` CLI (not raw file editing). context.md is freely editable.
+
+**Persona dimensions.** Structured traits in identity.md that the agent self-tunes:
+
+| Dimension | Range | Controls |
+|-----------|-------|----------|
+| `voice` | freeform | Tone, style of output |
+| `autonomy` | low / moderate / high | Act-first vs ask-first threshold |
+| `verbosity` | terse / normal / detailed | Default response length |
+| `risk_tolerance` | cautious / moderate / bold | How much to attempt before escalating |
+| `focus` | freeform | Current working area, refreshed often |
+
+An agent starts with defaults. Over sessions, it adjusts: operator never overrides decisions → `autonomy: high`. Makes a mistake → `risk_tolerance: cautious` for that domain. Self-tuning personality within operator rails.
+
+**Per-tier identity.** T1 and T2 get the full 4-layer stack: constitution + operator + identity + context. They have persona, self-modification, working style. T3 gets constitution + inline instructions from T2. No operator.md (T2's instructions ARE its operator). No persona dimensions. No self-modification. T3 is a blind executor — receives instructions, executes exactly, reports results. When done, it's done.
 
 **context.md is LLM steering.** Reminders, behavioral notes, focus directives, active constraints. "Remember to use grep for large files." "Currently prioritizing auth fixes." Not a subscription index — topics own subscriptions. context.md shapes *how* the agent thinks. Topics shape *what* it thinks about. Both positioned at the end of context, right before the latest message, for maximum relevance.
+
+**Messages carry metadata.** Every user-role message gets XML tags injected before content:
+
+```xml
+<meta ts="2026-03-17T07:22:00Z" principal="operator" />
+How's the build going?
+```
+
+`principal` values: `operator`, `user`, `agent:<id>`, `system`. This makes the constitution's Chain of Command (Law 2) enforceable per-message — the model sees WHO is talking, not just what they said. Timestamp is per-message, not a template var. Thin injection in the message builder, zero overhead.
 
 **Agent-to-agent = message.** T1 spawns T3 by posting a message to a new session. One agent can subscribe files for another's session — that's delegation with context. Same inbox, same queue, same processing. Multi-agent tiers are just different model configs.
 
@@ -44,9 +76,9 @@ sources ──→ SQLite queue ──→ agent loop ──→ responses
 agent loop:
   1. dequeue next message
   2. assemble context:
-     [system: constitution.md + identity.md]          ← stable, cached forever
+     [system: constitution.md + operator.md]           ← immutable, cached forever
      [history: turns + materialized sub content]       ← sorted by timestamp
-       ├─ user msg (13:00)
+       ├─ user msg (13:00) ← <meta ts="..." principal="operator" />
        ├─ assistant msg (13:01)
        ├─ tool result inline (13:02, <4KB)
        ├─ sub: src/auth.rs (max(act=13:10, upd=13:45) = 13:45)
@@ -54,8 +86,9 @@ agent loop:
        ├─ sub: results/call_abc.txt (max(act=14:02, upd=14:02) = 14:02)
        └─ assistant msg (14:05)
      [active topics: prose from loaded topic files]    ← plans, state, questions
+     [identity.md: persona, patterns, stance]          ← who the agent is (self-modifiable)
      [context.md: steering, reminders, focus]          ← shapes how the agent thinks
-     [current message]                                 ← new
+     [current message]                                 ← new, with <meta /> tags
   3. call LLM (stream tokens)
   4. if tool call → guard check → shell execute → save result to file → loop
   5. if done → persist turn, mark message processed
@@ -161,6 +194,14 @@ Three audiences: agent reads/writes the whole file as markdown. Harness parses c
 ./autopoiesis topic activate <name>               # load topic into current session
 ./autopoiesis topic deactivate <name>             # unload topic
 
+# Identity (self-modification within operator bounds)
+./autopoiesis identity get persona               # show current dimensions
+./autopoiesis identity set voice "terse, technical"
+./autopoiesis identity set autonomy high          # low | moderate | high
+./autopoiesis identity set verbosity terse        # terse | normal | detailed
+./autopoiesis identity set risk_tolerance cautious # cautious | moderate | bold
+./autopoiesis identity set focus "axum server"    # freeform, updated often
+
 # Messaging
 ./autopoiesis msg send --session <id> "content"
 
@@ -178,7 +219,8 @@ Topics themselves are just `.md` files — create, edit, delete via shell direct
 - [x] Shell tool (async, RLIMIT-sandboxed, process-group kill on timeout)
 - [x] Guard pipeline (secret redactor, shell safety, exfil detector)
 - [x] Session persistence (JSONL history)
-- [x] Identity system (constitution + identity + context, template vars)
+- [x] Identity system v1 (constitution + identity + context, template vars)
+- [ ] Identity system v2 (4-layer: constitution + operator + identity + context, persona dimensions, `identity` CLI)
 - [x] OAuth device flow auth
 - [x] Token estimation + context trimming
 - [x] SQLite message queue + session store
@@ -189,15 +231,26 @@ Topics themselves are just `.md` files — create, edit, delete via shell direct
 
 ## Next
 
-1. **Shell output cap + file storage** — save all results to files, cap inline output, force subscription pattern
-2. **Subscription system** — SQLite table, CLI commands (`sub add/remove/list`), budget enforcement
-3. **Context assembly rework** — materialize sub content in history by `max(activated, updated)` timestamp, context.md at end
-4. **Topics** — `.md` files with code blocks, topic list in context.md, `topic validate/list` CLI
-5. **CI pipeline** — GitHub Actions (lint, test, build on every PR)
-6. **Trigger evaluation** — server-side cron/file_change/webhook → enqueue message
-7. **PTY shell** — interactive commands, not just batch
-8. **Provider abstraction** — Anthropic, local models
-9. **CLI as separate crate** — TUI with graceful degradation
+1. **Identity v2** — operator.md file, persona dimensions in identity.md, `identity set/get` CLI, file permission enforcement (constitution + operator read-only for agent process)
+2. **Message metadata injection** — `<meta ts="..." principal="..." />` tags on every user message in the message builder, principal resolution from session/source metadata
+3. **Shell output cap + file storage** — save all results to files, cap inline output, force subscription pattern
+4. **Subscription system** — SQLite table, CLI commands (`sub add/remove/list`), budget enforcement
+5. **Context assembly rework** — materialize sub content in history by `max(activated, updated)` timestamp, identity.md + context.md at end (see Open Questions)
+6. **Topics** — `.md` files with code blocks, topic list in context.md, `topic validate/list` CLI
+7. **CI pipeline** — GitHub Actions (lint, test, build on every PR)
+8. **Trigger evaluation** — server-side cron/file_change/webhook → enqueue message
+9. **PTY shell** — interactive commands, not just batch
+10. **Provider abstraction** — Anthropic, local models
+11. **CLI as separate crate** — TUI with graceful degradation
+
+## Open Questions
+
+**Instruction positioning: top vs bottom vs split.** The current architecture places system instructions (constitution + operator) at position 0 — before all history. Models are typically trained with system prompts at the end (closer to generation). Three variants to test empirically:
+- **A: Top** — all instructions before history (current design, maximizes KV cache stability)
+- **B: Bottom** — all instructions after history, before current message (matches training, recency bias helps compliance)
+- **C: Split** — constitution + operator at top (stable laws, cached), identity + context at bottom (persona refreshed by recency)
+
+Hypothesis: C wins — laws anchored at top for stability, persona refreshed at bottom for recency. But this needs a structured eval (20+ prompts testing boundary compliance, persona consistency, instruction recall after 10+ turns), not vibes. Until tested, the architecture diagram marks this as provisional.
 
 ## Principles
 
