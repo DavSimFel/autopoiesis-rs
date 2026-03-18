@@ -80,6 +80,7 @@ impl ApprovalHandler for CliApprovalHandler {
     fn request_approval(&mut self, severity: &Severity, reason: &str, command: &str) -> bool {
         let prefix = match severity {
             Severity::Low => "⚠️",
+            Severity::Medium => "🟡",
             Severity::High => "🔴",
         };
 
@@ -136,7 +137,8 @@ where
 {
     let user_prompt = format!("[{}] {}", utc_timestamp(), user_prompt);
     let tools = turn.tool_definitions();
-    session.add_user_message(user_prompt)?;
+    let user_message = ChatMessage::user(user_prompt);
+    let mut persisted_user_message = false;
 
     let mut executed: Vec<ToolCall> = Vec::new();
     let mut had_user_approval = false;
@@ -144,7 +146,22 @@ where
     'agent_turn: loop {
         session.ensure_context_within_limit();
         let mut messages = session.history().to_vec();
-        match turn.check_inbound(&mut messages) {
+        let user_message_index = messages.len();
+        if !persisted_user_message {
+            messages.push(user_message.clone());
+        }
+
+        let verdict = turn.check_inbound(&mut messages);
+        if !persisted_user_message {
+            let user_message = messages
+                .get(user_message_index)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing user message after inbound checks"))?;
+            session.append(user_message, None)?;
+            persisted_user_message = true;
+        }
+
+        match verdict {
             Verdict::Allow => {}
             Verdict::Modify => {}
             Verdict::Deny { reason, gate_id } => {
@@ -370,6 +387,41 @@ mod tests {
             observed.first().cloned().is_some_and(|count| count <= 3),
             "expected pre-call trimming to run before stream completion"
         );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn inbound_redaction_is_persisted_before_session_write() {
+        let dir = temp_sessions_dir("redaction_persisted");
+        let (provider, _observed_message_counts) = InspectingProvider::new();
+        let mut session = crate::session::Session::new(&dir).unwrap();
+
+        let turn = Turn::new().guard(SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"]));
+        let mut make_provider = {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "please store sk-proj-abcdefghijklmnopqrstuvwxyz012345".to_string(),
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        let session_file = std::fs::read_to_string(session.today_path()).unwrap();
+        assert!(!session_file.contains("sk-proj-abcdefghijklmnopqrstuvwxyz012345"));
+        assert!(session_file.contains("[REDACTED]"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

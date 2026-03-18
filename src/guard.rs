@@ -3,9 +3,10 @@ use serde_json::{from_str, Value};
 use crate::llm::{ChatMessage, ToolCall};
 
 /// Severity level when execution needs explicit approval.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
     Low,
+    Medium,
     High,
 }
 
@@ -271,7 +272,13 @@ impl Guard for ShellSafety {
             GuardEvent::ToolCall(call) => {
                 let command = match self.command_from_args(call) {
                     Some(command) => command,
-                    None => return Verdict::Allow,
+                    None => {
+                        return Verdict::Approve {
+                            reason: "unable to parse shell command arguments".to_string(),
+                            gate_id: self.id.clone(),
+                            severity: Severity::Medium,
+                        }
+                    }
                 };
 
                 if self.fork_bomb_re.is_match(&command) {
@@ -307,13 +314,7 @@ impl Guard for ShellSafety {
                             severity,
                             gate_id: _,
                         } => {
-                            if most_restrictive.is_none()
-                                || most_restrictive
-                                    .as_ref()
-                                    .is_some_and(|(_, current)| {
-                                        *current == Severity::Low && severity == Severity::High
-                                    })
-                            {
+                            if most_restrictive.as_ref().is_none_or(|(_, current)| severity > *current) {
                                 most_restrictive = Some((reason, severity));
                             }
                         }
@@ -551,6 +552,25 @@ mod tests {
         };
         assert!(!redacted.contains("sk-proj-"));
         assert!(!redacted.contains("ghp_"));
+    }
+
+    #[test]
+    fn unparseable_command_requests_medium_approval() {
+        let gate = ShellSafety::new();
+        let call = ToolCall {
+            id: "tool_call_1".to_string(),
+            name: "execute".to_string(),
+            arguments: "not-json".to_string(),
+        };
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(
+            gate.check(&mut event),
+            Verdict::Approve {
+                severity: Severity::Medium,
+                ..
+            }
+        ));
     }
 
     #[test]

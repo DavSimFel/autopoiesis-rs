@@ -88,11 +88,7 @@ fn resolve_verdict(guards: &[Box<dyn Guard>], mut event: GuardEvent, modified: b
                 gate_id,
                 severity,
             } => {
-                if approved.is_none()
-                    || approved.as_ref().is_some_and(|(_, _, current)| {
-                        *current == Severity::Low && severity == Severity::High
-                    })
-                {
+                if approved.as_ref().is_none_or(|(_, _, current)| severity > *current) {
                     approved = Some((reason, gate_id, severity));
                 }
             }

@@ -346,19 +346,20 @@ mod tests {
                     }
                 }
                 SseEvent::FunctionCallArgumentsDone { call_id, name, arguments } => {
-                    let call_id = call_id.or_else(|| current_call_id.clone()).unwrap_or_else(|| "unknown".to_string());
+                    let call_id = match call_id.or_else(|| current_call_id.clone()) {
+                        Some(id) => id,
+                        None => continue,
+                    };
                     let mut entry = pending_calls.remove(&call_id).unwrap_or((None, String::new()));
                     if let Some(tool_name) = name {
                         entry.0 = Some(tool_name);
                     }
+                    let Some(tool_name) = entry.0 else {
+                        continue;
+                    };
                     let arguments = arguments.unwrap_or(entry.1);
 
-                    upsert_tool_call(
-                        &mut tool_calls,
-                        call_id,
-                        entry.0.unwrap_or_else(|| "unknown".to_string()),
-                        arguments,
-                    );
+                    upsert_tool_call(&mut tool_calls, call_id, tool_name, arguments);
                 }
                 SseEvent::FunctionCallOutputItemDone { call_id, name, arguments } => {
                     let mut arguments = arguments;
@@ -414,6 +415,19 @@ mod tests {
         assert_eq!(calls[1].name, "second");
         assert_eq!(calls[2].id, "call_3");
         assert_eq!(calls[2].name, "third");
+    }
+
+    #[test]
+    fn function_call_without_identifiable_id_is_dropped() {
+        let events = vec![SseEvent::FunctionCallArgumentsDone {
+            call_id: None,
+            name: Some("shell".to_string()),
+            arguments: Some("{\"command\":\"ls\"}".to_string()),
+        }];
+
+        let calls = collect_tool_calls_from_events(events);
+
+        assert!(calls.is_empty());
     }
 
     #[test]
