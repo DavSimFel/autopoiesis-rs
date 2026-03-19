@@ -63,11 +63,27 @@ impl OpenAIProvider {
         for msg in messages {
             match msg.role {
                 ChatRole::System => {
-                    // Keep only the latest system instruction message.
-                    for block in &msg.content {
-                        if let MessageContent::Text { text } = block {
-                            instructions = Some(text.clone());
+                    let text_blocks = msg
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            MessageContent::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+
+                    if instructions.is_none() {
+                        if !text_blocks.is_empty() {
+                            instructions = Some(text_blocks.join("\n"));
                         }
+                        continue;
+                    }
+
+                    for text in text_blocks {
+                        input.push(json!({
+                            "role": "system",
+                            "content": text
+                        }));
                     }
                 }
                 ChatRole::User => {
@@ -150,9 +166,9 @@ enum SseEvent {
         arguments: Option<String>,
     },
     FunctionCallOutputItemDone {
-        call_id: String,
-        name: String,
-        arguments: String,
+        call_id: Option<String>,
+        name: Option<String>,
+        arguments: Option<String>,
     },
     Completed {
         meta: Option<TurnMeta>,
@@ -222,18 +238,15 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
                     .get("call_id")
                     .or_else(|| item.get("id"))
                     .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string(),
+                    .map(ToString::to_string),
                 name: item
                     .get("name")
                     .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string(),
+                    .map(ToString::to_string),
                 arguments: item
                     .get("arguments")
                     .and_then(Value::as_str)
-                    .unwrap_or("{}")
-                    .to_string(),
+                    .map(ToString::to_string),
             })
         }
         "response.completed" => {
@@ -274,6 +287,56 @@ fn upsert_tool_call(
     } else {
         tool_calls.push((call_id, name, arguments));
     }
+}
+
+fn finalize_function_call(
+    pending_calls: &mut HashMap<String, (Option<String>, String)>,
+    tool_calls: &mut Vec<(String, String, String)>,
+    current_call_id: &Option<String>,
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: Option<String>,
+) {
+    let call_id = match call_id.or_else(|| current_call_id.clone()) {
+        Some(id) => id,
+        None => return,
+    };
+    let mut entry = pending_calls
+        .remove(&call_id)
+        .unwrap_or((None, String::new()));
+    if let Some(tool_name) = name {
+        entry.0 = Some(tool_name);
+    }
+    let Some(tool_name) = entry.0 else {
+        return;
+    };
+    let arguments = arguments.unwrap_or(entry.1);
+
+    upsert_tool_call(tool_calls, call_id, tool_name, arguments);
+}
+
+fn finalize_output_item(
+    pending_calls: &mut HashMap<String, (Option<String>, String)>,
+    tool_calls: &mut Vec<(String, String, String)>,
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: Option<String>,
+) {
+    let Some(call_id) = call_id else {
+        return;
+    };
+    let mut entry = pending_calls
+        .remove(&call_id)
+        .unwrap_or((None, String::new()));
+    if let Some(tool_name) = name {
+        entry.0 = Some(tool_name);
+    }
+    let Some(tool_name) = entry.0 else {
+        return;
+    };
+    let arguments = arguments.unwrap_or(entry.1);
+
+    upsert_tool_call(tool_calls, call_id, tool_name, arguments);
 }
 
 #[cfg(test)]
@@ -346,29 +409,18 @@ mod tests {
                     }
                 }
                 SseEvent::FunctionCallArgumentsDone { call_id, name, arguments } => {
-                    let call_id = match call_id.or_else(|| current_call_id.clone()) {
-                        Some(id) => id,
-                        None => continue,
-                    };
-                    let mut entry = pending_calls.remove(&call_id).unwrap_or((None, String::new()));
-                    if let Some(tool_name) = name {
-                        entry.0 = Some(tool_name);
-                    }
-                    let Some(tool_name) = entry.0 else {
-                        continue;
-                    };
-                    let arguments = arguments.unwrap_or(entry.1);
-
-                    upsert_tool_call(&mut tool_calls, call_id, tool_name, arguments);
+                    finalize_function_call(
+                        &mut pending_calls,
+                        &mut tool_calls,
+                        &current_call_id,
+                        call_id,
+                        name,
+                        arguments,
+                    );
                 }
                 SseEvent::FunctionCallOutputItemDone { call_id, name, arguments } => {
-                    let mut arguments = arguments;
-                    if let Some((_, pending_args)) = pending_calls.remove(&call_id) {
-                        if arguments.is_empty() {
-                            arguments = pending_args;
-                        }
-                    }
-                    upsert_tool_call(
+                    finalize_output_item(
+                        &mut pending_calls,
                         &mut tool_calls,
                         call_id,
                         name,
@@ -420,6 +472,32 @@ mod tests {
     #[test]
     fn function_call_without_identifiable_id_is_dropped() {
         let events = vec![SseEvent::FunctionCallArgumentsDone {
+            call_id: None,
+            name: Some("shell".to_string()),
+            arguments: Some("{\"command\":\"ls\"}".to_string()),
+        }];
+
+        let calls = collect_tool_calls_from_events(events);
+
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn function_call_without_identifiable_name_is_dropped() {
+        let events = vec![SseEvent::FunctionCallArgumentsDone {
+            call_id: Some("call_1".to_string()),
+            name: None,
+            arguments: Some("{\"command\":\"ls\"}".to_string()),
+        }];
+
+        let calls = collect_tool_calls_from_events(events);
+
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn output_item_without_identifiable_id_is_dropped() {
+        let events = vec![SseEvent::FunctionCallOutputItemDone {
             call_id: None,
             name: Some("shell".to_string()),
             arguments: Some("{\"command\":\"ls\"}".to_string()),
@@ -539,6 +617,23 @@ mod tests {
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[0]["content"], "Hello");
+    }
+
+    #[test]
+    fn build_input_preserves_first_system_message_and_replays_later_system_messages() {
+        let messages = vec![
+            ChatMessage::system("Primary system instructions"),
+            ChatMessage::user("Hello"),
+            ChatMessage::system("Tool execution rejected by user"),
+        ];
+        let (instructions, input) = OpenAIProvider::build_input(&messages);
+
+        assert_eq!(instructions, Some("Primary system instructions".to_string()));
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "Hello");
+        assert_eq!(input[1]["role"], "system");
+        assert_eq!(input[1]["content"], "Tool execution rejected by user");
     }
 
     #[test]
@@ -731,29 +826,31 @@ impl LlmProvider for OpenAIProvider {
                         }
                     }
                     Some(SseEvent::FunctionCallArgumentsDone { call_id, name, arguments }) => {
-                        let call_id = match call_id.or_else(|| current_call_id.clone()) {
-                            Some(id) => id,
-                            None => continue, // skip unidentifiable calls
-                        };
-                        let mut entry = pending_calls.remove(&call_id).unwrap_or((None, String::new()));
-                        if let Some(tool_name) = name {
-                            entry.0 = Some(tool_name);
+                        let previous_len = tool_calls.len();
+                        finalize_function_call(
+                            &mut pending_calls,
+                            &mut tool_calls,
+                            &current_call_id,
+                            call_id,
+                            name,
+                            arguments,
+                        );
+                        if tool_calls.len() != previous_len {
+                            stop_reason = StopReason::ToolCalls;
                         }
-                        let name = entry.0.unwrap_or_else(|| "unknown".to_string());
-                        let arguments = arguments.unwrap_or(entry.1);
-
-                        upsert_tool_call(&mut tool_calls, call_id, name, arguments);
-                        stop_reason = StopReason::ToolCalls;
                     }
                     Some(SseEvent::FunctionCallOutputItemDone { call_id, name, arguments }) => {
-                        let mut arguments = arguments;
-                        if let Some((_, pending_args)) = pending_calls.remove(&call_id) {
-                            if arguments.is_empty() {
-                                arguments = pending_args;
-                            }
+                        let previous_len = tool_calls.len();
+                        finalize_output_item(
+                            &mut pending_calls,
+                            &mut tool_calls,
+                            call_id,
+                            name,
+                            arguments,
+                        );
+                        if tool_calls.len() != previous_len {
+                            stop_reason = StopReason::ToolCalls;
                         }
-                        upsert_tool_call(&mut tool_calls, call_id, name, arguments);
-                        stop_reason = StopReason::ToolCalls;
                     }
                     Some(SseEvent::Completed { meta }) => {
                         if let Some(meta) = meta {
