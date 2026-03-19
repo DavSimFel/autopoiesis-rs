@@ -165,7 +165,6 @@ where
     'agent_turn: loop {
         session.ensure_context_within_limit();
         let mut messages = session.history().to_vec();
-        let user_message_index = messages.len();
         if !persisted_user_message {
             messages.push(user_message.clone());
         }
@@ -173,7 +172,9 @@ where
         let verdict = turn.check_inbound(&mut messages);
         if !persisted_user_message {
             let user_message = messages
-                .get(user_message_index)
+                .iter()
+                .rev()
+                .find(|message| message.role == crate::llm::ChatRole::User)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("missing user message after inbound checks"))?;
             session.append(user_message, None)?;
@@ -522,6 +523,54 @@ mod tests {
         let session_file = std::fs::read_to_string(session.today_path()).unwrap();
         assert!(!session_file.contains("sk-proj-abcdefghijklmnopqrstuvwxyz012345"));
         assert!(session_file.contains("[REDACTED]"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_insertion_does_not_replace_persisted_user_message() {
+        let dir = temp_sessions_dir("persist_user_with_context");
+        let identity_dir = dir.join("identity");
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        std::fs::write(identity_dir.join("constitution.md"), "constitution").unwrap();
+        std::fs::write(identity_dir.join("identity.md"), "identity").unwrap();
+        std::fs::write(identity_dir.join("context.md"), "context").unwrap();
+
+        let (provider, _observed_message_counts) = InspectingProvider::new();
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let turn = Turn::new().context(crate::context::Identity::new(
+            identity_dir.to_str().unwrap(),
+            std::collections::HashMap::new(),
+            "fallback",
+        ));
+        let mut make_provider = {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "store this user prompt".to_string(),
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        let first = session.history().first().expect("user message should be persisted");
+        assert!(matches!(first.role, crate::llm::ChatRole::User));
+        let content = match &first.content[0] {
+            MessageContent::Text { text } => text,
+            _ => panic!("expected text content"),
+        };
+        assert!(content.contains("store this user prompt"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -126,8 +126,7 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
     vars.insert("tools".to_string(), tools_list);
 
     Turn::new()
-        .context(crate::context::Identity::new("identity", vars, &config.system_prompt))
-        .context(crate::context::History::new(100_000))
+        .context(crate::context::Identity::new("identity", vars, &config.system_prompt).strict())
         .tool(tool)
         .guard(crate::guard::SecretRedactor::new(&[
             r"sk-[a-zA-Z0-9_-]{20,}",

@@ -188,9 +188,29 @@ where
     AH: agent::ApprovalHandler,
 {
     while let Some(message) = queue.dequeue_next_message(session_id)? {
-        if message.role != "user" {
-            queue.mark_processed(message.id)?;
-            continue;
+        match message.role.as_str() {
+            "system" => {
+                session.append(llm::ChatMessage::system(message.content), None)?;
+                queue.mark_processed(message.id)?;
+                continue;
+            }
+            "assistant" => {
+                session.append(
+                    llm::ChatMessage {
+                        role: llm::ChatRole::Assistant,
+                        content: vec![llm::MessageContent::text(message.content)],
+                    },
+                    None,
+                )?;
+                queue.mark_processed(message.id)?;
+                continue;
+            }
+            "user" => {}
+            other => {
+                eprintln!("unsupported queued role '{other}' for message {}", message.id);
+                queue.mark_failed(message.id)?;
+                continue;
+            }
         }
 
         let verdict = agent::run_agent_loop(
@@ -288,6 +308,104 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+
+        let conn = rusqlite::Connection::open(&queue_path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM messages WHERE id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn process_queue_persists_system_messages_instead_of_discarding_them() {
+        let root = temp_dir("system_queue_message");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let queue_path = root.join("queue.sqlite");
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "worker";
+        let mut queue = store::Store::new(&queue_path).unwrap();
+        queue.create_session(session_id, None).unwrap();
+        let message_id = queue
+            .enqueue_message(session_id, "system", "operational note", "cli")
+            .unwrap();
+
+        let mut session = session::Session::new(&sessions_dir).unwrap();
+        let turn = turn::Turn::new();
+        let mut provider_factory = || async { Ok::<_, anyhow::Error>(FailingProvider) };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler =
+            |_severity: &autopoiesis::guard::Severity, _reason: &str, _command: &str| true;
+
+        process_queue(
+            &mut queue,
+            session_id,
+            &mut session,
+            &turn,
+            &mut provider_factory,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.history().len(), 1);
+        assert!(matches!(session.history()[0].role, llm::ChatRole::System));
+        let conn = rusqlite::Connection::open(&queue_path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM messages WHERE id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "processed");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn process_queue_marks_unknown_roles_failed() {
+        let root = temp_dir("unknown_queue_message");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let queue_path = root.join("queue.sqlite");
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "worker";
+        let mut queue = store::Store::new(&queue_path).unwrap();
+        queue.create_session(session_id, None).unwrap();
+        let message_id = queue
+            .enqueue_message(session_id, "tool", "orphan tool result", "cli")
+            .unwrap();
+
+        let mut session = session::Session::new(&sessions_dir).unwrap();
+        let turn = turn::Turn::new();
+        let mut provider_factory = || async { Ok::<_, anyhow::Error>(FailingProvider) };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler =
+            |_severity: &autopoiesis::guard::Severity, _reason: &str, _command: &str| true;
+
+        process_queue(
+            &mut queue,
+            session_id,
+            &mut session,
+            &turn,
+            &mut provider_factory,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
 
         let conn = rusqlite::Connection::open(&queue_path).unwrap();
         let status: String = conn
