@@ -73,7 +73,6 @@ struct EnqueueMessageResponse {
 #[serde(tag = "op", rename_all = "lowercase")]
 enum WsFrame {
     Token { data: String },
-    ToolCall { data: llm::ToolCall },
     Approval { data: WsApprovalRequest },
     Error { data: String },
     Done,
@@ -91,12 +90,6 @@ struct WsApprovalRequest {
 struct WsApprovalDecision {
     request_id: u64,
     approved: bool,
-}
-
-enum QueueProcessingOutcome {
-    Agent(agent::TurnVerdict),
-    StoredMessage,
-    UnsupportedRole(String),
 }
 
 pub async fn run(port: u16) -> Result<()> {
@@ -252,10 +245,10 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
     let mut approval_handler = WsApprovalHandler::new(tx.clone(), approval_rx);
 
     while let Some(content) = prompt_rx.recv().await {
-        let message_id = {
+        {
             let mut store = state.store.lock().await;
             match store.enqueue_message(&session_id, "user", &content, "ws") {
-                Ok(message_id) => message_id,
+                Ok(_) => {}
                 Err(error) => {
                     let _ = tx.send(WsFrame::Error {
                         data: format!("failed to enqueue websocket message: {error}"),
@@ -264,7 +257,7 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
                     continue;
                 }
             }
-        };
+        }
 
         let mut token_sink = WsTokenSink::new(tx.clone());
         let mut provider_factory = {
@@ -288,10 +281,32 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
             }
         };
 
-        match drain_session_queue(
-            &state,
+        let _worker_guard = state.worker_lock.lock().await;
+        let mut history = match session::Session::new(state.sessions_dir.join(&session_id))
+            .with_context(|| format!("failed to open session {session_id}"))
+        {
+            Ok(history) => history,
+            Err(error) => {
+                let _ = tx.send(WsFrame::Error {
+                    data: format!("error: {error}"),
+                });
+                let _ = tx.send(WsFrame::Done);
+                continue;
+            }
+        };
+        if let Err(error) = history.load_today() {
+            let _ = tx.send(WsFrame::Error {
+                data: format!("error: {error}"),
+            });
+            let _ = tx.send(WsFrame::Done);
+            continue;
+        }
+
+        let mut store = state.store.lock().await;
+        if let Err(error) = agent::drain_queue(
+            &mut store,
             &session_id,
-            Some(message_id),
+            &mut history,
             &turn,
             &mut provider_factory,
             &mut token_sink,
@@ -299,18 +314,9 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
         )
         .await
         {
-            Ok(Some(agent::TurnVerdict::Executed(tool_calls)))
-            | Ok(Some(agent::TurnVerdict::Approved { tool_calls })) => {
-                for tool_call in tool_calls {
-                    let _ = tx.send(WsFrame::ToolCall { data: tool_call });
-                }
-            }
-            Ok(Some(agent::TurnVerdict::Denied { .. })) | Ok(None) => {}
-            Err(error) => {
-                let _ = tx.send(WsFrame::Error {
-                    data: format!("error: {error}"),
-                });
-            }
+            let _ = tx.send(WsFrame::Error {
+                data: format!("error: {error}"),
+            });
         }
 
         let _ = tx.send(WsFrame::Done);
@@ -396,11 +402,25 @@ fn spawn_http_queue_worker(state: ServerState, session_id: String) {
         };
         let mut token_sink = NoopTokenSink;
         let mut approval_handler = RejectApprovalHandler;
-
-        if let Err(error) = drain_session_queue(
-            &state,
+        let _worker_guard = state.worker_lock.lock().await;
+        let mut history = match session::Session::new(state.sessions_dir.join(&session_id))
+            .with_context(|| format!("failed to open session {session_id}"))
+        {
+            Ok(history) => history,
+            Err(error) => {
+                eprintln!("failed to drain queued HTTP messages for {session_id}: {error}");
+                return;
+            }
+        };
+        if let Err(error) = history.load_today() {
+            eprintln!("failed to drain queued HTTP messages for {session_id}: {error}");
+            return;
+        }
+        let mut store = state.store.lock().await;
+        if let Err(error) = agent::drain_queue(
+            &mut store,
             &session_id,
-            None,
+            &mut history,
             &turn,
             &mut provider_factory,
             &mut token_sink,
@@ -411,138 +431,6 @@ fn spawn_http_queue_worker(state: ServerState, session_id: String) {
             eprintln!("failed to drain queued HTTP messages for {session_id}: {error}");
         }
     });
-}
-
-async fn drain_session_queue<F, Fut, P, TS, AH>(
-    state: &ServerState,
-    session_id: &str,
-    stop_after_message_id: Option<i64>,
-    turn: &turn::Turn,
-    provider_factory: &mut F,
-    live_token_sink: &mut TS,
-    live_approval_handler: &mut AH,
-) -> Result<Option<agent::TurnVerdict>>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<P>>,
-    P: llm::LlmProvider,
-    TS: agent::TokenSink + Send,
-    AH: agent::ApprovalHandler,
-{
-    let _worker_guard = state.worker_lock.lock().await;
-    let mut history = session::Session::new(state.sessions_dir.join(session_id))
-        .with_context(|| format!("failed to open session {session_id}"))?;
-    history.load_today()?;
-
-    loop {
-        let next_message = {
-            let mut store = state.store.lock().await;
-            store.dequeue_next_message(session_id)?
-        };
-        let Some(message) = next_message else {
-            return Ok(None);
-        };
-
-        let is_live_message = stop_after_message_id == Some(message.id);
-        let outcome = if is_live_message {
-            process_queued_message(
-                &message,
-                &mut history,
-                turn,
-                provider_factory,
-                live_token_sink,
-                live_approval_handler,
-            )
-            .await
-        } else {
-            let mut token_sink = NoopTokenSink;
-            let mut approval_handler = RejectApprovalHandler;
-            process_queued_message(
-                &message,
-                &mut history,
-                turn,
-                provider_factory,
-                &mut token_sink,
-                &mut approval_handler,
-            )
-            .await
-        };
-
-        let mut store = state.store.lock().await;
-        match outcome {
-            Ok(QueueProcessingOutcome::Agent(verdict)) => {
-                store.mark_processed(message.id)?;
-                if is_live_message {
-                    return Ok(Some(verdict));
-                }
-            }
-            Ok(QueueProcessingOutcome::StoredMessage) => {
-                store.mark_processed(message.id)?;
-                if is_live_message {
-                    return Ok(None);
-                }
-            }
-            Ok(QueueProcessingOutcome::UnsupportedRole(role)) => {
-                eprintln!("unsupported queued role '{role}' for message {}", message.id);
-                store.mark_failed(message.id)?;
-                if is_live_message {
-                    return Err(anyhow!("unsupported queued role '{role}'"));
-                }
-            }
-            Err(error) => {
-                store.mark_failed(message.id)?;
-                if is_live_message || stop_after_message_id.is_none() {
-                    return Err(error);
-                }
-                eprintln!("failed to process queued message {}: {error}", message.id);
-            }
-        }
-    }
-}
-
-async fn process_queued_message<F, Fut, P, TS, AH>(
-    message: &store::QueuedMessage,
-    session: &mut session::Session,
-    turn: &turn::Turn,
-    provider_factory: &mut F,
-    token_sink: &mut TS,
-    approval_handler: &mut AH,
-) -> Result<QueueProcessingOutcome>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<P>>,
-    P: llm::LlmProvider,
-    TS: agent::TokenSink + Send,
-    AH: agent::ApprovalHandler,
-{
-    match message.role.as_str() {
-        "user" => Ok(QueueProcessingOutcome::Agent(
-            agent::run_agent_loop(
-                provider_factory,
-                session,
-                message.content.clone(),
-                turn,
-                token_sink,
-                approval_handler,
-            )
-            .await?,
-        )),
-        "system" => {
-            session.append(llm::ChatMessage::system(message.content.clone()), None)?;
-            Ok(QueueProcessingOutcome::StoredMessage)
-        }
-        "assistant" => {
-            session.append(
-                llm::ChatMessage {
-                    role: llm::ChatRole::Assistant,
-                    content: vec![llm::MessageContent::text(message.content.clone())],
-                },
-                None,
-            )?;
-            Ok(QueueProcessingOutcome::StoredMessage)
-        }
-        other => Ok(QueueProcessingOutcome::UnsupportedRole(other.to_string())),
-    }
 }
 
 fn route_ws_client_message(
@@ -797,7 +685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_session_queue_marks_target_message_processed() {
+    async fn drain_queue_marks_target_message_processed() {
         let (state, queue_path) = test_state();
         let session_id = "ws-session";
         let message_id = {
@@ -822,11 +710,14 @@ mod tests {
         };
         let mut token_sink = |_token: String| {};
         let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+        let mut history = session::Session::new(state.sessions_dir.join(session_id)).unwrap();
+        history.load_today().unwrap();
+        let mut store = state.store.lock().await;
 
-        let verdict = drain_session_queue(
-            &state,
+        agent::drain_queue(
+            &mut store,
             session_id,
-            Some(message_id),
+            &mut history,
             &turn,
             &mut provider_factory,
             &mut token_sink,
@@ -835,7 +726,6 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(verdict, Some(agent::TurnVerdict::Executed(_))));
         let conn = rusqlite::Connection::open(queue_path).unwrap();
         let status: String = conn
             .query_row(
@@ -848,16 +738,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_session_queue_uses_supplied_approval_handler() {
+    async fn drain_queue_uses_supplied_approval_handler() {
         let (state, _queue_path) = test_state();
         let session_id = "approval-session";
-        let message_id = {
+        {
             let mut store = state.store.lock().await;
             store.create_session(session_id, None).unwrap();
             store
                 .enqueue_message(session_id, "user", "run risky command", "ws")
-                .unwrap()
-        };
+                .unwrap();
+        }
 
         struct NeedsApproval;
 
@@ -921,11 +811,14 @@ mod tests {
                 .expect("approval counter mutex poisoned") += 1;
             false
         };
+        let mut history = session::Session::new(state.sessions_dir.join(session_id)).unwrap();
+        history.load_today().unwrap();
+        let mut store = state.store.lock().await;
 
-        let verdict = drain_session_queue(
-            &state,
+        agent::drain_queue(
+            &mut store,
             session_id,
-            Some(message_id),
+            &mut history,
             &turn,
             &mut provider_factory,
             &mut token_sink,
@@ -934,7 +827,6 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(matches!(verdict, Some(agent::TurnVerdict::Executed(_))));
         assert_eq!(
             *approvals.lock().expect("approval counter mutex poisoned"),
             1

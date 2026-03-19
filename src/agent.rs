@@ -8,6 +8,7 @@ use serde_json::{from_str, Value};
 use crate::guard::{Severity, Verdict};
 use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall};
 use crate::session::Session;
+use crate::store::{QueuedMessage, Store};
 use crate::turn::Turn;
 use crate::util::utc_timestamp;
 
@@ -115,6 +116,12 @@ pub enum TurnVerdict {
     Approved { tool_calls: Vec<ToolCall> },
 }
 
+pub enum QueueOutcome {
+    Agent(TurnVerdict),
+    Stored,
+    UnsupportedRole(String),
+}
+
 fn command_from_tool_call(call: &ToolCall) -> Option<String> {
     let value = from_str::<Value>(&call.arguments).ok()?;
     value.get("command").and_then(Value::as_str).map(ToString::to_string)
@@ -163,8 +170,8 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<P>>,
     P: LlmProvider,
-    TS: TokenSink + Send,
-    AH: ApprovalHandler,
+    TS: TokenSink + Send + ?Sized,
+    AH: ApprovalHandler + ?Sized,
 {
     let user_prompt = format!("[{}] {}", utc_timestamp(), user_prompt);
     let tools = turn.tool_definitions();
@@ -324,14 +331,116 @@ where
     }
 }
 
+pub async fn process_message<F, Fut, P, TS, AH>(
+    message: &QueuedMessage,
+    session: &mut Session,
+    turn: &Turn,
+    make_provider: &mut F,
+    token_sink: &mut TS,
+    approval_handler: &mut AH,
+) -> Result<QueueOutcome>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<P>>,
+    P: LlmProvider,
+    TS: TokenSink + Send + ?Sized,
+    AH: ApprovalHandler + ?Sized,
+{
+    match message.role.as_str() {
+        "user" => Ok(QueueOutcome::Agent(
+            run_agent_loop(
+                make_provider,
+                session,
+                message.content.clone(),
+                turn,
+                token_sink,
+                approval_handler,
+            )
+            .await?,
+        )),
+        "system" => {
+            session.append(ChatMessage::system(message.content.clone()), None)?;
+            Ok(QueueOutcome::Stored)
+        }
+        "assistant" => {
+            session.append(
+                ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::text(message.content.clone())],
+                },
+                None,
+            )?;
+            Ok(QueueOutcome::Stored)
+        }
+        other => Ok(QueueOutcome::UnsupportedRole(other.to_string())),
+    }
+}
+
+pub async fn drain_queue<F, Fut, P>(
+    store: &mut Store,
+    session_id: &str,
+    session: &mut Session,
+    turn: &Turn,
+    make_provider: &mut F,
+    token_sink: &mut (dyn TokenSink + Send),
+    approval_handler: &mut (dyn ApprovalHandler + Send),
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<P>>,
+    P: LlmProvider,
+{
+    while let Some(message) = store.dequeue_next_message(session_id)? {
+        let outcome = process_message(
+            &message,
+            session,
+            turn,
+            make_provider,
+            token_sink,
+            approval_handler,
+        )
+        .await;
+
+        match outcome {
+            Ok(QueueOutcome::Agent(verdict)) => {
+                store.mark_processed(message.id)?;
+                match verdict {
+                    TurnVerdict::Executed(_) => {}
+                    TurnVerdict::Approved { .. } => {
+                        eprintln!("Command approved by user and executed.");
+                    }
+                    TurnVerdict::Denied { reason, gate_id } => {
+                        eprintln!("Command hard-denied by {gate_id}: {reason}");
+                    }
+                }
+            }
+            Ok(QueueOutcome::Stored) => {
+                store.mark_processed(message.id)?;
+            }
+            Ok(QueueOutcome::UnsupportedRole(role)) => {
+                eprintln!("unsupported queued role '{role}' for message {}", message.id);
+                store.mark_processed(message.id)?;
+            }
+            Err(error) => {
+                store.mark_failed(message.id)?;
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::context::History;
     use crate::guard::SecretRedactor;
     use crate::llm::{FunctionTool, StreamedTurn};
+    use crate::store::Store;
     use crate::tool::{Shell, Tool, ToolFuture};
     use crate::turn::Turn;
 
@@ -421,6 +530,36 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct StaticProvider {
+        turn: StreamedTurn,
+    }
+
+    impl crate::llm::LlmProvider for StaticProvider {
+        async fn stream_completion(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[FunctionTool],
+            _on_token: &mut (dyn FnMut(String) + Send),
+        ) -> Result<StreamedTurn> {
+            Ok(self.turn.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingProvider;
+
+    impl crate::llm::LlmProvider for FailingProvider {
+        async fn stream_completion(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[FunctionTool],
+            _on_token: &mut (dyn FnMut(String) + Send),
+        ) -> Result<StreamedTurn> {
+            Err(anyhow::anyhow!("provider failure"))
+        }
+    }
+
     struct LeakyTool;
 
     impl Tool for LeakyTool {
@@ -455,6 +594,154 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn temp_queue_root(prefix: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "aprs_agent_queue_test_{prefix}_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn message_text(message: &ChatMessage) -> Option<&str> {
+        message.content.iter().find_map(|block| match block {
+            MessageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn drain_queue_processes_user_system_and_unknown_roles() {
+        let root = temp_queue_root("mixed_roles");
+        let queue_path = root.join("queue.sqlite");
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "worker";
+        let mut store = Store::new(&queue_path).unwrap();
+        store.create_session(session_id, None).unwrap();
+        let user_id = store.enqueue_message(session_id, "user", "hello", "cli").unwrap();
+        let system_id = store
+            .enqueue_message(session_id, "system", "operational note", "cli")
+            .unwrap();
+        let unknown_id = store
+            .enqueue_message(session_id, "tool", "orphan tool result", "cli")
+            .unwrap();
+
+        let mut session = Session::new(&sessions_dir).unwrap();
+        let turn = Turn::new();
+        let provider_calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let provider_calls_seen = provider_calls.clone();
+        let mut provider_factory = move || {
+            let provider_calls_seen = provider_calls_seen.clone();
+            async move {
+                *provider_calls_seen
+                    .lock()
+                    .expect("provider call counter mutex poisoned") += 1;
+                Ok::<_, anyhow::Error>(StaticProvider {
+                    turn: StreamedTurn {
+                        assistant_message: ChatMessage {
+                            role: crate::llm::ChatRole::Assistant,
+                            content: vec![MessageContent::text("ok")],
+                        },
+                        tool_calls: vec![],
+                        meta: None,
+                        stop_reason: StopReason::Stop,
+                    },
+                })
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        drain_queue(
+            &mut store,
+            session_id,
+            &mut session,
+            &turn,
+            &mut provider_factory,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *provider_calls.lock().expect("provider call counter mutex poisoned"),
+            1
+        );
+        assert!(session.history().iter().any(|message| {
+            matches!(message.role, crate::llm::ChatRole::System)
+                && message_text(message) == Some("operational note")
+        }));
+        assert!(!session.history().iter().any(|message| {
+            message_text(message) == Some("orphan tool result")
+        }));
+
+        let conn = Connection::open(&queue_path).unwrap();
+        for message_id in [user_id, system_id, unknown_id] {
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM messages WHERE id = ?1",
+                    [message_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "processed");
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_queue_marks_failed_when_agent_loop_errors() {
+        let root = temp_queue_root("failed_marking");
+        let queue_path = root.join("queue.sqlite");
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "worker";
+        let mut store = Store::new(&queue_path).unwrap();
+        store.create_session(session_id, None).unwrap();
+        let message_id = store
+            .enqueue_message(session_id, "user", "run something", "cli")
+            .unwrap();
+
+        let mut session = Session::new(&sessions_dir).unwrap();
+        let turn = Turn::new();
+        let mut provider_factory = || async { Ok::<_, anyhow::Error>(FailingProvider) };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        let result = drain_queue(
+            &mut store,
+            session_id,
+            &mut session,
+            &turn,
+            &mut provider_factory,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await;
+
+        assert!(result.is_err());
+
+        let conn = Connection::open(&queue_path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM messages WHERE id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]
