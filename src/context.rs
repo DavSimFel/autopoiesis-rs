@@ -72,10 +72,8 @@ impl ContextSource for Identity {
             return;
         }
 
-        let needs_edit = match &first.content[..] {
-            [MessageContent::Text { text }] if text == &rendered => false,
-            _ => true,
-        };
+        let needs_edit =
+            !matches!(&first.content[..], [MessageContent::Text { text }] if text == &rendered);
 
         if needs_edit {
             first.content.clear();

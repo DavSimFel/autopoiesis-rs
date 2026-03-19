@@ -290,7 +290,7 @@ impl Session {
     /// Get the path for today's JSONL file.
     pub fn today_path(&self) -> PathBuf {
         self.sessions_dir
-            .join(format!("{}.jsonl", utc_timestamp()[..10].to_string()))
+            .join(format!("{}.jsonl", &utc_timestamp()[..10]))
     }
 
     fn trim_anchor_index(&self) -> Option<usize> {

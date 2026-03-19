@@ -219,7 +219,7 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
                 Err(error) => format!(r#"{{"op":"error","data":"{error}"}}"#),
             };
 
-            if sender.send(Message::Text(payload.into())).await.is_err() {
+            if sender.send(Message::Text(payload)).await.is_err() {
                 break;
             }
         }

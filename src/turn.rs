@@ -76,6 +76,12 @@ impl Turn {
     }
 }
 
+impl Default for Turn {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn resolve_verdict(guards: &[Box<dyn Guard>], mut event: GuardEvent, modified: bool) -> Verdict {
     let mut approved: Option<(String, String, Severity)> = None;
     let mut verdict = if modified { Verdict::Modify } else { Verdict::Allow };
@@ -115,9 +121,9 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|path| path.to_str().map(ToString::to_string))
-        .unwrap_or_else(String::new);
+        .unwrap_or_default();
     let tool = crate::tool::Shell::new();
-    let tools = vec![tool.definition()];
+    let tools = [tool.definition()];
     let tools_list = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join(",");
 
     let mut vars = HashMap::new();

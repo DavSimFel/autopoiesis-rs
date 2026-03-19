@@ -54,6 +54,12 @@ impl CliTokenSink {
     }
 }
 
+impl Default for CliTokenSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TokenSink for CliTokenSink {
     fn on_token(&mut self, token: String) {
         print!("{token}");
@@ -73,6 +79,12 @@ pub struct CliApprovalHandler;
 impl CliApprovalHandler {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for CliApprovalHandler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

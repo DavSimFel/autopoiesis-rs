@@ -184,14 +184,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_db_path(prefix: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
+        std::env::temp_dir().join(format!(
             "autopoiesis_store_test_{prefix}_{}.db",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos()
-        ));
-        path
+        ))
     }
 
     #[test]
