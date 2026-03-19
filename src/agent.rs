@@ -184,8 +184,9 @@ fn cap_tool_output(
 
     let line_count = output.lines().count();
     let size_kb = output.len().div_ceil(1024);
+    let path_display = result_path.display();
     Ok(format!(
-        "[output exceeded inline limit ({line_count} lines, {size_kb} KB) -> results/{call_id}.txt]\nTo read: cat results/{call_id}.txt\nTo read specific lines: sed -n '10,20p' results/{call_id}.txt"
+        "[output exceeded inline limit ({line_count} lines, {size_kb} KB) -> {path_display}]\nTo read: cat {path_display}\nTo read specific lines: sed -n '10,20p' {path_display}"
     ))
 }
 
@@ -1231,9 +1232,11 @@ mod tests {
             .expect("tool result should be persisted");
         let tool_result = tool_result_text(tool_message).expect("tool result text should exist");
         assert!(!tool_result.contains(&output));
-        assert!(tool_result.contains("[output exceeded inline limit (2048 lines, 10 KB) -> results/call-capped.txt]"));
-        assert!(tool_result.contains("To read: cat results/call-capped.txt"));
-        assert!(tool_result.contains("To read specific lines: sed -n '10,20p' results/call-capped.txt"));
+        let expected_path = dir.join("results").join(format!("{call_id}.txt"));
+        let expected_path_str = expected_path.display().to_string();
+        assert!(tool_result.contains(&format!("[output exceeded inline limit (2048 lines, 10 KB) -> {expected_path_str}]")));
+        assert!(tool_result.contains(&format!("To read: cat {expected_path_str}")));
+        assert!(tool_result.contains(&format!("To read specific lines: sed -n '10,20p' {expected_path_str}")));
 
         let result_path = dir.join("results").join(format!("{call_id}.txt"));
         assert!(result_path.exists(), "result file should be created");
