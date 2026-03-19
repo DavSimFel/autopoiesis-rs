@@ -8,7 +8,7 @@ A lightweight agent runtime in Rust. One binary, one tool (shell), messages in, 
 - **HTTP + WebSocket server** — queue-driven sessions with streaming token output
 - **Shell as the universal tool** — file I/O, web requests, process management, self-configuration — all through `sh -lc`
 - **Guard pipeline** — secret redaction, shell safety checks, exfiltration detection. Deny > approve > allow semantics
-- **RLIMIT sandbox** — child processes run with NPROC, FSIZE, and CPU limits
+- **RLIMIT resource caps** — child processes run with NPROC, FSIZE, and CPU limits; this is not filesystem or network isolation
 - **Session persistence** — daily JSONL files with full tool call round-trip
 - **SQLite message queue** — ordered, persistent, crash-recoverable inbox per session
 - **Identity system** — constitution, personality, and context assembled from markdown files with template variables
@@ -72,7 +72,7 @@ main.rs          CLI entrypoint, REPL, server launch
 ├─ agent.rs      Agent loop: turn orchestration, tool execution, approval flow
 ├─ turn.rs       Context assembly + guard checks + tool dispatch
 ├─ context.rs    ContextSource trait: Identity (prompt files) + History (token-budgeted replay)
-├─ tool.rs       Shell tool: async execution, RLIMIT sandbox, process-group timeout kill
+├─ tool.rs       Shell tool: async execution, RLIMIT caps, process-group timeout kill
 ├─ guard.rs      Guard pipeline: SecretRedactor, ShellSafety, ExfilDetector
 ├─ session.rs    JSONL persistence, token tracking, context trimming
 ├─ store.rs      SQLite session registry + message queue

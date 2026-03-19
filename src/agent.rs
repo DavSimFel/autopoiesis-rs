@@ -119,6 +119,25 @@ fn append_hard_deny(session: &mut Session, by: &str, reason: &str) -> Result<()>
     session.append(ChatMessage::system(format!("Tool execution hard-denied by {by}: {reason}")), None)
 }
 
+fn guard_text_output(turn: &Turn, text: String) -> String {
+    let mut text = text;
+    match turn.check_text_delta(&mut text) {
+        Verdict::Deny { .. } => String::new(),
+        Verdict::Allow | Verdict::Modify | Verdict::Approve { .. } => text,
+    }
+}
+
+fn guard_message_output(turn: &Turn, message: &mut ChatMessage) {
+    for block in &mut message.content {
+        if let MessageContent::Text { text } = block {
+            *text = guard_text_output(turn, std::mem::take(text));
+        }
+    }
+    message
+        .content
+        .retain(|block| !matches!(block, MessageContent::Text { text } if text.is_empty()));
+}
+
 /// Run the agent loop until the model emits a non-tool stop reason.
 pub async fn run_agent_loop<F, Fut, P, TS, AH>(
     make_provider: &mut F,
@@ -201,9 +220,17 @@ where
         }
 
         let provider = make_provider().await?;
-        let turn_reply = provider
-            .stream_completion(&messages, &tools, &mut |token| token_sink.on_token(token))
+        let mut streamed_output = String::new();
+        let mut turn_reply = provider
+            .stream_completion(&messages, &tools, &mut |token| streamed_output.push_str(&token))
             .await?;
+        if !streamed_output.is_empty() {
+            let redacted_output = guard_text_output(turn, streamed_output);
+            if !redacted_output.is_empty() {
+                token_sink.on_token(redacted_output);
+            }
+        }
+        guard_message_output(turn, &mut turn_reply.assistant_message);
         let turn_meta = turn_reply.meta;
 
         match turn_reply.stop_reason {
@@ -265,6 +292,7 @@ where
                         Ok(output) => output,
                         Err(err) => format!(r#"{{"error": "{err}"}}"#),
                     };
+                    let result = guard_text_output(turn, result);
 
                     session.append(ChatMessage::tool_result(&call.id, &call.name, result), None)?;
                     executed.push(call.clone());
@@ -291,7 +319,7 @@ mod tests {
     use crate::context::History;
     use crate::guard::SecretRedactor;
     use crate::llm::{FunctionTool, StreamedTurn};
-    use crate::tool::Shell;
+    use crate::tool::{Shell, Tool, ToolFuture};
     use crate::turn::Turn;
 
     #[derive(Clone)]
@@ -329,6 +357,78 @@ mod tests {
                 meta: None,
                 stop_reason: StopReason::Stop,
             })
+        }
+    }
+
+    #[derive(Clone)]
+    struct StreamingProvider {
+        streamed_tokens: Vec<String>,
+        turn: StreamedTurn,
+    }
+
+    impl crate::llm::LlmProvider for StreamingProvider {
+        async fn stream_completion(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[FunctionTool],
+            on_token: &mut (dyn FnMut(String) + Send),
+        ) -> Result<StreamedTurn> {
+            for token in &self.streamed_tokens {
+                on_token(token.clone());
+            }
+            Ok(self.turn.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SequenceProvider {
+        turns: std::sync::Arc<std::sync::Mutex<Vec<StreamedTurn>>>,
+    }
+
+    impl SequenceProvider {
+        fn new(turns: Vec<StreamedTurn>) -> Self {
+            Self {
+                turns: std::sync::Arc::new(std::sync::Mutex::new(turns.into_iter().rev().collect())),
+            }
+        }
+    }
+
+    impl crate::llm::LlmProvider for SequenceProvider {
+        async fn stream_completion(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[FunctionTool],
+            _on_token: &mut (dyn FnMut(String) + Send),
+        ) -> Result<StreamedTurn> {
+            self.turns
+                .lock()
+                .expect("sequence provider mutex poisoned")
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("no more turns"))
+        }
+    }
+
+    struct LeakyTool;
+
+    impl Tool for LeakyTool {
+        fn name(&self) -> &str {
+            "leak"
+        }
+
+        fn definition(&self) -> FunctionTool {
+            FunctionTool {
+                name: "leak".to_string(),
+                description: "Return a secret".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+            }
+        }
+
+        fn execute(&self, _arguments: &str) -> ToolFuture<'_> {
+            Box::pin(async { Ok("stdout:\nsk-proj-abcdefghijklmnopqrstuvwxyz012345".to_string()) })
         }
     }
 
@@ -412,6 +512,121 @@ mod tests {
             &mut make_provider,
             &mut session,
             "please store sk-proj-abcdefghijklmnopqrstuvwxyz012345".to_string(),
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        let session_file = std::fs::read_to_string(session.today_path()).unwrap();
+        assert!(!session_file.contains("sk-proj-abcdefghijklmnopqrstuvwxyz012345"));
+        assert!(session_file.contains("[REDACTED]"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbound_redaction_is_streamed_and_persisted_before_session_write() {
+        let dir = temp_sessions_dir("outbound_redaction");
+        let provider = StreamingProvider {
+            streamed_tokens: vec!["sk-proj-abcdefghijklmnopqrstuvwxyz012345".to_string()],
+            turn: StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::text(
+                        "sk-proj-abcdefghijklmnopqrstuvwxyz012345",
+                    )],
+                },
+                tool_calls: vec![],
+                meta: None,
+                stop_reason: StopReason::Stop,
+            },
+        };
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let turn = Turn::new().guard(SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"]));
+        let mut make_provider = move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        };
+        let streamed = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let streamed_tokens = streamed.clone();
+        let mut token_sink = move |token: String| {
+            streamed_tokens
+                .lock()
+                .expect("streamed token mutex poisoned")
+                .push_str(&token);
+        };
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "reply with the secret".to_string(),
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        let streamed = streamed.lock().expect("streamed token mutex poisoned");
+        assert_eq!(streamed.as_str(), "[REDACTED]");
+        let session_file = std::fs::read_to_string(session.today_path()).unwrap();
+        assert!(!session_file.contains("sk-proj-abcdefghijklmnopqrstuvwxyz012345"));
+        assert!(session_file.contains("[REDACTED]"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_output_is_redacted_before_persist() {
+        let dir = temp_sessions_dir("tool_redaction");
+        let provider = SequenceProvider::new(vec![
+            StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::ToolCall {
+                        call: ToolCall {
+                            id: "call-1".to_string(),
+                            name: "leak".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    }],
+                },
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "leak".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                meta: None,
+                stop_reason: StopReason::ToolCalls,
+            },
+            StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::text("done")],
+                },
+                tool_calls: vec![],
+                meta: None,
+                stop_reason: StopReason::Stop,
+            },
+        ]);
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let turn = Turn::new()
+            .tool(LeakyTool)
+            .guard(SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"]));
+        let mut make_provider = move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "use the tool".to_string(),
             &turn,
             &mut token_sink,
             &mut approval_handler,

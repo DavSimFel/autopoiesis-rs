@@ -62,6 +62,10 @@ impl Turn {
         resolve_verdict(&self.guards, GuardEvent::ToolBatch(calls), false)
     }
 
+    pub fn check_text_delta(&self, text: &mut String) -> Verdict {
+        resolve_verdict(&self.guards, GuardEvent::TextDelta(text), false)
+    }
+
     pub async fn execute_tool(&self, name: &str, arguments: &str) -> Result<String> {
         let tool = self
             .tools

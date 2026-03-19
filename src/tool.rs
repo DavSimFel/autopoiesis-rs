@@ -1,3 +1,10 @@
+//! Shell tool execution with timeout and RLIMIT resource caps.
+//!
+//! RLIMITs are not a security sandbox: commands still run with the current user's
+//! filesystem, network, and process privileges.
+//! TODO: replace RLIMIT-only containment with real sandboxing (uid drop, filesystem
+//! isolation, network isolation, seccomp, or equivalent).
+
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -39,6 +46,21 @@ fn set_resource_limits() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
+    let rc = unsafe { libc::killpg(pid as libc::pid_t, signal) };
+    if rc == 0 {
+        return Ok(());
+    }
+
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
 
 pub trait Tool: Send + Sync {
@@ -60,6 +82,7 @@ impl Shell {
 }
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
+const TERMINATION_GRACE_MS: u64 = 250;
 
 impl Default for Shell {
     fn default() -> Self {
@@ -103,6 +126,9 @@ impl Tool for Shell {
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
                 .context("tool call requires a non-empty 'command' argument")?;
+            if command.trim().is_empty() {
+                return Err(anyhow!("tool call requires a non-empty 'command' argument"));
+            }
             let timeout_ms = args
                 .get("timeout_ms")
                 .and_then(Value::as_u64)
@@ -139,22 +165,19 @@ impl Shell {
             return Ok(());
         }
 
+        #[cfg(unix)]
         if let Some(pid) = pid {
-            // Kill the entire process group (child + all descendants)
-            #[cfg(unix)]
-            unsafe {
-                // Try SIGTERM on the process group first
-                libc::killpg(pid as libc::pid_t, libc::SIGTERM);
-            }
-
-            if let Err(_) = child.kill().await {
-                // SAFETY: final fallback — SIGKILL the entire process group
-                #[cfg(unix)]
-                unsafe {
-                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+            let _ = signal_process_group(pid, libc::SIGTERM);
+            match timeout(Duration::from_millis(TERMINATION_GRACE_MS), child.wait()).await {
+                Ok(_) => return Ok(()),
+                Err(_) => {
+                    let _ = signal_process_group(pid, libc::SIGKILL);
                 }
             }
         }
+
+        #[cfg(not(unix))]
+        child.kill().await.context("failed to kill timed-out child process")?;
 
         let _ = child.wait().await;
         Ok(())
@@ -227,6 +250,7 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn shell_tool_definition_has_execute_name() {
@@ -248,5 +272,47 @@ mod tests {
             .and_then(|value| value.get("type"))
             .expect("command property should define type");
         assert_eq!(command_type, "string");
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_empty_commands() {
+        let tool = Shell::new();
+        let error = tool
+            .execute("{\"command\":\"   \"}")
+            .await
+            .expect_err("empty command should fail");
+        assert!(error.to_string().contains("non-empty 'command' argument"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_sigkills_entire_process_group_after_grace_period() {
+        let marker = std::env::temp_dir().join(format!(
+            "autopoiesis_timeout_marker_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let command = format!(
+            "trap '' TERM; (sleep 1; echo survived > {}) & wait",
+            marker.display()
+        );
+
+        let start = Instant::now();
+        let error = Shell::run_with_timeout(&command, 100)
+            .await
+            .expect_err("command should time out");
+        assert!(error.to_string().contains("timed out"));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "timeout cleanup should not hang waiting on descendants"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !marker.exists(),
+            "descendant process should not survive long enough to write marker"
+        );
     }
 }
