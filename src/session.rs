@@ -258,6 +258,11 @@ impl Session {
         &self.messages
     }
 
+    /// Get the root sessions directory for this session.
+    pub fn sessions_dir(&self) -> &Path {
+        &self.sessions_dir
+    }
+
     /// Load persisted session history from disk, replaying all dated JSONL files in order.
     pub fn load_today(&mut self) -> Result<()> {
         self.messages.clear();
@@ -512,6 +517,16 @@ mod tests {
         assert_eq!(filename.len(), 16); // 2026-03-14.jsonl
         assert_eq!(&filename[4..5], "-");
         assert_eq!(&filename[7..8], "-");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sessions_dir_getter_returns_correct_path() {
+        let dir = temp_sessions_dir("sessions_dir_getter");
+        let session = Session::new(&dir).unwrap();
+
+        assert_eq!(session.sessions_dir(), dir.as_path());
 
         fs::remove_dir_all(&dir).unwrap();
     }
