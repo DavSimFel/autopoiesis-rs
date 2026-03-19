@@ -1,4 +1,4 @@
-use serde_json::{from_str, Value};
+use serde_json::{Value, from_str};
 
 use crate::llm::{ChatMessage, ToolCall};
 
@@ -141,8 +141,7 @@ impl ShellSafety {
     pub fn new() -> Self {
         Self {
             id: "shell-heuristic".to_string(),
-            split_re: regex::Regex::new(r"\s*(\|\||&&|;|\|)\s*")
-                .expect("valid split regex"),
+            split_re: regex::Regex::new(r"\s*(\|\||&&|;|\|)\s*").expect("valid split regex"),
             fork_bomb_re: regex::Regex::new(r":\(\)\s*\{\s*:\|:&\s*;\s*:\}")
                 .expect("valid fork bomb regex"),
         }
@@ -150,7 +149,10 @@ impl ShellSafety {
 
     fn command_from_args(&self, call: &ToolCall) -> Option<String> {
         let value = from_str::<Value>(&call.arguments).ok()?;
-        value.get("command").and_then(Value::as_str).map(ToString::to_string)
+        value
+            .get("command")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
     }
 
     fn is_root_recursive_rm(binary: &str, args: &[&str]) -> bool {
@@ -203,7 +205,10 @@ impl ShellSafety {
             "rm" => Some(("rm usage requires approval".to_string(), Severity::Low)),
             "apt" | "yum" => {
                 if args.iter().any(|arg| *arg == "install" || *arg == "remove") {
-                    Some((format!("{binary} install/remove requires approval"), Severity::Low))
+                    Some((
+                        format!("{binary} install/remove requires approval"),
+                        Severity::Low,
+                    ))
                 } else {
                     None
                 }
@@ -230,11 +235,7 @@ impl ShellSafety {
         }
 
         let binary = tokens.remove(0).to_lowercase();
-        let binary = binary
-            .rsplit('/')
-            .next()
-            .unwrap_or(&binary)
-            .to_lowercase();
+        let binary = binary.rsplit('/').next().unwrap_or(&binary).to_lowercase();
         let args: Vec<&str> = tokens.iter().map(|token| token.as_str()).collect();
 
         if self.fork_bomb_re.is_match(&args.join(" ")) {
@@ -277,7 +278,7 @@ impl Guard for ShellSafety {
                             reason: "unable to parse shell command arguments".to_string(),
                             gate_id: self.id.clone(),
                             severity: Severity::Medium,
-                        }
+                        };
                     }
                 };
 
@@ -314,7 +315,10 @@ impl Guard for ShellSafety {
                             severity,
                             gate_id: _,
                         } => {
-                            if most_restrictive.as_ref().is_none_or(|(_, current)| severity > *current) {
+                            if most_restrictive
+                                .as_ref()
+                                .is_none_or(|(_, current)| severity > *current)
+                            {
                                 most_restrictive = Some((reason, severity));
                             }
                         }
@@ -350,7 +354,10 @@ impl ExfilDetector {
 
     fn command_from_args(&self, call: &ToolCall) -> Option<String> {
         let value = from_str::<Value>(&call.arguments).ok()?;
-        value.get("command").and_then(Value::as_str).map(ToString::to_string)
+        value
+            .get("command")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
     }
 
     fn has_sensitive_read(command: &str) -> bool {
@@ -533,8 +540,14 @@ mod tests {
         let mut inbound_event = GuardEvent::Inbound(&mut inbound);
         let mut outbound_event = GuardEvent::Inbound(&mut outbound);
 
-        assert!(matches!(inbound_gate.check(&mut inbound_event), Verdict::Modify));
-        assert!(matches!(outbound_gate.check(&mut outbound_event), Verdict::Modify));
+        assert!(matches!(
+            inbound_gate.check(&mut inbound_event),
+            Verdict::Modify
+        ));
+        assert!(matches!(
+            outbound_gate.check(&mut outbound_event),
+            Verdict::Modify
+        ));
     }
 
     #[test]
@@ -846,7 +859,10 @@ mod tests {
             let result = gate.check(&mut event);
             match expected {
                 "deny" => {
-                    assert!(matches!(result, Verdict::Deny { .. }), "should deny: {command}")
+                    assert!(
+                        matches!(result, Verdict::Deny { .. }),
+                        "should deny: {command}"
+                    )
                 }
                 "allow" => {
                     assert!(matches!(result, Verdict::Allow), "should allow: {command}")
@@ -878,5 +894,4 @@ mod tests {
             _ => "<unsupported>",
         }
     }
-
 }

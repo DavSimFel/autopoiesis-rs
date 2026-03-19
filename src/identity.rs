@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use crate::template::render_template;
 
@@ -79,8 +79,11 @@ mod tests {
             .write_all(b"C")
             .expect("failed to write context");
 
-        let prompt = load_system_prompt(dir.path().to_str().expect("temp path should be utf8"), &HashMap::new())
-            .expect("expected prompt load to succeed");
+        let prompt = load_system_prompt(
+            dir.path().to_str().expect("temp path should be utf8"),
+            &HashMap::new(),
+        )
+        .expect("expected prompt load to succeed");
         assert_eq!(prompt, "A\n\nB\n\nC");
     }
 
@@ -105,8 +108,11 @@ mod tests {
         vars.insert("name".to_string(), "Ada".to_string());
         vars.insert("cwd".to_string(), "/tmp".to_string());
 
-        let prompt = load_system_prompt(dir.path().to_str().expect("temp path should be utf8"), &vars)
-            .expect("expected prompt load to succeed");
+        let prompt = load_system_prompt(
+            dir.path().to_str().expect("temp path should be utf8"),
+            &vars,
+        )
+        .expect("expected prompt load to succeed");
         assert_eq!(prompt, "name: Ada\n\ncwd: /tmp\n\ndone");
     }
 
@@ -114,8 +120,7 @@ mod tests {
     fn empty_constitution_file_is_kept_as_empty_section() {
         let dir = temp_identity_dir("empty_constitution");
 
-        File::create(dir.path().join("constitution.md"))
-            .expect("failed to create constitution");
+        File::create(dir.path().join("constitution.md")).expect("failed to create constitution");
         File::create(dir.path().join("identity.md"))
             .expect("failed to create identity")
             .write_all(b"identity")
@@ -125,8 +130,11 @@ mod tests {
             .write_all(b"context")
             .expect("failed to write context");
 
-        let prompt = load_system_prompt(dir.path().to_str().expect("temp path should be utf8"), &HashMap::new())
-            .expect("expected prompt load to succeed");
+        let prompt = load_system_prompt(
+            dir.path().to_str().expect("temp path should be utf8"),
+            &HashMap::new(),
+        )
+        .expect("expected prompt load to succeed");
         assert_eq!(prompt, "\n\nidentity\n\ncontext");
     }
 
@@ -148,7 +156,10 @@ mod tests {
             .write_all(b"context")
             .expect("failed to write context");
 
-        let result = load_system_prompt(dir.path().to_str().expect("temp path should be utf8"), &HashMap::new());
+        let result = load_system_prompt(
+            dir.path().to_str().expect("temp path should be utf8"),
+            &HashMap::new(),
+        );
         assert!(result.is_err());
     }
 }

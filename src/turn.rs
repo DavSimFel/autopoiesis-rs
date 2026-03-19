@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 
 use crate::context::ContextSource;
@@ -84,7 +84,11 @@ impl Default for Turn {
 
 fn resolve_verdict(guards: &[Box<dyn Guard>], mut event: GuardEvent, modified: bool) -> Verdict {
     let mut approved: Option<(String, String, Severity)> = None;
-    let mut verdict = if modified { Verdict::Modify } else { Verdict::Allow };
+    let mut verdict = if modified {
+        Verdict::Modify
+    } else {
+        Verdict::Allow
+    };
 
     for guard in guards {
         match guard.check(&mut event) {
@@ -98,7 +102,10 @@ fn resolve_verdict(guards: &[Box<dyn Guard>], mut event: GuardEvent, modified: b
                 gate_id,
                 severity,
             } => {
-                if approved.as_ref().is_none_or(|(_, _, current)| severity > *current) {
+                if approved
+                    .as_ref()
+                    .is_none_or(|(_, _, current)| severity > *current)
+                {
                     approved = Some((reason, gate_id, severity));
                 }
             }
@@ -124,7 +131,11 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
         .unwrap_or_default();
     let tool = crate::tool::Shell::new();
     let tools = [tool.definition()];
-    let tools_list = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join(",");
+    let tools_list = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
 
     let mut vars = HashMap::new();
     vars.insert("model".to_string(), config.model.clone());
@@ -159,11 +170,7 @@ mod tests {
     }
 
     impl RecordingGuard {
-        fn new(
-            id: &'static str,
-            result: GuardResult,
-            hits: Arc<Mutex<Vec<&'static str>>>,
-        ) -> Self {
+        fn new(id: &'static str, result: GuardResult, hits: Arc<Mutex<Vec<&'static str>>>) -> Self {
             Self { id, result, hits }
         }
     }
@@ -313,11 +320,7 @@ mod tests {
         ]);
 
         let turn = Turn::new()
-            .context(Identity::new(
-                "/tmp",
-                identity_vars.clone(),
-                "fallback",
-            ))
+            .context(Identity::new("/tmp", identity_vars.clone(), "fallback"))
             .context(history)
             .guard(SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"]));
 
@@ -325,7 +328,11 @@ mod tests {
         messages.clear();
         let result = turn.check_inbound(&mut messages);
         assert!(matches!(result, GuardResult::Modify));
-        assert!(messages.iter().any(|message| message.role == crate::llm::ChatRole::System));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.role == crate::llm::ChatRole::System)
+        );
     }
 
     fn make_tool_call(cmd: &str) -> ToolCall {

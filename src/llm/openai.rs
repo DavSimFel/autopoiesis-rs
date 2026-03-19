@@ -6,10 +6,10 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use reqwest::Client;
 // serde is used by tests and by request/response payload assembly.
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::llm::{
-    ChatMessage, ChatRole, FunctionTool, LlmProvider, MessageContent, StreamedTurn, StopReason,
+    ChatMessage, ChatRole, FunctionTool, LlmProvider, MessageContent, StopReason, StreamedTurn,
     ToolCall, TurnMeta,
 };
 
@@ -191,11 +191,10 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
     let event_type = event.get("type").and_then(|value| value.as_str())?;
 
     match event_type {
-        "response.output_text.delta" => {
-            event.get("delta").and_then(Value::as_str).map(|delta| {
-                SseEvent::TextDelta(delta.to_string())
-            })
-        }
+        "response.output_text.delta" => event
+            .get("delta")
+            .and_then(Value::as_str)
+            .map(|delta| SseEvent::TextDelta(delta.to_string())),
         "response.function_call_arguments.delta" => Some(SseEvent::FunctionCallArgumentsDelta {
             call_id: event
                 .get("call_id")
@@ -251,9 +250,14 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
             let usage = response.get("usage").or_else(|| event.get("usage"));
 
             let meta = TurnMeta {
-                model: response.get("model").and_then(Value::as_str).map(ToString::to_string),
-                input_tokens: usage.and_then(|usage| usage.get("input_tokens").and_then(Value::as_u64)),
-                output_tokens: usage.and_then(|usage| usage.get("output_tokens").and_then(Value::as_u64)),
+                model: response
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                input_tokens: usage
+                    .and_then(|usage| usage.get("input_tokens").and_then(Value::as_u64)),
+                output_tokens: usage
+                    .and_then(|usage| usage.get("output_tokens").and_then(Value::as_u64)),
                 reasoning_tokens: usage
                     .and_then(|usage| usage.get("reasoning_tokens").and_then(Value::as_u64)),
                 reasoning_trace: None,
@@ -278,7 +282,9 @@ fn upsert_tool_call(
     name: String,
     arguments: String,
 ) {
-    if let Some((_, existing_name, existing_args)) = tool_calls.iter_mut().find(|(id, _, _)| id == &call_id) {
+    if let Some((_, existing_name, existing_args)) =
+        tool_calls.iter_mut().find(|(id, _, _)| id == &call_id)
+    {
         *existing_name = name;
         *existing_args = arguments;
     } else {
@@ -412,7 +418,11 @@ impl LlmProvider for OpenAIProvider {
                         assistant_content.push_str(&delta);
                         on_token(delta);
                     }
-                    Some(SseEvent::FunctionCallArgumentsDelta { call_id, name, delta }) => {
+                    Some(SseEvent::FunctionCallArgumentsDelta {
+                        call_id,
+                        name,
+                        delta,
+                    }) => {
                         let call_id = match call_id {
                             Some(id) => {
                                 current_call_id = Some(id.clone());
@@ -424,7 +434,9 @@ impl LlmProvider for OpenAIProvider {
                             },
                         };
 
-                        let entry = pending_calls.entry(call_id).or_insert((None, String::new()));
+                        let entry = pending_calls
+                            .entry(call_id)
+                            .or_insert((None, String::new()));
                         if let Some(tool_name) = name {
                             entry.0 = Some(tool_name);
                         }
@@ -433,7 +445,11 @@ impl LlmProvider for OpenAIProvider {
                             entry.1.push_str(&delta);
                         }
                     }
-                    Some(SseEvent::FunctionCallArgumentsDone { call_id, name, arguments }) => {
+                    Some(SseEvent::FunctionCallArgumentsDone {
+                        call_id,
+                        name,
+                        arguments,
+                    }) => {
                         let previous_len = tool_calls.len();
                         finalize_function_call(
                             &mut pending_calls,
@@ -447,7 +463,11 @@ impl LlmProvider for OpenAIProvider {
                             stop_reason = StopReason::ToolCalls;
                         }
                     }
-                    Some(SseEvent::FunctionCallOutputItemDone { call_id, name, arguments }) => {
+                    Some(SseEvent::FunctionCallOutputItemDone {
+                        call_id,
+                        name,
+                        arguments,
+                    }) => {
                         let previous_len = tool_calls.len();
                         finalize_output_item(
                             &mut pending_calls,
@@ -514,7 +534,9 @@ impl LlmProvider for OpenAIProvider {
             });
         }
         for tc in &tool_calls {
-            assistant_msg.content.push(MessageContent::ToolCall { call: tc.clone() });
+            assistant_msg
+                .content
+                .push(MessageContent::ToolCall { call: tc.clone() });
         }
 
         Ok(StreamedTurn {
@@ -569,7 +591,11 @@ mod tests {
 
         for event in events {
             match event {
-                SseEvent::FunctionCallArgumentsDelta { call_id, name, delta } => {
+                SseEvent::FunctionCallArgumentsDelta {
+                    call_id,
+                    name,
+                    delta,
+                } => {
                     let call_id = match call_id {
                         Some(id) => {
                             current_call_id = Some(id.clone());
@@ -581,7 +607,9 @@ mod tests {
                         },
                     };
 
-                    let entry = pending_calls.entry(call_id).or_insert((None, String::new()));
+                    let entry = pending_calls
+                        .entry(call_id)
+                        .or_insert((None, String::new()));
                     if let Some(tool_name) = name {
                         entry.0 = Some(tool_name);
                     }
@@ -590,7 +618,11 @@ mod tests {
                         entry.1.push_str(&delta);
                     }
                 }
-                SseEvent::FunctionCallArgumentsDone { call_id, name, arguments } => {
+                SseEvent::FunctionCallArgumentsDone {
+                    call_id,
+                    name,
+                    arguments,
+                } => {
                     finalize_function_call(
                         &mut pending_calls,
                         &mut tool_calls,
@@ -600,7 +632,11 @@ mod tests {
                         arguments,
                     );
                 }
-                SseEvent::FunctionCallOutputItemDone { call_id, name, arguments } => {
+                SseEvent::FunctionCallOutputItemDone {
+                    call_id,
+                    name,
+                    arguments,
+                } => {
                     finalize_output_item(
                         &mut pending_calls,
                         &mut tool_calls,
@@ -810,7 +846,10 @@ mod tests {
         ];
         let (instructions, input) = OpenAIProvider::build_input(&messages);
 
-        assert_eq!(instructions, Some("Primary system instructions".to_string()));
+        assert_eq!(
+            instructions,
+            Some("Primary system instructions".to_string())
+        );
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[0]["content"], "Hello");

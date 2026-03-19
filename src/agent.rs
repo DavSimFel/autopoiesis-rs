@@ -3,7 +3,7 @@
 use std::io::{self, Write};
 
 use anyhow::Result;
-use serde_json::{from_str, Value};
+use serde_json::{Value, from_str};
 
 use crate::guard::{Severity, Verdict};
 use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall};
@@ -29,12 +29,7 @@ where
 
 /// Request approval for execution paths that need user confirmation.
 pub trait ApprovalHandler {
-    fn request_approval(
-        &mut self,
-        severity: &Severity,
-        reason: &str,
-        command: &str,
-    ) -> bool;
+    fn request_approval(&mut self, severity: &Severity, reason: &str, command: &str) -> bool;
 }
 
 impl<F> ApprovalHandler for F
@@ -124,18 +119,26 @@ pub enum QueueOutcome {
 
 fn command_from_tool_call(call: &ToolCall) -> Option<String> {
     let value = from_str::<Value>(&call.arguments).ok()?;
-    value.get("command").and_then(Value::as_str).map(ToString::to_string)
+    value
+        .get("command")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn append_approval_denied(session: &mut Session, reason: &str, command: &str) -> Result<()> {
     session.append(
-        ChatMessage::system(format!("Tool execution rejected by user: {reason}. Command: {command}")),
+        ChatMessage::system(format!(
+            "Tool execution rejected by user: {reason}. Command: {command}"
+        )),
         None,
     )
 }
 
 fn append_hard_deny(session: &mut Session, by: &str, reason: &str) -> Result<()> {
-    session.append(ChatMessage::system(format!("Tool execution hard-denied by {by}: {reason}")), None)
+    session.append(
+        ChatMessage::system(format!("Tool execution hard-denied by {by}: {reason}")),
+        None,
+    )
 }
 
 fn guard_text_output(turn: &Turn, text: String) -> String {
@@ -218,13 +221,10 @@ where
                 let command = messages
                     .iter()
                     .find_map(|message| {
-                        message
-                            .content
-                            .iter()
-                            .find_map(|block| match block {
-                                MessageContent::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
+                        message.content.iter().find_map(|block| match block {
+                            MessageContent::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
                     })
                     .unwrap_or("<inbound message>");
                 let approved = approval_handler.request_approval(&severity, &reason, command);
@@ -242,7 +242,9 @@ where
         let provider = make_provider().await?;
         let mut streamed_output = String::new();
         let mut turn_reply = provider
-            .stream_completion(&messages, &tools, &mut |token| streamed_output.push_str(&token))
+            .stream_completion(&messages, &tools, &mut |token| {
+                streamed_output.push_str(&token)
+            })
             .await?;
         if !streamed_output.is_empty() {
             let redacted_output = guard_text_output(turn, streamed_output);
@@ -273,7 +275,8 @@ where
                         } => {
                             let command = command_from_tool_call(call)
                                 .unwrap_or_else(|| "<command unavailable>".to_string());
-                            let approved = approval_handler.request_approval(&severity, &reason, &command);
+                            let approved =
+                                approval_handler.request_approval(&severity, &reason, &command);
                             if !approved {
                                 append_approval_denied(session, &reason, &command)?;
                                 continue 'agent_turn;
@@ -323,7 +326,9 @@ where
                 session.append(turn_reply.assistant_message, turn_meta)?;
                 token_sink.on_complete();
                 if had_user_approval {
-                    return Ok(TurnVerdict::Approved { tool_calls: executed });
+                    return Ok(TurnVerdict::Approved {
+                        tool_calls: executed,
+                    });
                 }
                 return Ok(TurnVerdict::Executed(executed));
             }
@@ -418,7 +423,10 @@ where
                 store.mark_processed(message.id)?;
             }
             Ok(QueueOutcome::UnsupportedRole(role)) => {
-                eprintln!("unsupported queued role '{role}' for message {}", message.id);
+                eprintln!(
+                    "unsupported queued role '{role}' for message {}",
+                    message.id
+                );
                 store.mark_processed(message.id)?;
             }
             Err(error) => {
@@ -510,7 +518,9 @@ mod tests {
     impl SequenceProvider {
         fn new(turns: Vec<StreamedTurn>) -> Self {
             Self {
-                turns: std::sync::Arc::new(std::sync::Mutex::new(turns.into_iter().rev().collect())),
+                turns: std::sync::Arc::new(std::sync::Mutex::new(
+                    turns.into_iter().rev().collect(),
+                )),
             }
         }
     }
@@ -625,7 +635,9 @@ mod tests {
         let session_id = "worker";
         let mut store = Store::new(&queue_path).unwrap();
         store.create_session(session_id, None).unwrap();
-        let user_id = store.enqueue_message(session_id, "user", "hello", "cli").unwrap();
+        let user_id = store
+            .enqueue_message(session_id, "user", "hello", "cli")
+            .unwrap();
         let system_id = store
             .enqueue_message(session_id, "system", "operational note", "cli")
             .unwrap();
@@ -672,16 +684,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            *provider_calls.lock().expect("provider call counter mutex poisoned"),
+            *provider_calls
+                .lock()
+                .expect("provider call counter mutex poisoned"),
             1
         );
         assert!(session.history().iter().any(|message| {
             matches!(message.role, crate::llm::ChatRole::System)
                 && message_text(message) == Some("operational note")
         }));
-        assert!(!session.history().iter().any(|message| {
-            message_text(message) == Some("orphan tool result")
-        }));
+        assert!(
+            !session
+                .history()
+                .iter()
+                .any(|message| { message_text(message) == Some("orphan tool result") })
+        );
 
         let conn = Connection::open(&queue_path).unwrap();
         for message_id in [user_id, system_id, unknown_id] {
@@ -863,7 +880,10 @@ mod tests {
         .await
         .unwrap();
 
-        let first = session.history().first().expect("user message should be persisted");
+        let first = session
+            .history()
+            .first()
+            .expect("user message should be persisted");
         assert!(matches!(first.role, crate::llm::ChatRole::User));
         let content = match &first.content[0] {
             MessageContent::Text { text } => text,

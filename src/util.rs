@@ -22,7 +22,11 @@ pub(crate) fn utc_timestamp() -> String {
     // 719_468 is the number of days from year 0 to the Unix epoch (1970-01-01) in the
     // proleptic Gregorian calendar; 146_097 is the number of days per 400-year cycle.
     days += 719_468;
-    let era = if days >= 0 { days / 146_097 } else { (days - 146_096) / 146_097 };
+    let era = if days >= 0 {
+        days / 146_097
+    } else {
+        (days - 146_096) / 146_097
+    };
     let doe = days - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
@@ -34,12 +38,7 @@ pub(crate) fn utc_timestamp() -> String {
 
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year,
-        month,
-        day,
-        hour,
-        minute,
-        second
+        year, month, day, hour, minute, second
     )
 }
 

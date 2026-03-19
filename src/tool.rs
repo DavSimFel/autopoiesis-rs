@@ -12,11 +12,11 @@ use std::process::Command as StdCommand;
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
-use serde_json::{json, Value};
-use tokio::io::AsyncReadExt;
+use anyhow::{Context, Result, anyhow};
+use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+use tokio::io::AsyncReadExt;
 use tokio::process::Child as TokioChild;
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
@@ -177,16 +177,16 @@ impl Shell {
         }
 
         #[cfg(not(unix))]
-        child.kill().await.context("failed to kill timed-out child process")?;
+        child
+            .kill()
+            .await
+            .context("failed to kill timed-out child process")?;
 
         let _ = child.wait().await;
         Ok(())
     }
 
-    async fn run_with_timeout(
-        command_text: &str,
-        timeout_ms: u64,
-    ) -> Result<std::process::Output> {
+    async fn run_with_timeout(command_text: &str, timeout_ms: u64) -> Result<std::process::Output> {
         let mut command = StdCommand::new("sh");
         command.arg("-lc").arg(command_text);
 

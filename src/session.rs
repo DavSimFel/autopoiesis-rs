@@ -115,7 +115,11 @@ impl Session {
             meta: meta.cloned(),
             call_id,
             tool_name,
-            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
         }
     }
 
@@ -164,7 +168,8 @@ impl Session {
                 })
             }
             "tool" => {
-                if entry.call_id.is_none() && entry.tool_name.is_none() && entry.content.is_empty() {
+                if entry.call_id.is_none() && entry.tool_name.is_none() && entry.content.is_empty()
+                {
                     None
                 } else {
                     Some(ChatMessage::tool_result(
@@ -270,8 +275,9 @@ impl Session {
                     continue;
                 }
 
-                let entry: SessionEntry = serde_json::from_str(&raw_line)
-                    .with_context(|| format!("failed to parse session entry in {}", path.display()))?;
+                let entry: SessionEntry = serde_json::from_str(&raw_line).with_context(|| {
+                    format!("failed to parse session entry in {}", path.display())
+                })?;
 
                 let (message, token_delta) = Self::message_from_entry(entry);
                 if let Some(message) = message {
@@ -472,9 +478,7 @@ mod tests {
             reasoning_trace: Some("I thought about it".to_string()),
         };
 
-        session
-            .append(ChatMessage::user("hi"), None)
-            .unwrap();
+        session.append(ChatMessage::user("hi"), None).unwrap();
         session
             .append(
                 ChatMessage::with_role(crate::llm::ChatRole::Assistant),
@@ -581,7 +585,9 @@ mod tests {
 
         {
             let mut session = Session::new(&dir).unwrap();
-            session.append(ChatMessage::system("system note"), None).unwrap();
+            session
+                .append(ChatMessage::system("system note"), None)
+                .unwrap();
             session.add_user_message("hello").unwrap();
         }
 
@@ -618,9 +624,11 @@ mod tests {
         };
 
         for _ in 0..2 {
-            seed
-                .append(ChatMessage::with_role(crate::llm::ChatRole::Assistant), Some(meta.clone()))
-                .unwrap();
+            seed.append(
+                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                Some(meta.clone()),
+            )
+            .unwrap();
         }
 
         let mut session = Session::new(&dir).unwrap();
@@ -651,11 +659,17 @@ mod tests {
 
         session.append(ChatMessage::user("q1"), None).unwrap();
         session
-            .append(ChatMessage::with_role(crate::llm::ChatRole::Assistant), Some(meta1))
+            .append(
+                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                Some(meta1),
+            )
             .unwrap();
         session.append(ChatMessage::user("q2"), None).unwrap();
         session
-            .append(ChatMessage::with_role(crate::llm::ChatRole::Assistant), Some(meta2))
+            .append(
+                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                Some(meta2),
+            )
             .unwrap();
 
         assert_eq!(session.total_tokens(), 180); // 50+10+100+20
@@ -717,19 +731,34 @@ mod tests {
             ..Default::default()
         };
 
-        session.append(ChatMessage::system("instructions"), None).unwrap();
-        session.append(ChatMessage::user("old question"), None).unwrap();
         session
-            .append(ChatMessage::with_role(crate::llm::ChatRole::Assistant), Some(big_meta.clone()))
+            .append(ChatMessage::system("instructions"), None)
             .unwrap();
-        session.append(ChatMessage::user("new question"), None).unwrap();
         session
-            .append(ChatMessage::with_role(crate::llm::ChatRole::Assistant), Some(big_meta))
+            .append(ChatMessage::user("old question"), None)
+            .unwrap();
+        session
+            .append(
+                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                Some(big_meta.clone()),
+            )
+            .unwrap();
+        session
+            .append(ChatMessage::user("new question"), None)
+            .unwrap();
+        session
+            .append(
+                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                Some(big_meta),
+            )
             .unwrap();
 
         let history = session.history();
         assert!(history.len() < 5, "should have trimmed some messages");
-        assert!(matches!(history.first().map(|message| &message.role), Some(ChatRole::System)));
+        assert!(matches!(
+            history.first().map(|message| &message.role),
+            Some(ChatRole::System)
+        ));
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -746,20 +775,33 @@ mod tests {
             ..Default::default()
         };
 
-        session.append(ChatMessage::user("oldest user"), None).unwrap();
         session
-            .append(ChatMessage::with_role(crate::llm::ChatRole::Assistant), Some(big_meta.clone()))
+            .append(ChatMessage::user("oldest user"), None)
             .unwrap();
-        session.append(ChatMessage::user("newer user"), None).unwrap();
         session
-            .append(ChatMessage::with_role(crate::llm::ChatRole::Assistant), Some(big_meta))
+            .append(
+                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                Some(big_meta.clone()),
+            )
+            .unwrap();
+        session
+            .append(ChatMessage::user("newer user"), None)
+            .unwrap();
+        session
+            .append(
+                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                Some(big_meta),
+            )
             .unwrap();
 
         assert!(
-            session.history().iter().all(|message| match &message.content[..] {
-                [MessageContent::Text { text }] => text != "oldest user",
-                _ => true,
-            }),
+            session
+                .history()
+                .iter()
+                .all(|message| match &message.content[..] {
+                    [MessageContent::Text { text }] => text != "oldest user",
+                    _ => true,
+                }),
             "oldest user message should not be pinned forever"
         );
 
@@ -778,7 +820,9 @@ mod tests {
             ..Default::default()
         };
 
-        session.append(ChatMessage::system("instructions"), None).unwrap();
+        session
+            .append(ChatMessage::system("instructions"), None)
+            .unwrap();
         session.append(ChatMessage::user("first"), None).unwrap();
         session
             .append(
@@ -803,7 +847,10 @@ mod tests {
             .unwrap();
         session.append(ChatMessage::user("second"), None).unwrap();
         session
-            .append(ChatMessage::with_role(crate::llm::ChatRole::Assistant), Some(big_meta))
+            .append(
+                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                Some(big_meta),
+            )
             .unwrap();
 
         for (index, message) in session.history().iter().enumerate() {
@@ -811,7 +858,10 @@ mod tests {
                 continue;
             }
 
-            assert!(index > 0, "tool result cannot be the first retained message");
+            assert!(
+                index > 0,
+                "tool result cannot be the first retained message"
+            );
             let previous = &session.history()[index - 1];
             assert!(matches!(previous.role, ChatRole::Assistant));
             let tool_call_id = match &message.content[0] {
@@ -822,7 +872,10 @@ mod tests {
                 MessageContent::ToolCall { call } => call.id == tool_call_id,
                 _ => false,
             });
-            assert!(has_matching_call, "tool result must retain its assistant tool call");
+            assert!(
+                has_matching_call,
+                "tool result must retain its assistant tool call"
+            );
         }
 
         fs::remove_dir_all(&dir).unwrap();
@@ -871,5 +924,4 @@ mod tests {
 
         fs::remove_dir_all(&dir).unwrap();
     }
-
 }

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use crate::util::utc_timestamp;
 
@@ -28,7 +28,8 @@ impl Store {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
         }
 
         let conn = Connection::open(path).context("failed to open sqlite store")?;
@@ -99,7 +100,10 @@ impl Store {
     }
 
     pub fn dequeue_next_message(&mut self, session_id: &str) -> Result<Option<QueuedMessage>> {
-        let tx = self.conn.transaction().context("failed to start dequeue transaction")?;
+        let tx = self
+            .conn
+            .transaction()
+            .context("failed to start dequeue transaction")?;
         let result = {
             let mut statement = tx
                 .prepare(
@@ -111,18 +115,17 @@ impl Store {
                 )
                 .context("failed to prepare dequeue query")?;
 
-            statement
-                .query_row(params![session_id], |row| {
-                    Ok(QueuedMessage {
-                        id: row.get(0)?,
-                        session_id: row.get(1)?,
-                        role: row.get(2)?,
-                        content: row.get(3)?,
-                        source: row.get(4)?,
-                        status: row.get(5)?,
-                        created_at: row.get(6)?,
-                    })
+            statement.query_row(params![session_id], |row| {
+                Ok(QueuedMessage {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    source: row.get(4)?,
+                    status: row.get(5)?,
+                    created_at: row.get(6)?,
                 })
+            })
         };
 
         match result {
@@ -132,11 +135,13 @@ impl Store {
                     params![message.id],
                 )
                 .context("failed to claim message")?;
-                tx.commit().context("failed to commit dequeue transaction")?;
+                tx.commit()
+                    .context("failed to commit dequeue transaction")?;
                 Ok(Some(message))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
-                tx.rollback().context("failed to rollback dequeue transaction")?;
+                tx.rollback()
+                    .context("failed to rollback dequeue transaction")?;
                 Ok(None)
             }
             Err(error) => Err(error).context("failed to dequeue message"),
@@ -198,8 +203,12 @@ mod tests {
         let path = temp_db_path("list");
         let mut store = Store::new(&path).unwrap();
 
-        store.create_session("s1", Some(r#"{"source":"cli"}"#)).unwrap();
-        store.create_session("s2", Some(r#"{"source":"api"}"#)).unwrap();
+        store
+            .create_session("s1", Some(r#"{"source":"cli"}"#))
+            .unwrap();
+        store
+            .create_session("s2", Some(r#"{"source":"api"}"#))
+            .unwrap();
 
         let sessions = store.list_sessions().unwrap();
         assert_eq!(sessions, vec!["s1", "s2"]);
@@ -228,14 +237,22 @@ mod tests {
         assert_eq!(first_msg.status, "pending");
         let status: String = store
             .conn
-            .query_row("SELECT status FROM messages WHERE id = ?1", [first_id], |row| row.get(0))
+            .query_row(
+                "SELECT status FROM messages WHERE id = ?1",
+                [first_id],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(status, "processing");
 
         store.mark_processed(first_id).unwrap();
         let status: String = store
             .conn
-            .query_row("SELECT status FROM messages WHERE id = ?1", [first_id], |row| row.get(0))
+            .query_row(
+                "SELECT status FROM messages WHERE id = ?1",
+                [first_id],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(status, "processed");
 
@@ -246,7 +263,11 @@ mod tests {
         store.mark_processed(second_id).unwrap();
         let status: String = store
             .conn
-            .query_row("SELECT status FROM messages WHERE id = ?1", [second_id], |row| row.get(0))
+            .query_row(
+                "SELECT status FROM messages WHERE id = ?1",
+                [second_id],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(status, "processed");
 

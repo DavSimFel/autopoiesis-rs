@@ -164,7 +164,10 @@ impl ContextSource for History {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, fs, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        env, fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     struct TempIdentityDir {
         path: std::path::PathBuf,
@@ -219,10 +222,7 @@ mod tests {
             vars,
             "fallback",
         );
-        let mut messages = vec![
-            ChatMessage::system("old"),
-            ChatMessage::user("ask"),
-        ];
+        let mut messages = vec![ChatMessage::system("old"), ChatMessage::user("ask")];
         source.assemble(&mut messages);
 
         let content = match &messages[0].content[0] {

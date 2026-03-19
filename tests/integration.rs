@@ -1,13 +1,13 @@
 #[cfg(feature = "integration")]
+use anyhow::Result;
+#[cfg(feature = "integration")]
 use autopoiesis::{
     auth,
     config::Config,
-    llm::{openai::OpenAIProvider, ChatMessage, LlmProvider, StopReason},
-    turn::Turn,
+    llm::{ChatMessage, LlmProvider, StopReason, openai::OpenAIProvider},
     tool::Shell,
+    turn::Turn,
 };
-#[cfg(feature = "integration")]
-use anyhow::Result;
 
 #[cfg(feature = "integration")]
 #[tokio::test]
@@ -36,7 +36,10 @@ async fn simple_prompt() -> Result<()> {
 
     let turn = provider
         .stream_completion(
-            &[ChatMessage::system("You are a helpful assistant."), ChatMessage::user("Say hi in 3 words")],
+            &[
+                ChatMessage::system("You are a helpful assistant."),
+                ChatMessage::user("Say hi in 3 words"),
+            ],
             &[],
             &mut on_token,
         )
@@ -67,7 +70,10 @@ async fn invalid_model_returns_error() -> anyhow::Result<()> {
 
     let result = provider
         .stream_completion(
-            &[ChatMessage::system("You are a helpful assistant."), ChatMessage::user("Hello")],
+            &[
+                ChatMessage::system("You are a helpful assistant."),
+                ChatMessage::user("Hello"),
+            ],
             &[],
             &mut on_token,
         )
