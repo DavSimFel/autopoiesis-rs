@@ -4,6 +4,7 @@
 //! Messages are appended in real time. On load, the file is
 //! replayed to rebuild in-memory state.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -145,7 +146,7 @@ impl Session {
         let token_delta = Self::token_total(entry.meta.as_ref());
 
         let message = match entry.role.as_str() {
-            "system" => None,
+            "system" => Some(ChatMessage::system(entry.content)),
             "user" => Some(ChatMessage::user(entry.content)),
             "assistant" => {
                 let mut content = Vec::new();
@@ -179,6 +180,20 @@ impl Session {
         (message, token_delta)
     }
 
+    fn session_paths(&self) -> Result<Vec<PathBuf>> {
+        if !self.sessions_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut paths = fs::read_dir(&self.sessions_dir)
+            .with_context(|| format!("failed to read {}", self.sessions_dir.display()))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+            .collect::<Vec<_>>();
+        paths.sort();
+        Ok(paths)
+    }
+
     fn message_text_for_estimation(message: &ChatMessage) -> String {
         message
             .content
@@ -201,10 +216,19 @@ impl Session {
         }
     }
 
+    fn can_trim_after_append(message: &ChatMessage) -> bool {
+        match message.role {
+            ChatRole::Assistant => Self::tool_call_ids(message).is_empty(),
+            ChatRole::Tool => false,
+            _ => true,
+        }
+    }
+
     /// Append a message and persist it to today's JSONL file.
     pub fn append(&mut self, message: ChatMessage, meta: Option<TurnMeta>) -> Result<()> {
         let token_delta = Self::token_total(meta.as_ref());
         let entry = Self::to_entry(&message, meta.as_ref());
+        let should_trim = Self::can_trim_after_append(&message);
 
         self.messages.push(message);
         self.message_tokens.push(token_delta);
@@ -212,7 +236,7 @@ impl Session {
 
         Self::append_entry_to_file(&self.today_path(), &entry)?;
 
-        if self.total_tokens > self.max_context_tokens {
+        if should_trim && self.total_tokens > self.max_context_tokens {
             self.trim_context();
         }
 
@@ -229,33 +253,32 @@ impl Session {
         &self.messages
     }
 
-    /// Load today's session from disk if it exists.
-        pub fn load_today(&mut self) -> Result<()> {
-        let path = self.today_path();
-        if !path.exists() {
-            return Ok(());
-        }
+    /// Load persisted session history from disk, replaying all dated JSONL files in order.
+    pub fn load_today(&mut self) -> Result<()> {
+        self.messages.clear();
+        self.message_tokens.clear();
+        self.total_tokens = 0;
 
-        let file = File::open(&path).context("failed to open sessions file")?;
-        let reader = BufReader::new(file);
+        for path in self.session_paths()? {
+            let file = File::open(&path)
+                .with_context(|| format!("failed to open sessions file {}", path.display()))?;
+            let reader = BufReader::new(file);
 
-        for raw_line in reader.lines() {
-            let raw_line = raw_line?;
-            if raw_line.trim().is_empty() {
-                continue;
-            }
+            for raw_line in reader.lines() {
+                let raw_line = raw_line?;
+                if raw_line.trim().is_empty() {
+                    continue;
+                }
 
-            let entry: SessionEntry = serde_json::from_str(&raw_line)
-                .context("failed to parse session entry")?;
+                let entry: SessionEntry = serde_json::from_str(&raw_line)
+                    .with_context(|| format!("failed to parse session entry in {}", path.display()))?;
 
-            let (message, token_delta) = Self::message_from_entry(entry);
-            if let Some(message) = message {
-                self.messages.push(message);
-                self.message_tokens.push(token_delta);
-                self.total_tokens += token_delta;
-            } else if token_delta > 0 {
-                self.total_tokens += token_delta;
-                self.message_tokens.push(token_delta);
+                let (message, token_delta) = Self::message_from_entry(entry);
+                if let Some(message) = message {
+                    self.messages.push(message);
+                    self.message_tokens.push(token_delta);
+                    self.total_tokens += token_delta;
+                }
             }
         }
 
@@ -270,47 +293,95 @@ impl Session {
             .join(format!("{}.jsonl", utc_timestamp()[..10].to_string()))
     }
 
-    /// Trim oldest non-system messages when over token limit.
-    fn trim_context(&mut self) {
-        let use_estimation = self.total_tokens == 0;
-        let mut estimated_tokens = if use_estimation {
+    fn trim_anchor_index(&self) -> Option<usize> {
+        self.messages
+            .iter()
+            .position(|message| message.role == ChatRole::System)
+    }
+
+    fn tool_call_ids(message: &ChatMessage) -> HashSet<&str> {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                MessageContent::ToolCall { call } => Some(call.id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn trim_group_range(&self, anchor_index: Option<usize>) -> Option<(usize, usize)> {
+        let mut start = 0;
+        while start < self.messages.len() {
+            if Some(start) == anchor_index {
+                start += 1;
+                continue;
+            }
+            break;
+        }
+
+        if start >= self.messages.len() {
+            return None;
+        }
+
+        let mut end = start + 1;
+        match self.messages[start].role {
+            ChatRole::Assistant => {
+                let call_ids = Self::tool_call_ids(&self.messages[start]);
+                if !call_ids.is_empty() {
+                    while end < self.messages.len() {
+                        match &self.messages[end] {
+                            ChatMessage {
+                                role: ChatRole::Tool,
+                                content,
+                            } => {
+                                let matches_call = content.iter().any(|block| match block {
+                                    MessageContent::ToolResult { result } => {
+                                        call_ids.contains(result.tool_call_id.as_str())
+                                    }
+                                    _ => false,
+                                });
+                                if matches_call {
+                                    end += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+            ChatRole::Tool => {
+                while end < self.messages.len() && self.messages[end].role == ChatRole::Tool {
+                    end += 1;
+                }
+            }
+            _ => {}
+        }
+
+        Some((start, end))
+    }
+
+    fn current_context_tokens(&self, use_estimation: bool) -> u64 {
+        if use_estimation {
             self.estimate_context_tokens() as u64
         } else {
             self.total_tokens
-        };
-
-        while estimated_tokens > self.max_context_tokens {
-            // Keep one leading system instruction message intact and trim from oldest conversational history.
-            if self.messages.len() <= 1 {
-                break;
-            }
-
-            let mut removed = 0;
-            for _ in 0..2 {
-                if self.messages.len() <= 1 {
-                    break;
-                }
-
-                let token_delta = if use_estimation {
-                    Self::estimate_message_tokens(&self.messages[1])
-                } else {
-                    self.message_tokens.remove(1)
-                };
-                self.messages.remove(1);
-                if use_estimation {
-                    self.message_tokens.remove(1);
-                }
-                removed += token_delta;
-            }
-
-            if removed == 0 {
-                break;
-            }
-
-            estimated_tokens = estimated_tokens.saturating_sub(removed);
         }
+    }
 
-        self.total_tokens = estimated_tokens;
+    /// Trim oldest conversational groups when over token limit without splitting tool round-trips.
+    fn trim_context(&mut self) {
+        let use_estimation = self.total_tokens == 0;
+        while self.current_context_tokens(use_estimation) > self.max_context_tokens {
+            let Some((start, end)) = self.trim_group_range(self.trim_anchor_index()) else {
+                break;
+            };
+            self.messages.drain(start..end);
+            self.message_tokens.drain(start..end);
+            self.total_tokens = self.message_tokens.iter().sum();
+        }
     }
 
     /// Estimate context tokens using cl100k_base tokenizer.
@@ -354,6 +425,13 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn write_entries(path: &Path, entries: &[SessionEntry]) {
+        let mut file = File::create(path).unwrap();
+        for entry in entries {
+            writeln!(file, "{}", serde_json::to_string(entry).unwrap()).unwrap();
+        }
     }
 
     // --- Persistence ---
@@ -453,6 +531,66 @@ mod tests {
             let history = session.history();
             assert!(history.len() >= 2);
         }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_today_replays_previous_day_files() {
+        let dir = temp_sessions_dir("load_multiple_days");
+        let yesterday = dir.join("2026-03-18.jsonl");
+        let today = dir.join("2026-03-19.jsonl");
+        write_entries(
+            &yesterday,
+            &[SessionEntry {
+                role: "user".to_string(),
+                content: "yesterday".to_string(),
+                ts: "2026-03-18T00:00:00Z".to_string(),
+                meta: None,
+                call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            }],
+        );
+        write_entries(
+            &today,
+            &[SessionEntry {
+                role: "assistant".to_string(),
+                content: "today".to_string(),
+                ts: "2026-03-19T00:00:00Z".to_string(),
+                meta: None,
+                call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            }],
+        );
+
+        let mut session = Session::new(&dir).unwrap();
+        session.load_today().unwrap();
+
+        assert_eq!(session.history().len(), 2);
+        assert!(matches!(session.history()[0].role, ChatRole::User));
+        assert!(matches!(session.history()[1].role, ChatRole::Assistant));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_today_preserves_system_entries() {
+        let dir = temp_sessions_dir("load_system_entries");
+
+        {
+            let mut session = Session::new(&dir).unwrap();
+            session.append(ChatMessage::system("system note"), None).unwrap();
+            session.add_user_message("hello").unwrap();
+        }
+
+        let mut session = Session::new(&dir).unwrap();
+        session.load_today().unwrap();
+
+        assert_eq!(session.history().len(), 2);
+        assert!(matches!(session.history()[0].role, ChatRole::System));
+        assert!(matches!(session.history()[1].role, ChatRole::User));
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -579,6 +717,7 @@ mod tests {
             ..Default::default()
         };
 
+        session.append(ChatMessage::system("instructions"), None).unwrap();
         session.append(ChatMessage::user("old question"), None).unwrap();
         session
             .append(ChatMessage::with_role(crate::llm::ChatRole::Assistant), Some(big_meta.clone()))
@@ -590,7 +729,101 @@ mod tests {
 
         let history = session.history();
         assert!(history.len() < 5, "should have trimmed some messages");
-        assert!(!history.is_empty());
+        assert!(matches!(history.first().map(|message| &message.role), Some(ChatRole::System)));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn trim_does_not_pin_oldest_user_when_history_has_no_system_message() {
+        let dir = temp_sessions_dir("trim_no_system_pin");
+        let mut session = Session::new(&dir).unwrap();
+        session.max_context_tokens = 50;
+
+        let big_meta = TurnMeta {
+            input_tokens: Some(30),
+            output_tokens: Some(30),
+            ..Default::default()
+        };
+
+        session.append(ChatMessage::user("oldest user"), None).unwrap();
+        session
+            .append(ChatMessage::with_role(crate::llm::ChatRole::Assistant), Some(big_meta.clone()))
+            .unwrap();
+        session.append(ChatMessage::user("newer user"), None).unwrap();
+        session
+            .append(ChatMessage::with_role(crate::llm::ChatRole::Assistant), Some(big_meta))
+            .unwrap();
+
+        assert!(
+            session.history().iter().all(|message| match &message.content[..] {
+                [MessageContent::Text { text }] => text != "oldest user",
+                _ => true,
+            }),
+            "oldest user message should not be pinned forever"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn trim_keeps_assistant_tool_roundtrip_intact() {
+        let dir = temp_sessions_dir("trim_tool_roundtrip");
+        let mut session = Session::new(&dir).unwrap();
+        session.max_context_tokens = 50;
+
+        let big_meta = TurnMeta {
+            input_tokens: Some(30),
+            output_tokens: Some(30),
+            ..Default::default()
+        };
+
+        session.append(ChatMessage::system("instructions"), None).unwrap();
+        session.append(ChatMessage::user("first"), None).unwrap();
+        session
+            .append(
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: vec![MessageContent::ToolCall {
+                        call: crate::llm::ToolCall {
+                            id: "call-1".to_string(),
+                            name: "execute".to_string(),
+                            arguments: "{\"command\":\"echo hi\"}".to_string(),
+                        },
+                    }],
+                },
+                Some(big_meta.clone()),
+            )
+            .unwrap();
+        session
+            .append(
+                ChatMessage::tool_result("call-1", "execute", "stdout:\nhi"),
+                None,
+            )
+            .unwrap();
+        session.append(ChatMessage::user("second"), None).unwrap();
+        session
+            .append(ChatMessage::with_role(crate::llm::ChatRole::Assistant), Some(big_meta))
+            .unwrap();
+
+        for (index, message) in session.history().iter().enumerate() {
+            if message.role != ChatRole::Tool {
+                continue;
+            }
+
+            assert!(index > 0, "tool result cannot be the first retained message");
+            let previous = &session.history()[index - 1];
+            assert!(matches!(previous.role, ChatRole::Assistant));
+            let tool_call_id = match &message.content[0] {
+                MessageContent::ToolResult { result } => result.tool_call_id.as_str(),
+                _ => panic!("expected tool result"),
+            };
+            let has_matching_call = previous.content.iter().any(|block| match block {
+                MessageContent::ToolCall { call } => call.id == tool_call_id,
+                _ => false,
+            });
+            assert!(has_matching_call, "tool result must retain its assistant tool call");
+        }
 
         fs::remove_dir_all(&dir).unwrap();
     }
