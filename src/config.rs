@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
 /// Runtime configuration loaded by the CLI when starting agent mode.
@@ -23,7 +23,8 @@ impl Config {
     pub fn load(config_path: impl AsRef<Path>) -> Result<Self> {
         let mut config = Self {
             model: "gpt-5.4".to_string(),
-            system_prompt: "You are a direct and capable coding agent. Execute tasks efficiently.".to_string(),
+            system_prompt: "You are a direct and capable coding agent. Execute tasks efficiently."
+                .to_string(),
             base_url: "https://chatgpt.com/backend-api/codex/responses".to_string(),
             reasoning_effort: None,
         };
@@ -110,7 +111,10 @@ mod tests {
     fn uses_defaults_when_file_missing() {
         let config = Config::load("/does/not/exist.toml").expect("expected defaults to be used");
         assert_eq!(config.model, "gpt-5.4");
-        assert_eq!(config.base_url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(
+            config.base_url,
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
         assert_eq!(config.reasoning_effort, None);
     }
 
@@ -120,7 +124,10 @@ mod tests {
 
         let config = Config::load(&path).expect("expected config to load");
         assert_eq!(config.model, "gpt-only");
-        assert_eq!(config.base_url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(
+            config.base_url,
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
         assert_eq!(
             config.system_prompt,
             "You are a direct and capable coding agent. Execute tasks efficiently."

@@ -1,99 +1,80 @@
-# PLAN: Unify queue-driven execution into a single shared function
+# PLAN: GitHub Actions CI for autopoiesis-rs
 
-## Problem
-`process_queue()` in `src/main.rs` and `drain_session_queue()` + `process_queued_message()` in `src/server.rs` are two separate implementations of the same dequeue→execute→mark lifecycle. This violates "one queue, one worker contract."
+## Repo facts established
+
+- `Cargo.toml` defines a single Rust package (`autopoiesis`) on edition `2024`.
+- `Cargo.toml` has an opt-in `integration` feature.
+- `tests/integration.rs` gates every test behind `#[cfg(feature = "integration")]` and those tests require live auth/API access.
+- `.github/` does not exist yet, so the workflow should be added from scratch.
 
 ## Files to read
 
-| File | Lines | What to look for |
-|------|-------|-----------------|
-| `src/main.rs` | 170-230 | `process_queue()` — dequeue loop, calls `run_agent_loop()`, marks processed/failed |
-| `src/server.rs` | 420-550 | `drain_session_queue()` — same loop but async, `process_queued_message()` — role dispatch, `QueueProcessingOutcome` enum |
-| `src/server.rs` | 390-420 | `spawn_http_queue_worker()` — how HTTP triggers the worker |
-| `src/server.rs` | 270-390 | `websocket_session()` — how WS enqueues then triggers the worker |
-| `src/server.rs` | 600-620 | `NoopTokenSink`, `RejectApprovalHandler` — HTTP-mode handlers |
-| `src/server.rs` | 620-660 | `WsApprovalHandler` — WS-mode handler |
-| `src/agent.rs` | 130-280 | `run_agent_loop()` signature, `TurnVerdict`, approval handler and token sink traits |
-| `src/store.rs` | full | `dequeue_next()`, `mark_processed()`, `mark_failed()`, `create_session()` |
-| `src/session.rs` | 1-30 | `Session::new()` constructor |
-| `src/turn.rs` | 120-140 | `build_default_turn()` |
+- `Cargo.toml`
+  - Confirm the crate is a single package and that the `integration` feature is opt-in.
+- `tests/integration.rs`
+  - Confirm integration tests are feature-gated and should not run in CI.
+- `.github/`
+  - Confirm there is no existing workflow or repository automation to merge with.
 
-## Analysis: differences between the two paths
+## File to create
 
-| Aspect | CLI (`process_queue`) | Server (`drain_session_queue`) |
-|--------|----------------------|-------------------------------|
-| Dequeue loop | synchronous-ish (blocking on agent loop) | async with worker_lock mutex |
-| Role dispatch | only handles "user", drops others silently | handles "user", "system", "assistant", logs unknown |
-| Agent loop call | calls `run_agent_loop()` directly | same, via `process_queued_message()` |
-| Approval handler | closure `&mut approval_handler` (stdin-based) | `WsApprovalHandler` or `RejectApprovalHandler` |
-| Token sink | closure `&mut token_sink` (stdout) | `NoopTokenSink` or WS channel sender |
-| Mark failed | yes, on agent loop error | yes, on agent loop error |
-| Session | passed in from CLI | created per drain call from sessions_dir |
+- `.github/workflows/ci.yml`
 
-## Design
+## Workflow specification
 
-Create a new shared function in `src/agent.rs` (or a new `src/worker.rs` — prefer `agent.rs` since it already owns the agent loop):
+- Create exactly one workflow file.
+- Keep the workflow minimal: one workflow, one job, no matrix.
 
-```
-pub async fn drain_queue<F, Fut, P>(
-    store: &mut Store,
-    session_id: &str,
-    session: &mut Session,
-    turn: &Turn,
-    make_provider: &mut F,
-    token_sink: &mut dyn TokenSink,
-    approval_handler: &mut dyn ApprovalHandler,
-) -> Result<()>
-```
+### Trigger behavior
 
-This function:
-1. Loops on `store.dequeue_next(session_id)`
-2. Dispatches by role ("user" → `run_agent_loop()`, "system"/"assistant" → `session.append()`, other → log warning)
-3. Marks `processed` on success, `failed` on error
-4. Returns `Err` on agent loop failure (caller decides whether to continue)
+- Run on every `pull_request`.
+- Run on `push` only when the branch is `main`.
 
-Both CLI and server become thin wrappers:
-- **CLI** (`main.rs`): builds session, turn, CliApprovalHandler, stdout token sink → calls `drain_queue()`
-- **Server** (`server.rs`): acquires worker_lock, builds session, turn, appropriate handlers → calls `drain_queue()`
+### Job definition
 
-`QueueProcessingOutcome` moves into agent.rs (or becomes part of `TurnVerdict`). `NoopTokenSink` and `RejectApprovalHandler` stay in server.rs since they're server-specific handler implementations.
+- Use a single job named `ci`.
+- Run the job on `ubuntu-latest`.
+- Use the stable Rust toolchain.
+- Ensure both `rustfmt` and `clippy` components are installed because the workflow must run formatting and lint checks.
 
-## Per-file changes
+### Step order
 
-### `src/agent.rs`
-- Add `pub enum QueueOutcome { Agent(TurnVerdict), Stored, UnsupportedRole(String) }`
-- Add `pub async fn drain_queue(...)` — the single shared dequeue loop
-- Add `pub async fn process_message(...)` — single message role dispatch (extracted from server's `process_queued_message`)
-- Ensure `TokenSink` and `ApprovalHandler` are `pub` traits (they should already be)
+1. Check out the repository.
+2. Install the stable Rust toolchain with `rustfmt` and `clippy`.
+3. Restore Cargo/build caches before any Cargo command runs.
+4. Run `cargo fmt --check`.
+5. Run `cargo clippy -- -D warnings`.
+6. Run `cargo test`.
 
-### `src/main.rs`
-- Delete `process_queue()` entirely
-- In the CLI entrypoint, call `agent::drain_queue()` with CLI-specific handlers
-- Keep `CliApprovalHandler` and CLI token sink here
+### Caching requirements
 
-### `src/server.rs`
-- Delete `drain_session_queue()` and `process_queued_message()` and `QueueProcessingOutcome`
-- In `spawn_http_queue_worker()` and `websocket_session()`, call `agent::drain_queue()` with server-specific handlers
-- Keep `NoopTokenSink`, `RejectApprovalHandler`, `WsApprovalHandler` here
+- Cache the Cargo registry and the `target/` directory.
+- Preferred implementation: use a Rust-specific cache action that already handles Cargo home artifacts and `target/` with minimal configuration.
+- The cache step must come after toolchain setup and before the first Cargo command.
+- If the implementer chooses explicit cache configuration instead of a Rust-specific cache action, the cache key should include:
+  - runner OS
+  - Rust toolchain channel (`stable`)
+  - dependency state from `Cargo.lock`
 
-## Tests
+## Non-goals and guardrails
 
-1. **Unit test in agent.rs**: mock provider, enqueue 3 messages (user, system, unknown role), call `drain_queue()`, assert:
-   - User message → agent loop ran (provider called)
-   - System message → appended to session
-   - Unknown role → logged, marked processed, not appended
-   - All queue rows end in processed
+- Do not run `cargo test --features integration`.
+- Do not use `--all-features` anywhere in the workflow.
+- Do not add secrets, API-key setup, or a separate integration-test job.
+- Do not introduce a build matrix, extra jobs, or additional workflow files.
 
-2. **Existing tests**: `process_queue_marks_failed_when_agent_loop_errors` in main.rs should move to agent.rs test (or just call the new shared function)
+## Order of operations for the implementer
 
-3. **Compilation check**: ensure server.rs and main.rs both call the same `drain_queue()` — if either has its own dequeue loop, that's a build error by design (delete the old functions)
-
-## Order of operations
-
-1. Add `QueueOutcome` enum and `process_message()` to `agent.rs` — cargo test (no callers yet, should compile)
-2. Add `drain_queue()` to `agent.rs` — cargo test
-3. Update `main.rs` to use `agent::drain_queue()`, delete `process_queue()` — cargo test
-4. Update `server.rs` to use `agent::drain_queue()`, delete `drain_session_queue()` + `process_queued_message()` + `QueueProcessingOutcome` — cargo test
-5. Move/update the failed-marking test — cargo test
-6. Clippy clean — cargo clippy
-7. Commit: `refactor: unify CLI and server queue execution into shared drain_queue()`
+1. Re-read `Cargo.toml` and `tests/integration.rs` to confirm the `integration` feature remains opt-in and excluded from CI.
+2. Verify `.github/` is still absent or has no overlapping workflow file.
+3. Create `.github/workflows/ci.yml`.
+4. Add the `pull_request` and `push` to `main` triggers.
+5. Add one `ci` job on `ubuntu-latest`.
+6. Configure stable Rust with `rustfmt` and `clippy`.
+7. Add caching for the Cargo registry and `target/`.
+8. Add the three commands in this exact order:
+   - `cargo fmt --check`
+   - `cargo clippy -- -D warnings`
+   - `cargo test`
+9. Verify the workflow never enables the `integration` feature.
+10. Run `cargo test` locally before committing, per repository rules. Do not run the integration-feature test path in CI.

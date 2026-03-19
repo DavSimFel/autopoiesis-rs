@@ -64,9 +64,7 @@ pub struct ToolResult {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum MessageContent {
     /// Plain text message content.
-    Text {
-        text: String,
-    },
+    Text { text: String },
     /// Assistant requested tool execution.
     ToolCall {
         #[serde(flatten)]
@@ -81,9 +79,7 @@ pub enum MessageContent {
 
 impl MessageContent {
     pub fn text(value: impl Into<String>) -> Self {
-        Self::Text {
-            text: value.into(),
-        }
+        Self::Text { text: value.into() }
     }
 
     pub fn tool_result(
@@ -132,7 +128,11 @@ impl ChatMessage {
         }
     }
 
-    pub fn tool_result(tool_call_id: impl Into<String>, name: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn tool_result(
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
         Self {
             role: ChatRole::Tool,
             content: vec![MessageContent::tool_result(tool_call_id, name, content)],

@@ -362,11 +362,7 @@ async fn authenticate(
         let from_query = request.uri().query().and_then(|q| {
             q.split('&').find_map(|pair| {
                 let (key, value) = pair.split_once('=')?;
-                if key == "api_key" {
-                    Some(value)
-                } else {
-                    None
-                }
+                if key == "api_key" { Some(value) } else { None }
             })
         });
         if from_query.is_some_and(|value| value == state.api_key) {
@@ -691,7 +687,9 @@ mod tests {
         let message_id = {
             let mut store = state.store.lock().await;
             store.create_session(session_id, None).unwrap();
-            store.enqueue_message(session_id, "user", "hello", "ws").unwrap()
+            store
+                .enqueue_message(session_id, "user", "hello", "ws")
+                .unwrap()
         };
 
         let turn = turn::Turn::new();

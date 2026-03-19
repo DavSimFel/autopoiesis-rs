@@ -4,12 +4,12 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
+use reqwest::{Client, StatusCode};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::json;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use reqwest::{Client, StatusCode};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::json;
 use tokio::time::sleep;
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -35,7 +35,9 @@ pub struct AuthTokens {
 /// Resolve the auth token file path from `$HOME` with a safe fallback.
 pub fn token_file_path() -> PathBuf {
     let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(home_dir).join(".autopoiesis").join("auth.json")
+    PathBuf::from(home_dir)
+        .join(".autopoiesis")
+        .join("auth.json")
 }
 
 /// Read persisted tokens from disk.
@@ -47,7 +49,8 @@ pub fn read_tokens() -> Result<AuthTokens> {
 
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str::<AuthTokens>(&raw).with_context(|| format!("failed to parse {}", path.display()))
+    serde_json::from_str::<AuthTokens>(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))
 }
 
 /// Run the device-code OAuth flow used by `autopoiesis auth login`.
@@ -60,7 +63,8 @@ pub fn read_tokens() -> Result<AuthTokens> {
 pub async fn device_code_login() -> Result<AuthTokens> {
     let client = Client::new();
 
-    let response: DeviceCodeResponse = post_json(&client, DEVICE_AUTH_URL, &json!({"client_id": CLIENT_ID})).await?;
+    let response: DeviceCodeResponse =
+        post_json(&client, DEVICE_AUTH_URL, &json!({"client_id": CLIENT_ID})).await?;
 
     let user_code = response
         .user_code
@@ -75,7 +79,12 @@ pub async fn device_code_login() -> Result<AuthTokens> {
 
     let authorization =
         poll_for_authorization(&client, &response.device_auth_id, &user_code, interval).await?;
-    let tokens = exchange_authorization_code(&client, authorization.authorization_code, authorization.code_verifier).await?;
+    let tokens = exchange_authorization_code(
+        &client,
+        authorization.authorization_code,
+        authorization.code_verifier,
+    )
+    .await?;
 
     save_tokens(&tokens)?;
     Ok(tokens)
@@ -144,7 +153,9 @@ async fn poll_for_authorization(
         match response.status() {
             StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => {
                 print!(".");
-                io::stdout().flush().context("failed to print poll progress")?;
+                io::stdout()
+                    .flush()
+                    .context("failed to print poll progress")?;
                 sleep(StdDuration::from_secs(interval)).await;
                 elapsed += StdDuration::from_secs(interval);
             }
@@ -216,7 +227,10 @@ async fn exchange_authorization_code(
         ("client_id", CLIENT_ID),
         ("code", &authorization_code),
         ("code_verifier", &code_verifier),
-        ("redirect_uri", "https://auth.openai.com/deviceauth/callback"),
+        (
+            "redirect_uri",
+            "https://auth.openai.com/deviceauth/callback",
+        ),
     ];
 
     request_token(client, &form).await
@@ -292,10 +306,7 @@ async fn post_json<T: DeserializeOwned>(
         return Err(anyhow!("request failed ({status}): {body}"));
     }
 
-    response
-        .json()
-        .await
-        .context("failed to parse response")
+    response.json().await.context("failed to parse response")
 }
 
 #[derive(Debug, Deserialize)]

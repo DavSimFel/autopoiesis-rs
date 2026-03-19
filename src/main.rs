@@ -1,11 +1,9 @@
 //! Binary entrypoint for the `autopoiesis` CLI.
 
-use anyhow::{anyhow, Result};
-use clap::{Parser, Subcommand};
-use autopoiesis::{
-    agent, auth, config, llm, session, store, turn,
-};
+use anyhow::{Result, anyhow};
 use autopoiesis::server;
+use autopoiesis::{agent, auth, config, llm, session, store, turn};
+use clap::{Parser, Subcommand};
 use reqwest::Client;
 
 use std::io::{self, BufRead, Write};
@@ -59,7 +57,8 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                let tokens = auth::read_tokens().map_err(|error| anyhow!("failed to read auth file: {error}"))?;
+                let tokens = auth::read_tokens()
+                    .map_err(|error| anyhow!("failed to read auth file: {error}"))?;
                 println!("Logged in");
                 println!("Expires at: {}", tokens.expires_at);
             }
@@ -71,8 +70,9 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                std::fs::remove_file(&auth_path)
-                    .map_err(|error| anyhow!("failed to remove {}: {error}", auth_path.display()))?;
+                std::fs::remove_file(&auth_path).map_err(|error| {
+                    anyhow!("failed to remove {}: {error}", auth_path.display())
+                })?;
                 println!("Logged out from {}", auth_path.display());
             }
         },
