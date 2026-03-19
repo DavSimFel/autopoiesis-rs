@@ -1,8 +1,10 @@
 //! Agent orchestration loop coordinating model turns and tool execution.
 
+use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, from_str};
 
 use crate::guard::{Severity, Verdict};
@@ -11,6 +13,8 @@ use crate::session::Session;
 use crate::store::{QueuedMessage, Store};
 use crate::turn::Turn;
 use crate::util::utc_timestamp;
+
+const DEFAULT_OUTPUT_CAP_BYTES: usize = 4096;
 
 /// Receiver of streaming tokens emitted by the model during completion.
 pub trait TokenSink {
@@ -158,6 +162,31 @@ fn guard_message_output(turn: &Turn, message: &mut ChatMessage) {
     message
         .content
         .retain(|block| !matches!(block, MessageContent::Text { text } if text.is_empty()));
+}
+
+fn cap_tool_output(
+    sessions_dir: &Path,
+    call_id: &str,
+    output: String,
+    threshold: usize,
+) -> Result<String> {
+    let results_dir = sessions_dir.join("results");
+    fs::create_dir_all(&results_dir)
+        .with_context(|| format!("failed to create results directory {}", results_dir.display()))?;
+
+    let result_path = results_dir.join(format!("{call_id}.txt"));
+    fs::write(&result_path, &output)
+        .with_context(|| format!("failed to write tool output to {}", result_path.display()))?;
+
+    if output.len() <= threshold {
+        return Ok(output);
+    }
+
+    let line_count = output.lines().count();
+    let size_kb = output.len().div_ceil(1024);
+    Ok(format!(
+        "[output exceeded inline limit ({line_count} lines, {size_kb} KB) -> results/{call_id}.txt]\nTo read: cat results/{call_id}.txt\nTo read specific lines: sed -n '10,20p' results/{call_id}.txt"
+    ))
 }
 
 /// Run the agent loop until the model emits a non-tool stop reason.
@@ -316,6 +345,12 @@ where
                         Err(err) => format!(r#"{{"error": "{err}"}}"#),
                     };
                     let result = guard_text_output(turn, result);
+                    let result = cap_tool_output(
+                        session.sessions_dir(),
+                        &call.id,
+                        result,
+                        DEFAULT_OUTPUT_CAP_BYTES,
+                    )?;
 
                     session.append(ChatMessage::tool_result(&call.id, &call.name, result), None)?;
                     executed.push(call.clone());
@@ -594,6 +629,34 @@ mod tests {
         }
     }
 
+    struct StaticOutputTool {
+        name: &'static str,
+        output: String,
+    }
+
+    impl Tool for StaticOutputTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn definition(&self) -> FunctionTool {
+            FunctionTool {
+                name: self.name.to_string(),
+                description: "Return static output".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+            }
+        }
+
+        fn execute(&self, _arguments: &str) -> ToolFuture<'_> {
+            let output = self.output.clone();
+            Box::pin(async move { Ok(output) })
+        }
+    }
+
     fn temp_sessions_dir(prefix: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "aprs_agent_test_{prefix}_{}",
@@ -621,6 +684,13 @@ mod tests {
     fn message_text(message: &ChatMessage) -> Option<&str> {
         message.content.iter().find_map(|block| match block {
             MessageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    fn tool_result_text(message: &ChatMessage) -> Option<&str> {
+        message.content.iter().find_map(|block| match block {
+            MessageContent::ToolResult { result } => Some(result.content.as_str()),
             _ => None,
         })
     }
@@ -1005,6 +1075,169 @@ mod tests {
         let session_file = std::fs::read_to_string(session.today_path()).unwrap();
         assert!(!session_file.contains("sk-proj-abcdefghijklmnopqrstuvwxyz012345"));
         assert!(session_file.contains("[REDACTED]"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_output_below_threshold_is_inline_and_saved_to_file() {
+        let dir = temp_sessions_dir("tool_output_inline");
+        let call_id = "call-inline";
+        let output = "stdout:\nsmall output\nstderr:\n\nexit_code=0".to_string();
+        let provider = SequenceProvider::new(vec![
+            StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::ToolCall {
+                        call: ToolCall {
+                            id: call_id.to_string(),
+                            name: "static".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    }],
+                },
+                tool_calls: vec![ToolCall {
+                    id: call_id.to_string(),
+                    name: "static".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                meta: None,
+                stop_reason: StopReason::ToolCalls,
+            },
+            StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::text("done")],
+                },
+                tool_calls: vec![],
+                meta: None,
+                stop_reason: StopReason::Stop,
+            },
+        ]);
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let turn = Turn::new().tool(StaticOutputTool {
+            name: "static",
+            output: output.clone(),
+        });
+        let mut make_provider = move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "use the tool".to_string(),
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        let tool_message = session
+            .history()
+            .iter()
+            .find(|message| matches!(message.role, crate::llm::ChatRole::Tool))
+            .expect("tool result should be persisted");
+        assert_eq!(tool_result_text(tool_message), Some(output.as_str()));
+
+        let result_path = dir.join("results").join(format!("{call_id}.txt"));
+        assert!(result_path.exists(), "result file should be created");
+        assert_eq!(std::fs::read_to_string(result_path).unwrap(), output);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cap_tool_output_creates_results_directory() {
+        let dir = temp_sessions_dir("cap_tool_output_dir");
+        let output = "stdout:\nhello\nstderr:\n\nexit_code=0".to_string();
+
+        let capped = cap_tool_output(&dir, "call-dir", output.clone(), DEFAULT_OUTPUT_CAP_BYTES).unwrap();
+
+        assert_eq!(capped, output);
+        let result_path = dir.join("results").join("call-dir.txt");
+        assert!(result_path.exists(), "result file should be created");
+        assert_eq!(std::fs::read_to_string(result_path).unwrap(), output);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_output_above_threshold_is_capped_with_metadata_pointer() {
+        let dir = temp_sessions_dir("tool_output_capped");
+        let call_id = "call-capped";
+        let output = "line\n".repeat(2048);
+        let provider = SequenceProvider::new(vec![
+            StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::ToolCall {
+                        call: ToolCall {
+                            id: call_id.to_string(),
+                            name: "static".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    }],
+                },
+                tool_calls: vec![ToolCall {
+                    id: call_id.to_string(),
+                    name: "static".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                meta: None,
+                stop_reason: StopReason::ToolCalls,
+            },
+            StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::text("done")],
+                },
+                tool_calls: vec![],
+                meta: None,
+                stop_reason: StopReason::Stop,
+            },
+        ]);
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let turn = Turn::new().tool(StaticOutputTool {
+            name: "static",
+            output: output.clone(),
+        });
+        let mut make_provider = move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "use the tool".to_string(),
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        let tool_message = session
+            .history()
+            .iter()
+            .find(|message| matches!(message.role, crate::llm::ChatRole::Tool))
+            .expect("tool result should be persisted");
+        let tool_result = tool_result_text(tool_message).expect("tool result text should exist");
+        assert!(!tool_result.contains(&output));
+        assert!(tool_result.contains("[output exceeded inline limit (2048 lines, 10 KB) -> results/call-capped.txt]"));
+        assert!(tool_result.contains("To read: cat results/call-capped.txt"));
+        assert!(tool_result.contains("To read specific lines: sed -n '10,20p' results/call-capped.txt"));
+
+        let result_path = dir.join("results").join(format!("{call_id}.txt"));
+        assert!(result_path.exists(), "result file should be created");
+        assert_eq!(std::fs::read_to_string(result_path).unwrap(), output);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
