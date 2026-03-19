@@ -14,6 +14,7 @@ pub struct Identity {
     identity_dir: String,
     vars: HashMap<String, String>,
     fallback_prompt: String,
+    strict: bool,
 }
 
 impl Identity {
@@ -22,12 +23,32 @@ impl Identity {
             identity_dir: identity_dir.to_string(),
             vars,
             fallback_prompt: fallback.to_string(),
+            strict: false,
         }
     }
 
+    pub fn strict(mut self) -> Self {
+        self.strict = true;
+        self
+    }
+
     fn load_prompt(&self) -> String {
-        identity::load_system_prompt(&self.identity_dir, &self.vars)
-            .unwrap_or_else(|_| self.fallback_prompt.clone())
+        match identity::load_system_prompt(&self.identity_dir, &self.vars) {
+            Ok(prompt) => prompt,
+            Err(error) if self.strict => {
+                panic!(
+                    "failed to load identity prompt from {}: {error}",
+                    self.identity_dir
+                )
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: failed to load identity prompt from {}: {error}; using fallback prompt",
+                    self.identity_dir
+                );
+                self.fallback_prompt.clone()
+            }
+        }
     }
 }
 
@@ -51,10 +72,8 @@ impl ContextSource for Identity {
             return;
         }
 
-        let needs_edit = match &first.content[..] {
-            [MessageContent::Text { text }] if text == &rendered => false,
-            _ => true,
-        };
+        let needs_edit =
+            !matches!(&first.content[..], [MessageContent::Text { text }] if text == &rendered);
 
         if needs_edit {
             first.content.clear();
@@ -105,7 +124,7 @@ impl History {
 
 impl ContextSource for History {
     fn name(&self) -> &str {
-        "context"
+        "history"
     }
 
     fn assemble(&self, messages: &mut Vec<ChatMessage>) {
@@ -226,6 +245,14 @@ mod tests {
             _ => panic!("expected text"),
         };
         assert_eq!(content, "fallback prompt");
+    }
+
+    #[test]
+    #[should_panic(expected = "failed to load identity prompt")]
+    fn identity_strict_mode_panics_on_missing_dir() {
+        let source = Identity::new("/does/not/exist", HashMap::new(), "fallback prompt").strict();
+        let mut messages = vec![ChatMessage::system("old prompt")];
+        source.assemble(&mut messages);
     }
 
     #[test]

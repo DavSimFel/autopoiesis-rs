@@ -62,6 +62,10 @@ impl Turn {
         resolve_verdict(&self.guards, GuardEvent::ToolBatch(calls), false)
     }
 
+    pub fn check_text_delta(&self, text: &mut String) -> Verdict {
+        resolve_verdict(&self.guards, GuardEvent::TextDelta(text), false)
+    }
+
     pub async fn execute_tool(&self, name: &str, arguments: &str) -> Result<String> {
         let tool = self
             .tools
@@ -69,6 +73,12 @@ impl Turn {
             .find(|tool| tool.name() == name)
             .ok_or_else(|| anyhow!("tool '{name}' not found"))?;
         tool.execute(arguments).await
+    }
+}
+
+impl Default for Turn {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -111,9 +121,9 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|path| path.to_str().map(ToString::to_string))
-        .unwrap_or_else(String::new);
+        .unwrap_or_default();
     let tool = crate::tool::Shell::new();
-    let tools = vec![tool.definition()];
+    let tools = [tool.definition()];
     let tools_list = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>().join(",");
 
     let mut vars = HashMap::new();
@@ -122,8 +132,7 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
     vars.insert("tools".to_string(), tools_list);
 
     Turn::new()
-        .context(crate::context::Identity::new("identity", vars, &config.system_prompt))
-        .context(crate::context::History::new(100_000))
+        .context(crate::context::Identity::new("identity", vars, &config.system_prompt).strict())
         .tool(tool)
         .guard(crate::guard::SecretRedactor::new(&[
             r"sk-[a-zA-Z0-9_-]{20,}",

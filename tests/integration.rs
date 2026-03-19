@@ -116,7 +116,7 @@ async fn tool_call_roundtrip() -> Result<()> {
         .find(|call| call.name == "execute")
         .expect("expected execute tool call");
 
-    let output = shell_turn.execute_tool(&call.name, &call.arguments)?;
+    let output = shell_turn.execute_tool(&call.name, &call.arguments).await?;
     assert!(output.contains("hello123"));
     Ok(())
 }

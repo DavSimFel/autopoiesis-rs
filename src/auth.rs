@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use reqwest::{Client, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
@@ -230,15 +232,34 @@ fn token_is_near_expiry(expires_at: u64) -> Result<bool> {
 }
 
 fn save_tokens(tokens: &AuthTokens) -> Result<()> {
-    let path = token_file_path();
+    save_tokens_at_path(&token_file_path(), tokens)
+}
+
+fn save_tokens_at_path(path: &std::path::Path, tokens: &AuthTokens) -> Result<()> {
+    use std::io::Write as _;
+
+    let path = path.to_path_buf();
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("failed to create auth directory")?;
+        #[cfg(unix)]
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to set permissions on {}", parent.display()))?;
     }
 
     let serialized = serde_json::to_string(tokens).context("failed to serialize auth tokens")?;
-    std::fs::write(&path, serialized)
+    let mut file = std::fs::OpenOptions::new();
+    file.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    file.mode(0o600);
+    let mut file = file
+        .open(&path)
         .with_context(|| format!("failed to write {}", path.display()))?;
+    file.write_all(serialized.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to set permissions on {}", path.display()))?;
     Ok(())
 }
 
@@ -316,4 +337,54 @@ struct TokenExchangeResponse {
     refresh_token: String,
     id_token: String,
     expires_in: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_auth_path(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "autopoiesis_auth_test_{prefix}_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("auth.json")
+    }
+
+    #[test]
+    fn save_tokens_writes_json_payload() {
+        let path = temp_auth_path("write");
+        let tokens = AuthTokens {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            id_token: "id".to_string(),
+            expires_at: 123,
+        };
+
+        save_tokens_at_path(&path, &tokens).unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("\"access_token\":\"access\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_tokens_uses_private_file_permissions() {
+        let path = temp_auth_path("permissions");
+        let tokens = AuthTokens {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            id_token: "id".to_string(),
+            expires_at: 123,
+        };
+
+        save_tokens_at_path(&path, &tokens).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }

@@ -8,6 +8,7 @@ use serde_json::{from_str, Value};
 use crate::guard::{Severity, Verdict};
 use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall};
 use crate::session::Session;
+use crate::store::{QueuedMessage, Store};
 use crate::turn::Turn;
 use crate::util::utc_timestamp;
 
@@ -54,6 +55,12 @@ impl CliTokenSink {
     }
 }
 
+impl Default for CliTokenSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TokenSink for CliTokenSink {
     fn on_token(&mut self, token: String) {
         print!("{token}");
@@ -73,6 +80,12 @@ pub struct CliApprovalHandler;
 impl CliApprovalHandler {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for CliApprovalHandler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -103,6 +116,12 @@ pub enum TurnVerdict {
     Approved { tool_calls: Vec<ToolCall> },
 }
 
+pub enum QueueOutcome {
+    Agent(TurnVerdict),
+    Stored,
+    UnsupportedRole(String),
+}
+
 fn command_from_tool_call(call: &ToolCall) -> Option<String> {
     let value = from_str::<Value>(&call.arguments).ok()?;
     value.get("command").and_then(Value::as_str).map(ToString::to_string)
@@ -119,6 +138,25 @@ fn append_hard_deny(session: &mut Session, by: &str, reason: &str) -> Result<()>
     session.append(ChatMessage::system(format!("Tool execution hard-denied by {by}: {reason}")), None)
 }
 
+fn guard_text_output(turn: &Turn, text: String) -> String {
+    let mut text = text;
+    match turn.check_text_delta(&mut text) {
+        Verdict::Deny { .. } => String::new(),
+        Verdict::Allow | Verdict::Modify | Verdict::Approve { .. } => text,
+    }
+}
+
+fn guard_message_output(turn: &Turn, message: &mut ChatMessage) {
+    for block in &mut message.content {
+        if let MessageContent::Text { text } = block {
+            *text = guard_text_output(turn, std::mem::take(text));
+        }
+    }
+    message
+        .content
+        .retain(|block| !matches!(block, MessageContent::Text { text } if text.is_empty()));
+}
+
 /// Run the agent loop until the model emits a non-tool stop reason.
 pub async fn run_agent_loop<F, Fut, P, TS, AH>(
     make_provider: &mut F,
@@ -132,8 +170,8 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<P>>,
     P: LlmProvider,
-    TS: TokenSink + Send,
-    AH: ApprovalHandler,
+    TS: TokenSink + Send + ?Sized,
+    AH: ApprovalHandler + ?Sized,
 {
     let user_prompt = format!("[{}] {}", utc_timestamp(), user_prompt);
     let tools = turn.tool_definitions();
@@ -146,7 +184,6 @@ where
     'agent_turn: loop {
         session.ensure_context_within_limit();
         let mut messages = session.history().to_vec();
-        let user_message_index = messages.len();
         if !persisted_user_message {
             messages.push(user_message.clone());
         }
@@ -154,7 +191,9 @@ where
         let verdict = turn.check_inbound(&mut messages);
         if !persisted_user_message {
             let user_message = messages
-                .get(user_message_index)
+                .iter()
+                .rev()
+                .find(|message| message.role == crate::llm::ChatRole::User)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("missing user message after inbound checks"))?;
             session.append(user_message, None)?;
@@ -201,9 +240,17 @@ where
         }
 
         let provider = make_provider().await?;
-        let turn_reply = provider
-            .stream_completion(&messages, &tools, &mut |token| token_sink.on_token(token))
+        let mut streamed_output = String::new();
+        let mut turn_reply = provider
+            .stream_completion(&messages, &tools, &mut |token| streamed_output.push_str(&token))
             .await?;
+        if !streamed_output.is_empty() {
+            let redacted_output = guard_text_output(turn, streamed_output);
+            if !redacted_output.is_empty() {
+                token_sink.on_token(redacted_output);
+            }
+        }
+        guard_message_output(turn, &mut turn_reply.assistant_message);
         let turn_meta = turn_reply.meta;
 
         match turn_reply.stop_reason {
@@ -265,6 +312,7 @@ where
                         Ok(output) => output,
                         Err(err) => format!(r#"{{"error": "{err}"}}"#),
                     };
+                    let result = guard_text_output(turn, result);
 
                     session.append(ChatMessage::tool_result(&call.id, &call.name, result), None)?;
                     executed.push(call.clone());
@@ -283,15 +331,117 @@ where
     }
 }
 
+pub async fn process_message<F, Fut, P, TS, AH>(
+    message: &QueuedMessage,
+    session: &mut Session,
+    turn: &Turn,
+    make_provider: &mut F,
+    token_sink: &mut TS,
+    approval_handler: &mut AH,
+) -> Result<QueueOutcome>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<P>>,
+    P: LlmProvider,
+    TS: TokenSink + Send + ?Sized,
+    AH: ApprovalHandler + ?Sized,
+{
+    match message.role.as_str() {
+        "user" => Ok(QueueOutcome::Agent(
+            run_agent_loop(
+                make_provider,
+                session,
+                message.content.clone(),
+                turn,
+                token_sink,
+                approval_handler,
+            )
+            .await?,
+        )),
+        "system" => {
+            session.append(ChatMessage::system(message.content.clone()), None)?;
+            Ok(QueueOutcome::Stored)
+        }
+        "assistant" => {
+            session.append(
+                ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::text(message.content.clone())],
+                },
+                None,
+            )?;
+            Ok(QueueOutcome::Stored)
+        }
+        other => Ok(QueueOutcome::UnsupportedRole(other.to_string())),
+    }
+}
+
+pub async fn drain_queue<F, Fut, P>(
+    store: &mut Store,
+    session_id: &str,
+    session: &mut Session,
+    turn: &Turn,
+    make_provider: &mut F,
+    token_sink: &mut (dyn TokenSink + Send),
+    approval_handler: &mut (dyn ApprovalHandler + Send),
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<P>>,
+    P: LlmProvider,
+{
+    while let Some(message) = store.dequeue_next_message(session_id)? {
+        let outcome = process_message(
+            &message,
+            session,
+            turn,
+            make_provider,
+            token_sink,
+            approval_handler,
+        )
+        .await;
+
+        match outcome {
+            Ok(QueueOutcome::Agent(verdict)) => {
+                store.mark_processed(message.id)?;
+                match verdict {
+                    TurnVerdict::Executed(_) => {}
+                    TurnVerdict::Approved { .. } => {
+                        eprintln!("Command approved by user and executed.");
+                    }
+                    TurnVerdict::Denied { reason, gate_id } => {
+                        eprintln!("Command hard-denied by {gate_id}: {reason}");
+                    }
+                }
+            }
+            Ok(QueueOutcome::Stored) => {
+                store.mark_processed(message.id)?;
+            }
+            Ok(QueueOutcome::UnsupportedRole(role)) => {
+                eprintln!("unsupported queued role '{role}' for message {}", message.id);
+                store.mark_processed(message.id)?;
+            }
+            Err(error) => {
+                store.mark_failed(message.id)?;
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::context::History;
     use crate::guard::SecretRedactor;
     use crate::llm::{FunctionTool, StreamedTurn};
-    use crate::tool::Shell;
+    use crate::store::Store;
+    use crate::tool::{Shell, Tool, ToolFuture};
     use crate::turn::Turn;
 
     #[derive(Clone)]
@@ -332,6 +482,108 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct StreamingProvider {
+        streamed_tokens: Vec<String>,
+        turn: StreamedTurn,
+    }
+
+    impl crate::llm::LlmProvider for StreamingProvider {
+        async fn stream_completion(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[FunctionTool],
+            on_token: &mut (dyn FnMut(String) + Send),
+        ) -> Result<StreamedTurn> {
+            for token in &self.streamed_tokens {
+                on_token(token.clone());
+            }
+            Ok(self.turn.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SequenceProvider {
+        turns: std::sync::Arc<std::sync::Mutex<Vec<StreamedTurn>>>,
+    }
+
+    impl SequenceProvider {
+        fn new(turns: Vec<StreamedTurn>) -> Self {
+            Self {
+                turns: std::sync::Arc::new(std::sync::Mutex::new(turns.into_iter().rev().collect())),
+            }
+        }
+    }
+
+    impl crate::llm::LlmProvider for SequenceProvider {
+        async fn stream_completion(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[FunctionTool],
+            _on_token: &mut (dyn FnMut(String) + Send),
+        ) -> Result<StreamedTurn> {
+            self.turns
+                .lock()
+                .expect("sequence provider mutex poisoned")
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("no more turns"))
+        }
+    }
+
+    #[derive(Clone)]
+    struct StaticProvider {
+        turn: StreamedTurn,
+    }
+
+    impl crate::llm::LlmProvider for StaticProvider {
+        async fn stream_completion(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[FunctionTool],
+            _on_token: &mut (dyn FnMut(String) + Send),
+        ) -> Result<StreamedTurn> {
+            Ok(self.turn.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingProvider;
+
+    impl crate::llm::LlmProvider for FailingProvider {
+        async fn stream_completion(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[FunctionTool],
+            _on_token: &mut (dyn FnMut(String) + Send),
+        ) -> Result<StreamedTurn> {
+            Err(anyhow::anyhow!("provider failure"))
+        }
+    }
+
+    struct LeakyTool;
+
+    impl Tool for LeakyTool {
+        fn name(&self) -> &str {
+            "leak"
+        }
+
+        fn definition(&self) -> FunctionTool {
+            FunctionTool {
+                name: "leak".to_string(),
+                description: "Return a secret".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+            }
+        }
+
+        fn execute(&self, _arguments: &str) -> ToolFuture<'_> {
+            Box::pin(async { Ok("stdout:\nsk-proj-abcdefghijklmnopqrstuvwxyz012345".to_string()) })
+        }
+    }
+
     fn temp_sessions_dir(prefix: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "aprs_agent_test_{prefix}_{}",
@@ -342,6 +594,154 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn temp_queue_root(prefix: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "aprs_agent_queue_test_{prefix}_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn message_text(message: &ChatMessage) -> Option<&str> {
+        message.content.iter().find_map(|block| match block {
+            MessageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn drain_queue_processes_user_system_and_unknown_roles() {
+        let root = temp_queue_root("mixed_roles");
+        let queue_path = root.join("queue.sqlite");
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "worker";
+        let mut store = Store::new(&queue_path).unwrap();
+        store.create_session(session_id, None).unwrap();
+        let user_id = store.enqueue_message(session_id, "user", "hello", "cli").unwrap();
+        let system_id = store
+            .enqueue_message(session_id, "system", "operational note", "cli")
+            .unwrap();
+        let unknown_id = store
+            .enqueue_message(session_id, "tool", "orphan tool result", "cli")
+            .unwrap();
+
+        let mut session = Session::new(&sessions_dir).unwrap();
+        let turn = Turn::new();
+        let provider_calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let provider_calls_seen = provider_calls.clone();
+        let mut provider_factory = move || {
+            let provider_calls_seen = provider_calls_seen.clone();
+            async move {
+                *provider_calls_seen
+                    .lock()
+                    .expect("provider call counter mutex poisoned") += 1;
+                Ok::<_, anyhow::Error>(StaticProvider {
+                    turn: StreamedTurn {
+                        assistant_message: ChatMessage {
+                            role: crate::llm::ChatRole::Assistant,
+                            content: vec![MessageContent::text("ok")],
+                        },
+                        tool_calls: vec![],
+                        meta: None,
+                        stop_reason: StopReason::Stop,
+                    },
+                })
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        drain_queue(
+            &mut store,
+            session_id,
+            &mut session,
+            &turn,
+            &mut provider_factory,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *provider_calls.lock().expect("provider call counter mutex poisoned"),
+            1
+        );
+        assert!(session.history().iter().any(|message| {
+            matches!(message.role, crate::llm::ChatRole::System)
+                && message_text(message) == Some("operational note")
+        }));
+        assert!(!session.history().iter().any(|message| {
+            message_text(message) == Some("orphan tool result")
+        }));
+
+        let conn = Connection::open(&queue_path).unwrap();
+        for message_id in [user_id, system_id, unknown_id] {
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM messages WHERE id = ?1",
+                    [message_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "processed");
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_queue_marks_failed_when_agent_loop_errors() {
+        let root = temp_queue_root("failed_marking");
+        let queue_path = root.join("queue.sqlite");
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "worker";
+        let mut store = Store::new(&queue_path).unwrap();
+        store.create_session(session_id, None).unwrap();
+        let message_id = store
+            .enqueue_message(session_id, "user", "run something", "cli")
+            .unwrap();
+
+        let mut session = Session::new(&sessions_dir).unwrap();
+        let turn = Turn::new();
+        let mut provider_factory = || async { Ok::<_, anyhow::Error>(FailingProvider) };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        let result = drain_queue(
+            &mut store,
+            session_id,
+            &mut session,
+            &turn,
+            &mut provider_factory,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await;
+
+        assert!(result.is_err());
+
+        let conn = Connection::open(&queue_path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM messages WHERE id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]
@@ -412,6 +812,169 @@ mod tests {
             &mut make_provider,
             &mut session,
             "please store sk-proj-abcdefghijklmnopqrstuvwxyz012345".to_string(),
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        let session_file = std::fs::read_to_string(session.today_path()).unwrap();
+        assert!(!session_file.contains("sk-proj-abcdefghijklmnopqrstuvwxyz012345"));
+        assert!(session_file.contains("[REDACTED]"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_insertion_does_not_replace_persisted_user_message() {
+        let dir = temp_sessions_dir("persist_user_with_context");
+        let identity_dir = dir.join("identity");
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        std::fs::write(identity_dir.join("constitution.md"), "constitution").unwrap();
+        std::fs::write(identity_dir.join("identity.md"), "identity").unwrap();
+        std::fs::write(identity_dir.join("context.md"), "context").unwrap();
+
+        let (provider, _observed_message_counts) = InspectingProvider::new();
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let turn = Turn::new().context(crate::context::Identity::new(
+            identity_dir.to_str().unwrap(),
+            std::collections::HashMap::new(),
+            "fallback",
+        ));
+        let mut make_provider = {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "store this user prompt".to_string(),
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        let first = session.history().first().expect("user message should be persisted");
+        assert!(matches!(first.role, crate::llm::ChatRole::User));
+        let content = match &first.content[0] {
+            MessageContent::Text { text } => text,
+            _ => panic!("expected text content"),
+        };
+        assert!(content.contains("store this user prompt"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbound_redaction_is_streamed_and_persisted_before_session_write() {
+        let dir = temp_sessions_dir("outbound_redaction");
+        let provider = StreamingProvider {
+            streamed_tokens: vec!["sk-proj-abcdefghijklmnopqrstuvwxyz012345".to_string()],
+            turn: StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::text(
+                        "sk-proj-abcdefghijklmnopqrstuvwxyz012345",
+                    )],
+                },
+                tool_calls: vec![],
+                meta: None,
+                stop_reason: StopReason::Stop,
+            },
+        };
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let turn = Turn::new().guard(SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"]));
+        let mut make_provider = move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        };
+        let streamed = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let streamed_tokens = streamed.clone();
+        let mut token_sink = move |token: String| {
+            streamed_tokens
+                .lock()
+                .expect("streamed token mutex poisoned")
+                .push_str(&token);
+        };
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "reply with the secret".to_string(),
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        let streamed = streamed.lock().expect("streamed token mutex poisoned");
+        assert_eq!(streamed.as_str(), "[REDACTED]");
+        let session_file = std::fs::read_to_string(session.today_path()).unwrap();
+        assert!(!session_file.contains("sk-proj-abcdefghijklmnopqrstuvwxyz012345"));
+        assert!(session_file.contains("[REDACTED]"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_output_is_redacted_before_persist() {
+        let dir = temp_sessions_dir("tool_redaction");
+        let provider = SequenceProvider::new(vec![
+            StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::ToolCall {
+                        call: ToolCall {
+                            id: "call-1".to_string(),
+                            name: "leak".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    }],
+                },
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "leak".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                meta: None,
+                stop_reason: StopReason::ToolCalls,
+            },
+            StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::text("done")],
+                },
+                tool_calls: vec![],
+                meta: None,
+                stop_reason: StopReason::Stop,
+            },
+        ]);
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let turn = Turn::new()
+            .tool(LeakyTool)
+            .guard(SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"]));
+        let mut make_provider = move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "use the tool".to_string(),
             &turn,
             &mut token_sink,
             &mut approval_handler,

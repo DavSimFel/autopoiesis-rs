@@ -63,11 +63,27 @@ impl OpenAIProvider {
         for msg in messages {
             match msg.role {
                 ChatRole::System => {
-                    // Keep only the latest system instruction message.
-                    for block in &msg.content {
-                        if let MessageContent::Text { text } = block {
-                            instructions = Some(text.clone());
+                    let text_blocks = msg
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            MessageContent::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+
+                    if instructions.is_none() {
+                        if !text_blocks.is_empty() {
+                            instructions = Some(text_blocks.join("\n"));
                         }
+                        continue;
+                    }
+
+                    for text in text_blocks {
+                        input.push(json!({
+                            "role": "system",
+                            "content": text
+                        }));
                     }
                 }
                 ChatRole::User => {
@@ -150,9 +166,9 @@ enum SseEvent {
         arguments: Option<String>,
     },
     FunctionCallOutputItemDone {
-        call_id: String,
-        name: String,
-        arguments: String,
+        call_id: Option<String>,
+        name: Option<String>,
+        arguments: Option<String>,
     },
     Completed {
         meta: Option<TurnMeta>,
@@ -169,10 +185,7 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
         return Some(SseEvent::Done);
     }
 
-    let data = match line.strip_prefix("data: ") {
-        Some(data) => data,
-        None => return None,
-    };
+    let data = line.strip_prefix("data: ")?;
 
     let event: Value = serde_json::from_str(data).ok()?;
     let event_type = event.get("type").and_then(|value| value.as_str())?;
@@ -222,32 +235,29 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
                     .get("call_id")
                     .or_else(|| item.get("id"))
                     .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string(),
+                    .map(ToString::to_string),
                 name: item
                     .get("name")
                     .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string(),
+                    .map(ToString::to_string),
                 arguments: item
                     .get("arguments")
                     .and_then(Value::as_str)
-                    .unwrap_or("{}")
-                    .to_string(),
+                    .map(ToString::to_string),
             })
         }
         "response.completed" => {
             let response = event.get("response").unwrap_or(&event);
             let usage = response.get("usage").or_else(|| event.get("usage"));
 
-            let mut meta = TurnMeta::default();
-            meta.model = response.get("model").and_then(Value::as_str).map(ToString::to_string);
-
-            if let Some(usage) = usage {
-                meta.input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
-                meta.output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
-                meta.reasoning_tokens = usage.get("reasoning_tokens").and_then(Value::as_u64);
-            }
+            let meta = TurnMeta {
+                model: response.get("model").and_then(Value::as_str).map(ToString::to_string),
+                input_tokens: usage.and_then(|usage| usage.get("input_tokens").and_then(Value::as_u64)),
+                output_tokens: usage.and_then(|usage| usage.get("output_tokens").and_then(Value::as_u64)),
+                reasoning_tokens: usage
+                    .and_then(|usage| usage.get("reasoning_tokens").and_then(Value::as_u64)),
+                reasoning_trace: None,
+            };
 
             let has_meta = meta.model.is_some()
                 || meta.input_tokens.is_some()
@@ -276,6 +286,246 @@ fn upsert_tool_call(
     }
 }
 
+fn finalize_function_call(
+    pending_calls: &mut HashMap<String, (Option<String>, String)>,
+    tool_calls: &mut Vec<(String, String, String)>,
+    current_call_id: &Option<String>,
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: Option<String>,
+) {
+    let call_id = match call_id.or_else(|| current_call_id.clone()) {
+        Some(id) => id,
+        None => return,
+    };
+    let mut entry = pending_calls
+        .remove(&call_id)
+        .unwrap_or((None, String::new()));
+    if let Some(tool_name) = name {
+        entry.0 = Some(tool_name);
+    }
+    let Some(tool_name) = entry.0 else {
+        return;
+    };
+    let arguments = arguments.unwrap_or(entry.1);
+
+    upsert_tool_call(tool_calls, call_id, tool_name, arguments);
+}
+
+fn finalize_output_item(
+    pending_calls: &mut HashMap<String, (Option<String>, String)>,
+    tool_calls: &mut Vec<(String, String, String)>,
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: Option<String>,
+) {
+    let Some(call_id) = call_id else {
+        return;
+    };
+    let mut entry = pending_calls
+        .remove(&call_id)
+        .unwrap_or((None, String::new()));
+    if let Some(tool_name) = name {
+        entry.0 = Some(tool_name);
+    }
+    let Some(tool_name) = entry.0 else {
+        return;
+    };
+    let arguments = arguments.unwrap_or(entry.1);
+
+    upsert_tool_call(tool_calls, call_id, tool_name, arguments);
+}
+
+impl LlmProvider for OpenAIProvider {
+    /// Stream a completion and parse SSE events from the OpenAI Responses API.
+    ///
+    /// The parser understands the minimal event set needed by the current agent:
+    /// - partial assistant output
+    /// - tool call argument streaming and completion
+    /// - final completion signal
+    async fn stream_completion(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[FunctionTool],
+        on_token: &mut (dyn FnMut(String) + Send),
+    ) -> Result<StreamedTurn> {
+        let (instructions, input) = Self::build_input(messages);
+        let tools_json = Self::build_tools(tools);
+
+        let mut request = json!({
+            "model": self.model,
+            "input": input,
+            "stream": true,
+            "store": false,
+        });
+
+        if let Some(ref instructions) = instructions {
+            request["instructions"] = json!(instructions);
+        }
+
+        if !tools_json.is_empty() {
+            request["tools"] = json!(tools_json);
+        }
+
+        if let Some(ref effort) = self.reasoning_effort {
+            request["reasoning"] = json!({"effort": effort});
+        }
+
+        let response = self
+            .client
+            .post(&self.base_url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&request)
+            .send()
+            .await
+            .context("failed to send request to OpenAI")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| String::from("<failed to read response body>"));
+            anyhow::bail!("API error {status}: {body}");
+        }
+
+        let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+        let mut pending_calls: HashMap<String, (Option<String>, String)> = HashMap::new();
+        let mut current_call_id: Option<String> = None;
+        let mut stop_reason = StopReason::Stop;
+        let mut completion_meta = None;
+        let mut assistant_content = String::new();
+        let mut stream_buffer = String::new();
+        let mut done = false;
+
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("failed to read streamed completion response chunk")?;
+            let chunk = String::from_utf8_lossy(&chunk);
+            stream_buffer.push_str(&chunk);
+
+            while let Some(line_end) = stream_buffer.find('\n') {
+                let raw_line = stream_buffer[..line_end].to_string();
+                stream_buffer.drain(..line_end + 1);
+                match parse_sse_line(&raw_line) {
+                    Some(SseEvent::TextDelta(delta)) => {
+                        assistant_content.push_str(&delta);
+                        on_token(delta);
+                    }
+                    Some(SseEvent::FunctionCallArgumentsDelta { call_id, name, delta }) => {
+                        let call_id = match call_id {
+                            Some(id) => {
+                                current_call_id = Some(id.clone());
+                                id
+                            }
+                            None => match current_call_id.clone() {
+                                Some(id) => id,
+                                None => continue,
+                            },
+                        };
+
+                        let entry = pending_calls.entry(call_id).or_insert((None, String::new()));
+                        if let Some(tool_name) = name {
+                            entry.0 = Some(tool_name);
+                        }
+
+                        if let Some(delta) = delta {
+                            entry.1.push_str(&delta);
+                        }
+                    }
+                    Some(SseEvent::FunctionCallArgumentsDone { call_id, name, arguments }) => {
+                        let previous_len = tool_calls.len();
+                        finalize_function_call(
+                            &mut pending_calls,
+                            &mut tool_calls,
+                            &current_call_id,
+                            call_id,
+                            name,
+                            arguments,
+                        );
+                        if tool_calls.len() != previous_len {
+                            stop_reason = StopReason::ToolCalls;
+                        }
+                    }
+                    Some(SseEvent::FunctionCallOutputItemDone { call_id, name, arguments }) => {
+                        let previous_len = tool_calls.len();
+                        finalize_output_item(
+                            &mut pending_calls,
+                            &mut tool_calls,
+                            call_id,
+                            name,
+                            arguments,
+                        );
+                        if tool_calls.len() != previous_len {
+                            stop_reason = StopReason::ToolCalls;
+                        }
+                    }
+                    Some(SseEvent::Completed { meta }) => {
+                        if let Some(meta) = meta {
+                            completion_meta = Some(meta);
+                        }
+
+                        if tool_calls.is_empty() {
+                            stop_reason = StopReason::Stop;
+                        }
+                    }
+                    Some(SseEvent::Done) => {
+                        done = true;
+                        break;
+                    }
+                    None => {}
+                }
+            }
+
+            if done {
+                break;
+            }
+        }
+
+        if !stream_buffer.is_empty()
+            && let Some(event) = parse_sse_line(stream_buffer.trim_end())
+        {
+            match event {
+                SseEvent::TextDelta(delta) => {
+                    assistant_content.push_str(&delta);
+                    on_token(delta);
+                }
+                SseEvent::FunctionCallArgumentsDelta { .. }
+                | SseEvent::FunctionCallArgumentsDone { .. }
+                | SseEvent::FunctionCallOutputItemDone { .. }
+                | SseEvent::Completed { .. }
+                | SseEvent::Done => {}
+            }
+        }
+
+        let tool_calls: Vec<ToolCall> = tool_calls
+            .into_iter()
+            .map(|(id, name, arguments)| ToolCall {
+                id,
+                name,
+                arguments,
+            })
+            .collect();
+
+        let mut assistant_msg = ChatMessage::with_role(ChatRole::Assistant);
+        if !assistant_content.is_empty() {
+            assistant_msg.content.push(MessageContent::Text {
+                text: assistant_content,
+            });
+        }
+        for tc in &tool_calls {
+            assistant_msg.content.push(MessageContent::ToolCall { call: tc.clone() });
+        }
+
+        Ok(StreamedTurn {
+            assistant_message: assistant_msg,
+            tool_calls,
+            meta: completion_meta,
+            stop_reason,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,12 +540,7 @@ mod tests {
             let chunk = std::str::from_utf8(chunk).expect("mock SSE chunks should be valid utf-8");
             buffer.push_str(chunk);
 
-            loop {
-                let line_end = match buffer.find('\n') {
-                    Some(index) => index,
-                    None => break,
-                };
-
+            while let Some(line_end) = buffer.find('\n') {
                 let line = buffer[..line_end].to_string();
                 buffer.drain(..line_end + 1);
 
@@ -346,29 +591,18 @@ mod tests {
                     }
                 }
                 SseEvent::FunctionCallArgumentsDone { call_id, name, arguments } => {
-                    let call_id = match call_id.or_else(|| current_call_id.clone()) {
-                        Some(id) => id,
-                        None => continue,
-                    };
-                    let mut entry = pending_calls.remove(&call_id).unwrap_or((None, String::new()));
-                    if let Some(tool_name) = name {
-                        entry.0 = Some(tool_name);
-                    }
-                    let Some(tool_name) = entry.0 else {
-                        continue;
-                    };
-                    let arguments = arguments.unwrap_or(entry.1);
-
-                    upsert_tool_call(&mut tool_calls, call_id, tool_name, arguments);
+                    finalize_function_call(
+                        &mut pending_calls,
+                        &mut tool_calls,
+                        &current_call_id,
+                        call_id,
+                        name,
+                        arguments,
+                    );
                 }
                 SseEvent::FunctionCallOutputItemDone { call_id, name, arguments } => {
-                    let mut arguments = arguments;
-                    if let Some((_, pending_args)) = pending_calls.remove(&call_id) {
-                        if arguments.is_empty() {
-                            arguments = pending_args;
-                        }
-                    }
-                    upsert_tool_call(
+                    finalize_output_item(
+                        &mut pending_calls,
                         &mut tool_calls,
                         call_id,
                         name,
@@ -420,6 +654,32 @@ mod tests {
     #[test]
     fn function_call_without_identifiable_id_is_dropped() {
         let events = vec![SseEvent::FunctionCallArgumentsDone {
+            call_id: None,
+            name: Some("shell".to_string()),
+            arguments: Some("{\"command\":\"ls\"}".to_string()),
+        }];
+
+        let calls = collect_tool_calls_from_events(events);
+
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn function_call_without_identifiable_name_is_dropped() {
+        let events = vec![SseEvent::FunctionCallArgumentsDone {
+            call_id: Some("call_1".to_string()),
+            name: None,
+            arguments: Some("{\"command\":\"ls\"}".to_string()),
+        }];
+
+        let calls = collect_tool_calls_from_events(events);
+
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn output_item_without_identifiable_id_is_dropped() {
+        let events = vec![SseEvent::FunctionCallOutputItemDone {
             call_id: None,
             name: Some("shell".to_string()),
             arguments: Some("{\"command\":\"ls\"}".to_string()),
@@ -542,6 +802,23 @@ mod tests {
     }
 
     #[test]
+    fn build_input_preserves_first_system_message_and_replays_later_system_messages() {
+        let messages = vec![
+            ChatMessage::system("Primary system instructions"),
+            ChatMessage::user("Hello"),
+            ChatMessage::system("Tool execution rejected by user"),
+        ];
+        let (instructions, input) = OpenAIProvider::build_input(&messages);
+
+        assert_eq!(instructions, Some("Primary system instructions".to_string()));
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "Hello");
+        assert_eq!(input[1]["role"], "system");
+        assert_eq!(input[1]["content"], "Tool execution rejected by user");
+    }
+
+    #[test]
     fn build_input_converts_tool_calls_to_function_call_with_call_id() {
         let messages = vec![ChatMessage {
             role: ChatRole::Assistant,
@@ -628,198 +905,5 @@ mod tests {
         assert_eq!(input[2]["type"], "function_call_output");
         assert_eq!(input[2]["call_id"], "call-1");
         assert_eq!(input[2]["output"], "{\"stdout\":\"ok\"}");
-    }
-}
-
-impl LlmProvider for OpenAIProvider {
-    /// Stream a completion and parse SSE events from the OpenAI Responses API.
-    ///
-    /// The parser understands the minimal event set needed by the current agent:
-    /// - partial assistant output
-    /// - tool call argument streaming and completion
-    /// - final completion signal
-    async fn stream_completion(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[FunctionTool],
-        on_token: &mut (dyn FnMut(String) + Send),
-    ) -> Result<StreamedTurn> {
-        let (instructions, input) = Self::build_input(messages);
-        let tools_json = Self::build_tools(tools);
-
-        let mut request = json!({
-            "model": self.model,
-            "input": input,
-            "stream": true,
-            "store": false,
-        });
-
-        if let Some(ref instructions) = instructions {
-            request["instructions"] = json!(instructions);
-        }
-
-        if !tools_json.is_empty() {
-            request["tools"] = json!(tools_json);
-        }
-
-        if let Some(ref effort) = self.reasoning_effort {
-            request["reasoning"] = json!({"effort": effort});
-        }
-
-        let response = self
-            .client
-            .post(&self.base_url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&request)
-            .send()
-            .await
-            .context("failed to send request to OpenAI")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| String::from("<failed to read response body>"));
-            anyhow::bail!("API error {status}: {body}");
-        }
-
-        // Track tool calls as they arrive in stream order.
-        let mut tool_calls: Vec<(String, String, String)> = Vec::new();
-        let mut pending_calls: HashMap<String, (Option<String>, String)> = HashMap::new();
-        let mut current_call_id: Option<String> = None;
-        let mut stop_reason = StopReason::Stop;
-        let mut completion_meta = None;
-        let mut assistant_content = String::new();
-        let mut stream_buffer = String::new();
-        let mut done = false;
-
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("failed to read streamed completion response chunk")?;
-            let chunk = String::from_utf8_lossy(&chunk);
-            stream_buffer.push_str(&chunk);
-
-            while let Some(line_end) = stream_buffer.find('\n') {
-                let raw_line = stream_buffer[..line_end].to_string();
-                stream_buffer.drain(..line_end + 1);
-                match parse_sse_line(&raw_line) {
-                    Some(SseEvent::TextDelta(delta)) => {
-                        assistant_content.push_str(&delta);
-                        on_token(delta);
-                    }
-                    Some(SseEvent::FunctionCallArgumentsDelta { call_id, name, delta }) => {
-                        let call_id = match call_id {
-                            Some(id) => {
-                                current_call_id = Some(id.clone());
-                                id
-                            }
-                            None => match current_call_id.clone() {
-                                Some(id) => id,
-                                None => continue,
-                            },
-                        };
-
-                        let entry =
-                            pending_calls.entry(call_id).or_insert((None, String::new()));
-                        if let Some(tool_name) = name {
-                            entry.0 = Some(tool_name);
-                        }
-
-                        if let Some(delta) = delta {
-                            entry.1.push_str(&delta);
-                        }
-                    }
-                    Some(SseEvent::FunctionCallArgumentsDone { call_id, name, arguments }) => {
-                        let call_id = match call_id.or_else(|| current_call_id.clone()) {
-                            Some(id) => id,
-                            None => continue, // skip unidentifiable calls
-                        };
-                        let mut entry = pending_calls.remove(&call_id).unwrap_or((None, String::new()));
-                        if let Some(tool_name) = name {
-                            entry.0 = Some(tool_name);
-                        }
-                        let name = entry.0.unwrap_or_else(|| "unknown".to_string());
-                        let arguments = arguments.unwrap_or(entry.1);
-
-                        upsert_tool_call(&mut tool_calls, call_id, name, arguments);
-                        stop_reason = StopReason::ToolCalls;
-                    }
-                    Some(SseEvent::FunctionCallOutputItemDone { call_id, name, arguments }) => {
-                        let mut arguments = arguments;
-                        if let Some((_, pending_args)) = pending_calls.remove(&call_id) {
-                            if arguments.is_empty() {
-                                arguments = pending_args;
-                            }
-                        }
-                        upsert_tool_call(&mut tool_calls, call_id, name, arguments);
-                        stop_reason = StopReason::ToolCalls;
-                    }
-                    Some(SseEvent::Completed { meta }) => {
-                        if let Some(meta) = meta {
-                            completion_meta = Some(meta);
-                        }
-
-                        if tool_calls.is_empty() {
-                            stop_reason = StopReason::Stop;
-                        }
-                    }
-                    Some(SseEvent::Done) => {
-                        done = true;
-                        break;
-                    }
-                    None => {}
-                }
-            }
-
-            if done {
-                break;
-            }
-        }
-
-        if !stream_buffer.is_empty()
-            && let Some(event) = parse_sse_line(stream_buffer.trim_end()) {
-            match event {
-                SseEvent::TextDelta(delta) => {
-                    assistant_content.push_str(&delta);
-                    on_token(delta);
-                }
-                SseEvent::FunctionCallArgumentsDelta { .. }
-                | SseEvent::FunctionCallArgumentsDone { .. }
-                | SseEvent::FunctionCallOutputItemDone { .. }
-                | SseEvent::Completed { .. }
-                | SseEvent::Done => {}
-            }
-        }
-
-        // Build tool calls from pending events.
-        let tool_calls: Vec<ToolCall> = tool_calls
-            .into_iter()
-            .map(|(id, name, arguments)| ToolCall {
-                id,
-                name,
-                arguments,
-            })
-            .collect();
-
-        // Build assistant message for session history.
-        let mut assistant_msg = ChatMessage::with_role(ChatRole::Assistant);
-        if !assistant_content.is_empty() {
-            assistant_msg
-                .content
-                .push(MessageContent::Text { text: assistant_content });
-        }
-        for tc in &tool_calls {
-            assistant_msg.content.push(MessageContent::ToolCall {
-                call: tc.clone(),
-            });
-        }
-
-        Ok(StreamedTurn {
-            assistant_message: assistant_msg,
-            tool_calls,
-            meta: completion_meta,
-            stop_reason,
-        })
     }
 }
