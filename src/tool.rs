@@ -152,7 +152,11 @@ impl Tool for Shell {
                 result.push_str(&stderr);
             }
             result.push_str("\nexit_code=");
-            result.push_str(&output.status.code().unwrap_or(-1).to_string());
+            let exit_code = match output.status.code() {
+                Some(code) => code.to_string(),
+                None => "signal".to_string(),
+            };
+            result.push_str(&exit_code);
 
             Ok(result)
         })

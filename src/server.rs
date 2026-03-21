@@ -243,7 +243,9 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
 
     {
         let mut store = state.store.lock().await;
-        let _ = store.create_session(&session_id, None);
+        if let Err(error) = store.create_session(&session_id, None) {
+            eprintln!("failed to create session {session_id}: {error}");
+        }
     }
 
     let turn = turn::build_default_turn(&state.config);
