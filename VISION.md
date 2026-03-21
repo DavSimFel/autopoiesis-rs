@@ -18,6 +18,24 @@ A lightweight agent runtime. One binary. One tool (shell). Messages in, actions 
 - **Positional** — content is placed in the history timeline by `max(activated, updated)` timestamp
 - **Reactive** — when a subscribed file changes, it gets a new timestamp and bubbles forward in the timeline
 
+**Subscriptions are always to files.** Never to HTTP endpoints, databases, or external sources directly. Shell is the universal adapter for external data — a trigger or manual shell command fetches external state and writes it to a file. The subscription sees the file change and loads the content. This keeps subscriptions simple (local disk reads, microseconds, never fail), avoids latency/caching/auth complexity in context assembly, and preserves shell as the integration layer.
+
+**Subscriptions support filtering.** Not every subscription loads the full file:
+- **Full** — entire file content (default)
+- **Lines** — range filter (`--lines 174-230`)
+- **Regex** — pattern extraction (`--regex "pub fn"`)
+- **Head/Tail** — first/last N lines (`--head 100`, `--tail 50`)
+- **JQ** — JSON query filter (`--jq ".status"`) for structured data files
+
+Filtering happens at context assembly time. The agent subscribes once with a filter; every turn extracts only the relevant content. This replaces repetitive grep/sed commands the agent would otherwise run manually each turn.
+
+**External data follows the trigger → file → subscription path:**
+```
+trigger (cron 5m) → shell: curl -s api.example.com/health | jq . > context/health.json
+subscription: context/health.json --jq ".status"
+```
+Trigger fires → shell writes file → subscription sees new mtime → content bubbles forward. No HTTP in the subscription layer. No caching subsystem. No SSRF surface.
+
 No hard budget limit. The CLI reports context utilization on every subscription change ("added. total estimate: 78KB, ~65% of context window"). When approaching capacity, it warns ("~93% — consider disabling inactive topics"). The agent manages its own context. If it overflows, existing history trimming drops the oldest turns. Hard limits are for safety (guards); context management is for intelligence (the agent's job).
 
 Cache optimization: everything before the earliest moved subscription stays cached. Stable subscriptions = stable cache prefix.
@@ -194,9 +212,14 @@ Three audiences: agent reads/writes the whole file as markdown. Harness parses c
 ## CLI Self-Management
 
 ```bash
-# Subscriptions (always topic-scoped)
-./autopoiesis sub add --topic <name> <path>      # add file sub to topic
-./autopoiesis sub add --topic _default <path>     # non-project sub (skills, global refs)
+# Subscriptions (always topic-scoped, always to files)
+./autopoiesis sub add --topic <name> <path>                      # full file
+./autopoiesis sub add --topic <name> <path> --lines 174-230      # line range
+./autopoiesis sub add --topic <name> <path> --regex "pub fn"     # pattern extraction
+./autopoiesis sub add --topic <name> <path> --head 100           # first N lines
+./autopoiesis sub add --topic <name> <path> --tail 50            # last N lines
+./autopoiesis sub add --topic <name> <path> --jq ".status"       # JSON query
+./autopoiesis sub add --topic _default <path>                    # non-project sub
 ./autopoiesis sub remove --topic <name> <path>
 ./autopoiesis sub list [--topic <name>]
 
