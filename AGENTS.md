@@ -61,7 +61,7 @@ src/
 
 ## Coding conventions
 
-- **Error handling:** `anyhow::Result` everywhere. Use `.context("description")` on fallible operations. No `.unwrap()` in non-test code.
+- **Error handling:** `anyhow::Result` everywhere. Use `.context("description")` on fallible operations. No `.unwrap()` in non-test code. `.expect("reason")` is allowed only for compile-time invariants (e.g., regex constants). `.unwrap_or(default)` / `.unwrap_or_default()` are fine when the default is semantically correct. Never silently swallow errors that indicate corruption or I/O failure — log them.
 - **Async:** tokio runtime. Shell execution is async with `tokio::time::timeout`. Process-group kill on timeout via `libc::killpg`.
 - **Serialization:** serde + serde_json. Session entries are one-JSON-per-line (JSONL).
 - **Tests:** unit tests in `#[cfg(test)] mod tests` at bottom of each file. Use temp dirs with unique names (timestamp-based) to avoid collisions.
@@ -75,13 +75,57 @@ src/
 - **Session JSONL ≠ SQLite queue.** JSONL files persist conversation history. SQLite queue handles message ordering and delivery. They're complementary, not redundant.
 - **Process-group kill:** Shell child processes run in their own process group (`setpgid(0,0)`). Timeout kill uses `killpg` to terminate all descendants, not just the parent shell.
 
+## Integration tests to write
+
+End-to-end tests that assert seams between components, not just local helpers.
+
+1. **Queue is the single source of truth.**
+   Enqueue a WebSocket message. Assert the worker dequeues it, marks it `processing`, then `processed`. Assert no direct execution path runs without a queue row.
+
+2. **HTTP and WebSocket share queue semantics.**
+   Enqueue identical prompts through HTTP and WebSocket. Assert both paths persist the same session history shape and final queue status.
+
+3. **Approval verdicts cannot be bypassed.**
+   Return a tool call that requires approval. Assert HTTP rejects without execution. Assert WebSocket emits approval request and blocks until client response. Assert rejected approval never produces a tool result.
+
+4. **System prompt survives full lifecycle.**
+   Start with identity files. Add later operational `system` messages. Restart from persisted JSONL. Assert first system message is still provider instructions and later system messages remain replayable.
+
+5. **Session trimming preserves structural invariants.**
+   Persist `assistant(tool_call) -> tool -> assistant` sequences. Force trim on append and reload. Assert no retained tool result lacks its originating assistant tool call.
+
+6. **Outbound redaction is enforced before user-visible or disk-visible output.**
+   Stream a secret from the provider. Return a secret from the tool. Assert token sink, session JSONL, and tool replay history all contain only redacted text.
+
+7. **Timeout cleanup kills descendants.**
+   Spawn a child that ignores `SIGTERM` and a descendant that writes a marker later. Force timeout. Assert the marker is never written.
+
+## Pre-merge checklist
+
+1. **Queue paths:** No execution path may consume prompt content without first claiming a queue row. Every claimed row must end in `processed` or `failed`.
+2. **Guard paths:** Inbound text, tool calls, tool batches, streamed model output, and tool output all go through guards. No server path may substitute auto-approve for interactive approvals.
+3. **Prompt handling:** First `system` message is preserved as instructions. Later `system` messages are appended as replayable conversation state.
+4. **Persistence:** Reload covers all session day files, not only today. Reload preserves `system`, `assistant`, `tool`, and tool-call metadata needed for replay.
+5. **Trimming:** Role-aware. Never splits assistant/tool round-trips.
+6. **Shell execution:** Timeout cleanup terminates the whole process group. Docs describe RLIMIT caps honestly — not called a sandbox.
+7. **Secrets:** Token files use `0600`. Tests cover both inbound and outbound redaction.
+8. **Error visibility:** No fallible operation silently swallowed with `unwrap_or` when error indicates corruption, I/O failure, or lost data. Recovery paths must log before falling through.
+9. **Verification:** `cargo test` + `cargo clippy -- -D warnings` both pass.
+
+## Architectural rules (extended)
+
+In addition to the rules above:
+
+1. **One queue, one worker contract.** WebSocket, HTTP, CLI, and recovery paths must all use the same dequeue/mark lifecycle.
+2. **Approval is part of execution, not UI sugar.** Approval-required tool calls must suspend execution until an explicit handler decision arrives.
+3. **Context sources may add instructions, never redefine ownership of persisted messages.** The agent loop owns persistence of the live user message.
+4. **Session history is a typed transcript, not a bag of strings.** Replay and trim code must operate on message roles and tool-call relationships explicitly.
+5. **Security claims must match implementation.** Heuristics and RLIMITs are risk reduction, not sandboxing. If isolation is missing, document the gap.
+6. **Cross-component invariants need integration tests.** Any change touching queueing, prompting, guards, persistence, or tool execution must add or update an end-to-end invariant test.
+
 ## What's next
 
-See VISION.md for the roadmap. Current priorities:
-1. Shell output cap + file storage (force subscription pattern)
-2. Subscription system (SQLite + CLI)
-3. Context assembly rework (subscriptions in timeline)
-4. Topics (.md files with code blocks)
+See VISION.md for the roadmap.
 
 ## Don't
 

@@ -99,9 +99,14 @@ pub async fn run(port: u16) -> Result<()> {
 
     let mut store =
         store::Store::new("sessions/queue.sqlite").context("failed to open session store")?;
-    let recovered = store.recover_stale_messages().unwrap_or(0);
-    if recovered > 0 {
-        eprintln!("recovered {recovered} stale messages from previous crash");
+    match store.recover_stale_messages() {
+        Ok(recovered) if recovered > 0 => {
+            eprintln!("recovered {recovered} stale messages from previous crash");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("warning: failed to recover stale messages: {error}");
+        }
     }
     let state = ServerState {
         store: Arc::new(Mutex::new(store)),

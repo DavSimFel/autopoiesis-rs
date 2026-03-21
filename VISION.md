@@ -28,6 +28,10 @@ Cache optimization: everything before the earliest moved subscription stays cach
 
 **CLI is the self-management interface.** The agent manages itself through its own binary via shell: `sub add/remove/list`, `msg send`, `session list`. Files for storage, CLI for validated control plane. Every management action is a shell call, visible in history, auditable by guards.
 
+**Safety is multi-dimensional.** Guards are not a single approval check. The control plane combines four dimensions: **budget** (resource/cost ceilings), **permissions** (what the agent is allowed to touch), **taint** (tracking provenance of untrusted input), and **approval** (human-in-the-loop escalation). A command can pass approval but fail budget. A command can be within permissions but tainted. The guard pipeline evaluates all dimensions; approval alone is insufficient for safe autonomy.
+
+**Skills are thought patterns, not vendor connectors.** When the agent needs a new integration, it reads the docs, generates the connector, tests it, and deploys it — all through shell. A skill is a reusable reasoning pattern stored in a topic or subscription, not a runtime plugin or bespoke tool. This keeps the tool surface at one and pushes capability into context.
+
 **Identity is layered, not flat.** Three files, strict hierarchy:
 
 1. **`constitution.md`** — Laws of thought. Epistemic fidelity, chain of command, reversible action, contextual continuity. Immutable. Only the operator modifies this through direct file access.
@@ -274,3 +278,5 @@ Needs the same kind of eval: baseline vs dimensions-in-prompt, measuring actual 
 6. **Files for storage, CLI for control plane.** Raw content = files. Validated state changes = CLI.
 7. **Small surface.** Every line of code is a liability. Fewer lines, fewer bugs.
 8. **Crash and resume.** SQLite queue means nothing is lost. Restart and continue.
+9. **Composition over accretion.** The system scales by composing small primitives (context, subscriptions, topics, queues, files), not by adding features. Richer behavior emerges from how the agent uses the primitives, not from new runtime surface area.
+10. **SSE over WebSocket for transport.** Streamable HTTP/SSE is the preferred transport — stateless, resumable, mobile-friendly. WebSocket is supported but SSE should be the primary path for reliability across unreliable networks.

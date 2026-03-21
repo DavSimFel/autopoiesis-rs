@@ -104,8 +104,13 @@ impl ApprovalHandler for CliApprovalHandler {
         }
 
         let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap_or(0);
-        input.trim().eq_ignore_ascii_case("y")
+        match io::stdin().read_line(&mut input) {
+            Ok(_) => input.trim().eq_ignore_ascii_case("y"),
+            Err(error) => {
+                eprintln!("failed to read approval input: {error}");
+                false
+            }
+        }
     }
 }
 
