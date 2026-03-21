@@ -30,7 +30,13 @@ Cache optimization: everything before the earliest moved subscription stays cach
 
 **Safety is multi-dimensional.** Guards are not a single approval check. The control plane combines four dimensions: **budget** (resource/cost ceilings), **permissions** (what the agent is allowed to touch), **taint** (tracking provenance of untrusted input), and **approval** (human-in-the-loop escalation). A command can pass approval but fail budget. A command can be within permissions but tainted. The guard pipeline evaluates all dimensions; approval alone is insufficient for safe autonomy.
 
-**Skills are thought patterns, not vendor connectors.** When the agent needs a new integration, it reads the docs, generates the connector, tests it, and deploys it — all through shell. A skill is a reusable reasoning pattern stored in a topic or subscription, not a runtime plugin or bespoke tool. This keeps the tool surface at one and pushes capability into context.
+**Skills are two-tiered: shipped and custom.**
+
+*Shipped skills* are core cognitive capabilities that come with the binary: web search, deep research, coding, planning. These are thought patterns — reusable reasoning strategies injected into context, not runtime plugins. They teach the agent HOW to think about a class of problem.
+
+*Custom skills* are built by the agent or the operator. Connectors, procedures, workflows, integrations. When the agent needs a new integration, it reads the docs, generates the connector, tests it, and deploys it — all through shell. Autopoiesis ships zero vendor connectors. The meta-skill of building connectors is a shipped skill; the connectors themselves are custom.
+
+Both tiers live as context (topic files, subscriptions) rather than as code in the binary. The tool surface stays at one (shell). Skills are context, not tools.
 
 **Identity is layered, not flat.** Three files, strict hierarchy:
 
