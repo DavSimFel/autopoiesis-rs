@@ -42,15 +42,36 @@ Cache optimization: everything before the earliest moved subscription stays cach
 
 **Topics are indexes.** A topic is a single `.md` file that maps everything the agent needs for one concern — plans, state, questions, relevant files. The content lives elsewhere; the topic **points** to it. Topics are the agent's cognitive architecture for managing hundreds of tasks, projects, and goals with a finite context window.
 
-**Topics have two zones with different write rules:**
+**Topics split storage by concern: prose on disk, structure in SQLite.**
 
-*Prose sections* (plan, state, questions) — the agent reads and writes freely via shell. This is working memory. The agent updates plans, logs state, writes questions. Direct file edits (`sed`, `echo >>`, etc.) are fine for freeform text.
+This is a decided architectural choice, not a transitional compromise.
 
-*Structured sections* (triggers, items/subscriptions, relations) — CLI only. These have schema and affect runtime behavior. `sub add`, `topic add-trigger`, etc. validate before writing. Raw shell edits to TOML code blocks would bypass validation and could break the harness. The CLI is the gatekeeper for structured data.
+*Prose* (plan, state, questions) lives in `topics/<name>.md` files. The agent reads and writes freely via shell — `cat <<'EOF'`, `sed`, `echo >>`. This is working memory. Freeform, frequent, the agent's scratchpad. No CLI ceremony for the most common operation.
 
-*Topic lifecycle* (create, delete, activate, deactivate) — CLI only. Auditable, validates state transitions, maintains indexes.
+*Structure* (subscriptions, triggers, relations) lives in SQLite, managed exclusively through CLI commands (`sub add`, `topic add-trigger`, etc.). CLI validates schema before writing. The DB is the runtime authority for what affects agent behavior.
 
-The identity prompt teaches this rule. ShellSafety guard enforcement of structured blocks is a later hardening step.
+*Lifecycle* (create, delete, activate, deactivate) goes through CLI only. Auditable, validates state transitions, maintains indexes.
+
+**Authority rules:**
+- SQLite is authoritative for topic identity, activation state, subscriptions, triggers, relations, and the prose file path.
+- The `.md` file is authoritative only for prose content.
+- Missing registered file → warn, load empty prose. Topic still functions (subs/triggers work).
+- Unregistered `.md` file in `topics/` → inert. Ignored by context assembly.
+- `mtime` of the prose file is a cache invalidation hint, not semantic truth.
+
+**Enforcement:**
+- ShellSafety guard rule must block direct `sqlite3` writes to the topic/subscription database. The CLI is the only validated entry point for structured data.
+- Prose files need no enforcement — they're the agent's working memory, unconstrained by design.
+
+**Portability:**
+- `topic export <name>` bundles DB metadata + prose file into a portable artifact for T1→T3 handoffs and cross-session transfer.
+- `topic import <bundle>` restores both layers.
+
+**Why not full SQLite:**
+- Shell ergonomics: the agent's only tool is shell. Files are shell's native substrate. CLI wrappers for every plan update add wrong-direction friction.
+- Enforcement is not improved: if the agent has shell, it can `sqlite3` directly. SQLite-only expands the sensitive surface without real enforcement gain.
+- Debugging: topic prose is where operators debug autonomy failures. `less`, `diff`, `grep`, git history — all better with files than DB rows.
+- Backup: the system is already file-heavy (identity, JSONL sessions, shell results). One-file backup is not achievable anyway. Markdown prose plays well with git and rsync.
 
 **Default topic.** A catch-all topic (e.g. `topics/_default.md`) holds subscriptions that don't belong to any specific project — skills, global references, workspace config. Always active. Anything that isn't a dedicated topic's concern goes here.
 
@@ -145,77 +166,58 @@ shell results:
 
 ## Topics
 
-A topic is a single `.md` file. Code blocks hold structured data the harness evaluates. Prose sections are free-form — the agent reads and writes them via shell.
+A topic has two layers: a prose file on disk and structured metadata in SQLite.
+
+**Prose file** (`topics/<name>.md`) — pure markdown, no code blocks, no structured data. The agent's working memory for this concern:
 
 ```markdown
 # Fix Auth Bug
 
-Status: active
-Priority: high
-
-## Triggers
-
-​```toml
-[[trigger]]
-type = "file_change"
-paths = ["src/server.rs", "src/auth.rs"]
-
-[[trigger]]
-type = "cron"
-schedule = "daily"
-​```
-
-## Items
-
-​```toml
-[[item]]
-path = "src/server.rs"
-summary = "Auth middleware + WS handler"
-lines = "174-230"
-
-[[item]]
-path = "src/guard.rs"
-summary = "Guard pipeline, may need gate changes"
-​```
-
-## Relations
-
-​```toml
-blocked_by = ["database-migration"]
-related = ["security-audit"]
-​```
-
 ## Plan
-
-Replace WsAutoApprove with real gate check...
+1. Replace WsAutoApprove with real gate check
+2. Add integration test for approval rejection
+3. Update guards
 
 ## State
-
 P1 fixes applied. WS approval bypass still open.
+Middleware drafted, untested.
 
 ## Questions
-
 - Should destructive tools require per-call approval?
+- Is the current guard pipeline sufficient for WS paths?
 ```
 
-Three audiences: agent reads/writes the whole file as markdown. Harness parses code blocks for triggers, items, relations. Humans read it like a document.
+**Structured metadata** (SQLite, managed via CLI):
+```bash
+# Subscriptions point to relevant files
+./autopoiesis sub add --topic fix-auth src/server.rs --lines 174-230
+./autopoiesis sub add --topic fix-auth src/guard.rs --regex "fn check"
+
+# Triggers fire when conditions are met
+./autopoiesis trigger add --topic fix-auth --type file_change --paths "src/server.rs,src/auth.rs"
+./autopoiesis trigger add --topic fix-auth --type cron --schedule daily
+
+# Relations track dependencies
+./autopoiesis relation add --topic fix-auth --blocked-by database-migration
+./autopoiesis relation add --topic fix-auth --related security-audit
+```
 
 **Loading a topic does two things:**
-1. Its **file subscriptions** (items) activate → content materializes in the history timeline by timestamp
-2. Its **prose** (plan, state, questions) appears in the end zone → maximum LLM attention
+1. Its **subscriptions** activate — file content materializes in the history timeline by timestamp
+2. Its **prose** loads from `topics/<name>.md` — appears in the end zone for maximum LLM attention
 
 **Topics at scale:**
 - Layer 0: Topic list — "I have 200 topics" (~2KB, always visible in context.md)
 - Layer 1: Topic prose — "fix-auth plan, current state, open questions" (~500B–2KB, in end zone when active)
-- Layer 2: Item content — actual file content (materialized in history timeline when topic is active)
+- Layer 2: Subscribed content — actual file content (materialized in history timeline when topic is active)
 
 200 topics, one context window. Agent loads 1-3 at a time. Everything else is on disk, indexed, resumable.
 
 **Topic as portable context:**
-- T1 sends scout T3 to explore a codebase
-- Scout reads code, subscribes relevant files to the topic, writes plan
-- T1 sends coder T3 with same topic
-- Coder loads topic → all subs ready, plan written. Zero exploration. Codes immediately.
+- `topic export fix-auth` bundles DB metadata (subs, triggers, relations) + prose file into a portable artifact
+- T1 sends scout T3 with a topic — scout reads code, adds subscriptions, writes plan in prose file
+- T1 sends coder T3 with same topic — coder loads topic, all subs ready, plan written. Zero exploration.
+- `topic import <bundle>` restores both layers in a new session
 
 **Triggers** are evaluated server-side. The server watches trigger conditions (cron ticks, file mtime changes, incoming webhooks) and enqueues a message to the appropriate session when a trigger fires. The agent just sees a new inbox message.
 
@@ -236,11 +238,27 @@ Three audiences: agent reads/writes the whole file as markdown. Harness parses c
 # Cross-session subscription (delegation)
 ./autopoiesis sub add --session <id> --topic <name> <path>
 
-# Topics
+# Topics (lifecycle + structure in SQLite, prose in files)
+./autopoiesis topic create <name>                 # register topic, create topics/<name>.md
+./autopoiesis topic delete <name>                 # unregister + CASCADE subs/triggers/relations
 ./autopoiesis topic list                          # all topics with status
-./autopoiesis topic validate <name>               # validate code blocks
 ./autopoiesis topic activate <name>               # load topic into current session
 ./autopoiesis topic deactivate <name>             # unload topic
+./autopoiesis topic export <name>                 # bundle DB metadata + prose file
+./autopoiesis topic import <bundle>               # restore both layers
+
+# Triggers (SQLite, validated)
+./autopoiesis trigger add --topic <name> --type cron --schedule "daily"
+./autopoiesis trigger add --topic <name> --type file_change --paths "src/auth.rs"
+./autopoiesis trigger add --topic <name> --type webhook --path "/hooks/deploy"
+./autopoiesis trigger remove --topic <name> <trigger-id>
+./autopoiesis trigger list [--topic <name>]
+
+# Relations (SQLite, validated)
+./autopoiesis relation add --topic <name> --blocked-by <other>
+./autopoiesis relation add --topic <name> --related <other>
+./autopoiesis relation remove --topic <name> <relation-id>
+./autopoiesis relation list [--topic <name>]
 
 # Identity (self-modification within operator bounds)
 ./autopoiesis identity get persona               # show current dimensions
@@ -259,7 +277,7 @@ Three audiences: agent reads/writes the whole file as markdown. Harness parses c
 
 CLI validates: path safety (no traversal), file existence. Reports context utilization on every change — warns on overflow, never blocks. Every action is a shell call in history, auditable by guards.
 
-Topic prose sections (plan, state, questions) are edited directly via shell. Structured sections (triggers, subscriptions, relations) and lifecycle operations (create, delete, activate) go through CLI for validation.
+Topic prose (`topics/<name>.md`) is edited directly via shell — the agent's scratchpad. Structured metadata (subscriptions, triggers, relations) and lifecycle operations (create, delete, activate, export/import) go through CLI for validation. ShellSafety must block direct `sqlite3` writes to the topic database.
 
 ## Done
 
@@ -284,7 +302,7 @@ Topic prose sections (plan, state, questions) are edited directly via shell. Str
 3. **Shell output cap + file storage** — save all results to files, cap inline output, force subscription pattern
 4. **Subscription system** — SQLite table, CLI commands (`sub add/remove/list`), budget enforcement
 5. **Context assembly rework** — materialize sub content in history by `max(activated, updated)` timestamp, identity.md + context.md at end (see Open Questions)
-6. **Topics** — `.md` files with code blocks, topic list in context.md, `topic validate/list` CLI
+6. **Topics** — prose files + SQLite metadata, `topic create/activate/export` CLI, `trigger/relation` CLI
 7. **CI pipeline** — GitHub Actions (lint, test, build on every PR)
 8. **Trigger evaluation** — server-side cron/file_change/webhook → enqueue message
 9. **PTY shell** — interactive commands, not just batch
