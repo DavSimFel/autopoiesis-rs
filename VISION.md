@@ -42,6 +42,16 @@ Cache optimization: everything before the earliest moved subscription stays cach
 
 **Topics are indexes.** A topic is a single `.md` file that maps everything the agent needs for one concern — plans, state, questions, relevant files. The content lives elsewhere; the topic **points** to it. Topics are the agent's cognitive architecture for managing hundreds of tasks, projects, and goals with a finite context window.
 
+**Topics have two zones with different write rules:**
+
+*Prose sections* (plan, state, questions) — the agent reads and writes freely via shell. This is working memory. The agent updates plans, logs state, writes questions. Direct file edits (`sed`, `echo >>`, etc.) are fine for freeform text.
+
+*Structured sections* (triggers, items/subscriptions, relations) — CLI only. These have schema and affect runtime behavior. `sub add`, `topic add-trigger`, etc. validate before writing. Raw shell edits to TOML code blocks would bypass validation and could break the harness. The CLI is the gatekeeper for structured data.
+
+*Topic lifecycle* (create, delete, activate, deactivate) — CLI only. Auditable, validates state transitions, maintains indexes.
+
+The identity prompt teaches this rule. ShellSafety guard enforcement of structured blocks is a later hardening step.
+
 **Default topic.** A catch-all topic (e.g. `topics/_default.md`) holds subscriptions that don't belong to any specific project — skills, global references, workspace config. Always active. Anything that isn't a dedicated topic's concern goes here.
 
 **CLI is the self-management interface.** The agent manages itself through its own binary via shell: `sub add/remove/list`, `msg send`, `session list`. Files for storage, CLI for validated control plane. Every management action is a shell call, visible in history, auditable by guards.
@@ -249,7 +259,7 @@ Three audiences: agent reads/writes the whole file as markdown. Harness parses c
 
 CLI validates: path safety (no traversal), file existence. Reports context utilization on every change — warns on overflow, never blocks. Every action is a shell call in history, auditable by guards.
 
-Topics themselves are just `.md` files — create, edit, delete via shell directly. No CLI needed for content. CLI validates structured data (code blocks) on demand.
+Topic prose sections (plan, state, questions) are edited directly via shell. Structured sections (triggers, subscriptions, relations) and lifecycle operations (create, delete, activate) go through CLI for validation.
 
 ## Done
 
