@@ -276,4 +276,22 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn create_session_is_idempotent() {
+        let path = temp_db_path("idempotent");
+        let mut store = Store::new(&path).unwrap();
+
+        store
+            .create_session("shared", Some(r#"{"source":"cli"}"#))
+            .unwrap();
+        store
+            .create_session("shared", Some(r#"{"source":"cli"}"#))
+            .unwrap();
+
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions, vec!["shared"]);
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

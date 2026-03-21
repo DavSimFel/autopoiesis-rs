@@ -167,24 +167,22 @@ impl Session {
                     content,
                 })
             }
-            "tool" => {
-                match (&entry.call_id, &entry.tool_name) {
-                    (None, None) if entry.content.is_empty() => None,
-                    (None, _) | (_, None) => {
-                        eprintln!(
-                            "warning: dropping tool entry with missing call_id or tool_name \
+            "tool" => match (&entry.call_id, &entry.tool_name) {
+                (None, None) if entry.content.is_empty() => None,
+                (None, _) | (_, None) => {
+                    eprintln!(
+                        "warning: dropping tool entry with missing call_id or tool_name \
                              (call_id={:?}, tool_name={:?})",
-                            entry.call_id, entry.tool_name
-                        );
-                        None
-                    }
-                    (Some(call_id), Some(tool_name)) => Some(ChatMessage::tool_result(
-                        call_id.clone(),
-                        tool_name.clone(),
-                        entry.content,
-                    )),
+                        entry.call_id, entry.tool_name
+                    );
+                    None
                 }
-            }
+                (Some(call_id), Some(tool_name)) => Some(ChatMessage::tool_result(
+                    call_id.clone(),
+                    tool_name.clone(),
+                    entry.content,
+                )),
+            },
             _ => None,
         };
 
