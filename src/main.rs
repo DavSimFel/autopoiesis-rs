@@ -7,13 +7,19 @@ use clap::{Parser, Subcommand};
 use reqwest::Client;
 
 use std::io::{self, BufRead, Write};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(name = "autopoiesis", version, about = "MVP Rust agent runtime")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    #[arg(
+        long,
+        value_name = "name",
+        help = "Persistent session name for CLI mode"
+    )]
+    session: Option<String>,
 
     #[arg(help = "Prompt for the agent", trailing_var_arg = true)]
     prompt: Vec<String>,
@@ -36,6 +42,13 @@ enum AuthAction {
     Login,
     Status,
     Logout,
+}
+
+fn resolve_session_id(cli_session: Option<&str>, config_session: Option<&str>) -> String {
+    cli_session
+        .or(config_session)
+        .unwrap_or("default")
+        .to_string()
 }
 
 #[tokio::main]
@@ -83,13 +96,8 @@ async fn main() -> Result<()> {
             let config = config::Config::load("agents.toml")
                 .map_err(|error| anyhow!("failed to load configuration: {error}"))?;
 
-            let session_id = format!(
-                "cli-{}",
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_micros()
-            );
+            let session_id =
+                resolve_session_id(cli.session.as_deref(), config.session_name.as_deref());
             let session_root = format!("sessions/{session_id}");
             let mut history = session::Session::new(&session_root)?;
             history.load_today()?;
@@ -169,4 +177,30 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_session_id;
+
+    #[test]
+    fn resolve_session_id_prefers_cli_value() {
+        assert_eq!(
+            resolve_session_id(Some("fix-auth"), Some("configured-default")),
+            "fix-auth"
+        );
+    }
+
+    #[test]
+    fn resolve_session_id_uses_config_value_when_cli_missing() {
+        assert_eq!(
+            resolve_session_id(None, Some("configured-default")),
+            "configured-default"
+        );
+    }
+
+    #[test]
+    fn resolve_session_id_falls_back_to_default() {
+        assert_eq!(resolve_session_id(None, None), "default");
+    }
 }

@@ -611,6 +611,7 @@ mod tests {
                     system_prompt: "system".to_string(),
                     base_url: "https://example.test/api".to_string(),
                     reasoning_effort: None,
+                    session_name: None,
                 },
                 http_client: Client::new(),
             },

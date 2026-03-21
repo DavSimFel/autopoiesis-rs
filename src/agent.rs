@@ -176,8 +176,12 @@ fn cap_tool_output(
     threshold: usize,
 ) -> Result<String> {
     let results_dir = sessions_dir.join("results");
-    fs::create_dir_all(&results_dir)
-        .with_context(|| format!("failed to create results directory {}", results_dir.display()))?;
+    fs::create_dir_all(&results_dir).with_context(|| {
+        format!(
+            "failed to create results directory {}",
+            results_dir.display()
+        )
+    })?;
 
     let result_path = results_dir.join(format!("{call_id}.txt"));
     fs::write(&result_path, &output)
@@ -1162,7 +1166,8 @@ mod tests {
         let dir = temp_sessions_dir("cap_tool_output_dir");
         let output = "stdout:\nhello\nstderr:\n\nexit_code=0".to_string();
 
-        let capped = cap_tool_output(&dir, "call-dir", output.clone(), DEFAULT_OUTPUT_CAP_BYTES).unwrap();
+        let capped =
+            cap_tool_output(&dir, "call-dir", output.clone(), DEFAULT_OUTPUT_CAP_BYTES).unwrap();
 
         assert_eq!(capped, output);
         let result_path = dir.join("results").join("call-dir.txt");
@@ -1239,9 +1244,13 @@ mod tests {
         assert!(!tool_result.contains(&output));
         let expected_path = dir.join("results").join(format!("{call_id}.txt"));
         let expected_path_str = expected_path.display().to_string();
-        assert!(tool_result.contains(&format!("[output exceeded inline limit (2048 lines, 10 KB) -> {expected_path_str}]")));
+        assert!(tool_result.contains(&format!(
+            "[output exceeded inline limit (2048 lines, 10 KB) -> {expected_path_str}]"
+        )));
         assert!(tool_result.contains(&format!("To read: cat {expected_path_str}")));
-        assert!(tool_result.contains(&format!("To read specific lines: sed -n '10,20p' {expected_path_str}")));
+        assert!(tool_result.contains(&format!(
+            "To read specific lines: sed -n '10,20p' {expected_path_str}"
+        )));
 
         let result_path = dir.join("results").join(format!("{call_id}.txt"));
         assert!(result_path.exists(), "result file should be created");

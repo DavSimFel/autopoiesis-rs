@@ -16,6 +16,8 @@ pub struct Config {
     pub base_url: String,
     /// Optional reasoning effort hint forwarded to the model provider.
     pub reasoning_effort: Option<String>,
+    /// Optional default CLI session name loaded from configuration.
+    pub session_name: Option<String>,
 }
 
 impl Config {
@@ -27,6 +29,7 @@ impl Config {
                 .to_string(),
             base_url: "https://chatgpt.com/backend-api/codex/responses".to_string(),
             reasoning_effort: None,
+            session_name: None,
         };
 
         let contents = match std::fs::read_to_string(config_path.as_ref()) {
@@ -54,6 +57,10 @@ impl Config {
 
         if let Some(reasoning_effort) = file_config.agent.reasoning_effort {
             config.reasoning_effort = Some(reasoning_effort);
+        }
+
+        if let Some(session_name) = file_config.agent.session_name {
+            config.session_name = Some(session_name);
         }
 
         Ok(config)
@@ -85,7 +92,7 @@ mod tests {
     fn loads_valid_agents_toml_with_all_fields() {
         let path = temp_toml_path(
             "all_fields",
-            "[agent]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning_effort='low'\n",
+            "[agent]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning_effort='low'\nsession_name='fix-auth'\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -93,6 +100,7 @@ mod tests {
         assert_eq!(config.system_prompt, "All good");
         assert_eq!(config.base_url, "https://example.test/api");
         assert_eq!(config.reasoning_effort, Some("low".to_string()));
+        assert_eq!(config.session_name, Some("fix-auth".to_string()));
     }
 
     #[test]
@@ -116,6 +124,7 @@ mod tests {
             "https://chatgpt.com/backend-api/codex/responses"
         );
         assert_eq!(config.reasoning_effort, None);
+        assert_eq!(config.session_name, None);
     }
 
     #[test]
@@ -133,6 +142,15 @@ mod tests {
             "You are a direct and capable coding agent. Execute tasks efficiently."
         );
         assert_eq!(config.reasoning_effort, None);
+        assert_eq!(config.session_name, None);
+    }
+
+    #[test]
+    fn loads_session_name_from_agents_toml() {
+        let path = temp_toml_path("session_name", "[agent]\nsession_name='default-work'\n");
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(config.session_name, Some("default-work".to_string()));
     }
 
     #[test]
@@ -155,4 +173,5 @@ struct AgentFileSection {
     system_prompt: Option<String>,
     base_url: Option<String>,
     reasoning_effort: Option<String>,
+    session_name: Option<String>,
 }
