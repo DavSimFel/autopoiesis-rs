@@ -11,7 +11,7 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, State, WebSocketUpgrade},
+    extract::{Extension, Path, State, WebSocketUpgrade},
     http::{Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -33,8 +33,32 @@ pub struct ServerState {
     worker_lock: Arc<Mutex<()>>,
     sessions_dir: PathBuf,
     api_key: String,
+    operator_key: Option<String>,
     config: config::Config,
     http_client: Client,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Principal {
+    Operator,
+    User,
+}
+
+impl Principal {
+    fn role_for_request(self, requested_role: Option<&str>) -> &str {
+        match self {
+            Self::Operator => requested_role.unwrap_or("user"),
+            Self::User => "user",
+        }
+    }
+
+    fn source_for_transport(self, transport: &str) -> String {
+        let suffix = match self {
+            Self::Operator => "operator",
+            Self::User => "user",
+        };
+        format!("{transport}-{suffix}")
+    }
 }
 
 #[derive(Serialize)]
@@ -59,9 +83,8 @@ struct SessionListResponse {
 
 #[derive(Deserialize)]
 struct EnqueueMessageRequest {
-    role: String,
+    role: Option<String>,
     content: String,
-    source: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -113,6 +136,7 @@ pub async fn run(port: u16) -> Result<()> {
         worker_lock: Arc::new(Mutex::new(())),
         sessions_dir: PathBuf::from("sessions"),
         api_key,
+        operator_key: config.operator_key.clone(),
         config,
         http_client: Client::new(),
     };
@@ -169,6 +193,7 @@ async fn list_sessions(State(state): State<ServerState>) -> impl IntoResponse {
 
 async fn enqueue_message(
     State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
     Path(session_id): Path<String>,
     Json(payload): Json<EnqueueMessageRequest>,
 ) -> impl IntoResponse {
@@ -181,8 +206,9 @@ async fn enqueue_message(
         return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
     }
 
-    let source = payload.source.unwrap_or_else(|| "http".to_string());
-    match store.enqueue_message(&session_id, &payload.role, &payload.content, &source) {
+    let role = principal.role_for_request(payload.role.as_deref());
+    let source = principal.source_for_transport("http");
+    match store.enqueue_message(&session_id, role, &payload.content, &source) {
         Ok(message_id) => {
             drop(store);
             spawn_http_queue_worker(state.clone(), session_id.clone());
@@ -194,17 +220,23 @@ async fn enqueue_message(
 
 async fn ws_session(
     State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
     Path(session_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     if !validate_session_id(&session_id) {
         return (StatusCode::BAD_REQUEST, "invalid session id").into_response();
     }
-    ws.on_upgrade(move |socket| websocket_session(state, session_id, socket))
+    ws.on_upgrade(move |socket| websocket_session(state, session_id, principal, socket))
         .into_response()
 }
 
-async fn websocket_session(state: ServerState, session_id: String, socket: WebSocket) {
+async fn websocket_session(
+    state: ServerState,
+    session_id: String,
+    principal: Principal,
+    socket: WebSocket,
+) {
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<WsFrame>();
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<String>();
@@ -254,7 +286,8 @@ async fn websocket_session(state: ServerState, session_id: String, socket: WebSo
     while let Some(content) = prompt_rx.recv().await {
         {
             let mut store = state.store.lock().await;
-            match store.enqueue_message(&session_id, "user", &content, "ws") {
+            let source = principal.source_for_transport("ws");
+            match store.enqueue_message(&session_id, "user", &content, &source) {
                 Ok(_) => {}
                 Err(error) => {
                     let _ = tx.send(WsFrame::Error {
@@ -353,14 +386,15 @@ fn validate_session_id(id: &str) -> bool {
 
 async fn authenticate(
     State(state): State<ServerState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
     let from_header = request
         .headers()
         .get(API_KEY_HEADER)
         .and_then(|value| value.to_str().ok());
-    if from_header.is_some_and(|value| value == state.api_key) {
+    if let Some(principal) = from_header.and_then(|value| principal_for_token(&state, value)) {
+        request.extensions_mut().insert(principal);
         return next.run(request).await;
     }
 
@@ -372,12 +406,25 @@ async fn authenticate(
                 if key == "api_key" { Some(value) } else { None }
             })
         });
-        if from_query.is_some_and(|value| value == state.api_key) {
+        if let Some(principal) = from_query.and_then(|value| principal_for_token(&state, value)) {
+            request.extensions_mut().insert(principal);
             return next.run(request).await;
         }
     }
 
     (StatusCode::UNAUTHORIZED, "missing or invalid api key").into_response()
+}
+
+fn principal_for_token(state: &ServerState, token: &str) -> Option<Principal> {
+    if state
+        .operator_key
+        .as_deref()
+        .is_some_and(|operator_key| operator_key == token)
+    {
+        return Some(Principal::Operator);
+    }
+
+    (token == state.api_key).then_some(Principal::User)
 }
 
 fn spawn_http_queue_worker(state: ServerState, session_id: String) {
@@ -606,17 +653,58 @@ mod tests {
                 worker_lock: Arc::new(Mutex::new(())),
                 sessions_dir,
                 api_key: "test-key".to_string(),
+                operator_key: Some("operator-key".to_string()),
                 config: config::Config {
                     model: "gpt-test".to_string(),
                     system_prompt: "system".to_string(),
                     base_url: "https://example.test/api".to_string(),
                     reasoning_effort: None,
                     session_name: None,
+                    operator_key: Some("operator-key".to_string()),
                 },
                 http_client: Client::new(),
             },
             queue_path,
         )
+    }
+
+    async fn enqueue_message_via_http(
+        app: Router,
+        api_key: &str,
+        session_id: &str,
+        payload: Value,
+    ) -> Response {
+        app.oneshot(
+            Request::builder()
+                .uri(format!("/api/sessions/{session_id}/messages"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .header("x-api-key", api_key)
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn response_message_id(response: Response) -> i64 {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        payload["message_id"]
+            .as_i64()
+            .expect("response should contain message_id")
+    }
+
+    fn load_queued_message(queue_path: &PathBuf, message_id: i64) -> (String, String) {
+        let conn = rusqlite::Connection::open(queue_path).unwrap();
+        conn.query_row(
+            "SELECT role, source FROM messages WHERE id = ?1",
+            [message_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
     }
 
     #[derive(Clone)]
@@ -686,6 +774,94 @@ mod tests {
             .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn enqueue_with_user_api_key_forces_role_to_user() {
+        let (state, queue_path) = test_state();
+        let app = router(state);
+
+        let response = enqueue_message_via_http(
+            app,
+            "test-key",
+            "role-user-session",
+            serde_json::json!({
+                "role": "system",
+                "content": "injected system prompt",
+                "source": "spoofed",
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let message_id = response_message_id(response).await;
+        let (role, source) = load_queued_message(&queue_path, message_id);
+        assert_eq!(role, "user");
+        assert_eq!(source, "http-user");
+    }
+
+    #[tokio::test]
+    async fn enqueue_with_operator_key_keeps_requested_role() {
+        let (state, queue_path) = test_state();
+        let app = router(state);
+
+        let response = enqueue_message_via_http(
+            app,
+            "operator-key",
+            "role-operator-session",
+            serde_json::json!({
+                "role": "system",
+                "content": "operator note",
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let message_id = response_message_id(response).await;
+        let (role, source) = load_queued_message(&queue_path, message_id);
+        assert_eq!(role, "system");
+        assert_eq!(source, "http-operator");
+    }
+
+    #[tokio::test]
+    async fn enqueue_without_role_defaults_to_user() {
+        let (state, queue_path) = test_state();
+        let app = router(state);
+
+        let response = enqueue_message_via_http(
+            app,
+            "operator-key",
+            "default-role-session",
+            serde_json::json!({
+                "content": "no explicit role",
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let message_id = response_message_id(response).await;
+        let (role, source) = load_queued_message(&queue_path, message_id);
+        assert_eq!(role, "user");
+        assert_eq!(source, "http-operator");
+    }
+
+    #[tokio::test]
+    async fn invalid_api_key_returns_unauthorized() {
+        let (state, _queue_path) = test_state();
+        let app = router(state);
+
+        let response = enqueue_message_via_http(
+            app,
+            "wrong-key",
+            "unauthorized-session",
+            serde_json::json!({
+                "role": "system",
+                "content": "blocked",
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
