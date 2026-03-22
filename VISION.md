@@ -255,33 +255,50 @@ Topics are pure SQLite entries — no special files. All topic operations (lifec
 
 ## Done
 
-- [x] Agent loop (async, streaming)
+- [x] Agent loop (async, streaming, real SSE parsing with incremental byte boundaries)
 - [x] Shell tool (async, RLIMIT-sandboxed, process-group kill on timeout)
-- [x] Guard pipeline (secret redactor, shell safety, exfil detector)
-- [x] Session persistence (JSONL history)
+- [x] Guard pipeline (SecretRedactor, ShellSafety, ExfilDetector — deny>approve>allow)
+- [x] Turn architecture (ContextSource + Tool + Guard trait composition)
+- [x] Approval system with severity levels + REPL prompt flow
+- [x] Session persistence (daily JSONL, tool_call round-trip, replay-safe)
 - [x] Identity system v1 (constitution + identity + context, template vars)
-- [ ] Identity system v2 (4-layer: constitution + operator + identity + context, persona dimensions, `identity` CLI)
-- [x] OAuth device flow auth
-- [x] Token estimation + context trimming
-- [x] SQLite message queue + session store
+- [x] Constitution v1 (4 laws, 1st person, research-backed)
+- [x] OAuth device flow auth (token storage, refresh, expiry)
+- [x] Token estimation via tiktoken-rs + context trimming
+- [x] SQLite message queue + session store (source-agnostic inbox)
+- [x] Unified drain_queue() for CLI and server execution
 - [x] axum HTTP server + WebSocket
 - [x] API key auth middleware (header + WS query param)
 - [x] Decouple agent loop from stdin/stdout (TokenSink + ApprovalHandler callbacks)
-- [x] Kill child process on shell timeout (process-group aware)
+- [x] Kill child process on shell timeout (process-group aware, setpgid + killpg)
+- [x] CI pipeline — GitHub Actions (fmt + clippy + test on every PR)
+- [x] Shell output cap + file-backed result storage (4KB threshold, forces subscription pattern)
+- [x] Persistent named sessions with default session (`--session <name>`)
+- [x] Server path sanitization (session_id validation on HTTP routes)
+- [x] Stale message recovery on startup
 
 ## Next
 
-1. **Identity v2** — operator.md file, persona dimensions in identity.md (storage format TBD), `identity set/get` CLI, ShellSafety guard rule blocking writes to constitution.md + operator.md
-2. **Message metadata injection** — `<meta ts="..." principal="..." />` tags on every user message in the message builder, principal resolution from session/source metadata
-3. **Shell output cap + file storage** — save all results to files, cap inline output, force subscription pattern
-4. **Subscription system** — SQLite table, CLI commands (`sub add/remove/list`), budget enforcement
-5. **Context assembly rework** — materialize sub content in history by `max(activated, updated)` timestamp, identity.md + context.md at end (see Open Questions)
-6. **Topics** — pure SQLite indexes, `topic/trigger/relation` CLI, `export/import` for portability
-7. **CI pipeline** — GitHub Actions (lint, test, build on every PR)
-8. **Trigger evaluation** — server-side cron + webhook → enqueue message
-9. **PTY shell** — interactive commands, not just batch
+### Security stack (priority — build in this order)
+
+1. **P0 fixes** — HTTP role injection (force user-only from external callers), approval denial terminates the turn (wire up TurnVerdict::Denied), shell default-approve with allowlist/denylist config
+2. **Standing approvals** — `[shell.standing_approvals]` in agents.toml. Pattern-based pre-approval for known-safe commands. Operator-configured, not agent-modifiable.
+3. **Taint tracking** — `<meta ts="..." principal="operator|user|agent:id|system" />` tags on every message. Tainted input escalates tool calls to manual approval even if they match standing approvals.
+4. **Budget enforcement** — per-turn token ceiling, per-session ceiling, per-day ceiling. Structural prevention of runaway loops.
+
+### Context management (after security)
+
+5. **Subscription system** — SQLite table, CLI commands (`sub add/remove/list`), filter support (lines/regex/head/tail/jq), budget reporting. Standalone — no topic dependency.
+6. **Context assembly rework** — materialize subscribed content in history by `max(activated, updated)` timestamp, identity.md + context.md at end
+7. **Topics** — optional grouping layer on subscriptions. Pure SQLite indexes, `topic/trigger/relation` CLI, `export/import` for portability
+
+### Identity + infrastructure (parallel track)
+
+8. **Identity v2** — operator.md file, persona dimensions in identity.md, `identity set/get` CLI, guard rules blocking writes to constitution.md + operator.md
+9. **Trigger evaluation** — server-side cron + webhook → enqueue message
 10. **Provider abstraction** — Anthropic, local models
-11. **CLI as separate crate** — TUI with graceful degradation
+11. **PTY shell** — interactive commands, not just batch
+12. **Permissions** — filesystem/network sandboxing (seccomp/landlock/uid-drop) for multi-tenant
 
 ## Open Questions
 
@@ -298,6 +315,22 @@ Hypothesis: C wins — laws anchored at top for stability, persona refreshed at 
 - They don't work → drop the concept, persona is just freeform identity.md prose
 
 Needs the same kind of eval: baseline vs dimensions-in-prompt, measuring actual output length, decision patterns, tone consistency across turns.
+
+## Architectural reality check (2026-03-22)
+
+This section exists because the vision above describes a mature system. The codebase is not there yet. Read this before assuming any invariant holds.
+
+**The shell is not contained.** The vision says "one tool" and describes safety as "multi-dimensional gates." The reality is that `sh -lc` runs with the current user's full privileges. ShellSafety is regex pattern matching — trivially bypassed via `python -c`, string concatenation, shell builtins, or any unflagged binary. The guard pipeline is risk reduction, not a security boundary. Until standing approvals + taint tracking + real sandboxing are built, any feature that depends on "the agent can't do X" is built on sand.
+
+**The identity hierarchy has no enforcement.** The vision describes constitution.md as immutable and operator.md as operator-only. The guard pipeline does not yet block writes to these files. `echo "new rules" > identity/constitution.md` works. File permissions alone are insufficient because the agent runs shell as the process user. Guard rules for identity protection are planned, not built.
+
+**CLI self-management is a privilege escalation surface.** The vision says the agent manages subscriptions/topics via its own CLI through shell. That means the agent's context management goes through the same uncontained shell that can write arbitrary files. Without taint tracking, a prompt injection can instruct the agent to `sub add` a malicious file, and the subscription system will faithfully load it into context on every turn.
+
+**The server is single-threaded in practice.** `worker_lock` serializes all sessions behind one global mutex held for the full agent turn (LLM call + tool execution + persistence). The vision of concurrent trigger-driven topic updates clashes with this reality. The SQLite queue claim is also non-atomic across processes.
+
+**HTTP prompt integrity is broken.** The enqueue endpoint accepts arbitrary `role` from callers. `system` and `assistant` messages can be injected into persistent history by anyone with the API key. The 4-layer identity hierarchy (constitution → operator → identity → context) is meaningless when the "operator" layer can be spoofed via HTTP. Fix this before building identity v2.
+
+**These are not future concerns.** They are current blockers for every feature in the Next section that depends on safety, identity, or concurrency. The build order in Next reflects this: security stack first, then context management, then identity.
 
 ## Principles
 
