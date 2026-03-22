@@ -61,24 +61,35 @@ fn command_from_tool_call(call: &ToolCall) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn append_approval_denied(session: &mut Session, reason: &str, command: &str) -> Result<()> {
-    session.append(
-        ChatMessage::system_with_principal(
-            format!("Tool execution rejected by user: {reason}. Command: {command}"),
-            Some(Principal::System),
-        ),
-        None,
+fn append_audit_note(session: &mut Session, note: String) -> Result<()> {
+    let mut message = ChatMessage::with_role_with_principal(
+        crate::llm::ChatRole::Assistant,
+        Some(Principal::System),
+    );
+    message.content.push(MessageContent::text(note));
+    session.append(message, None)
+}
+
+fn append_approval_denied(session: &mut Session, gate_id: &str) -> Result<()> {
+    append_audit_note(
+        session,
+        format!("Tool execution rejected after approval by {gate_id}"),
     )
 }
 
-fn append_hard_deny(session: &mut Session, by: &str, reason: &str) -> Result<()> {
-    session.append(
-        ChatMessage::system_with_principal(
-            format!("Tool execution hard-denied by {by}: {reason}"),
-            Some(Principal::System),
-        ),
-        None,
+fn append_inbound_approval_denied(session: &mut Session, gate_id: &str) -> Result<()> {
+    append_audit_note(
+        session,
+        format!("Message rejected after approval by {gate_id}"),
     )
+}
+
+fn append_hard_deny(session: &mut Session, by: &str) -> Result<()> {
+    append_audit_note(session, format!("Tool execution hard-denied by {by}"))
+}
+
+fn append_inbound_deny(session: &mut Session, gate_id: &str) -> Result<()> {
+    append_audit_note(session, format!("Message hard-denied by {gate_id}"))
 }
 
 fn make_denial_verdict(denial_count: &mut usize, gate_id: String, reason: String) -> TurnVerdict {
@@ -98,6 +109,59 @@ fn make_denial_verdict(denial_count: &mut usize, gate_id: String, reason: String
 
 pub fn format_denial_message(reason: &str, gate_id: &str) -> String {
     format!("Command hard-denied by {gate_id}: {reason}")
+}
+
+pub(crate) async fn process_queued_message<F, Fut, P, TS, AH>(
+    message: &QueuedMessage,
+    session: &mut Session,
+    turn: &Turn,
+    make_provider: &mut F,
+    token_sink: &mut TS,
+    approval_handler: &mut AH,
+) -> Result<QueueOutcome>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<P>>,
+    P: LlmProvider,
+    TS: TokenSink + Send + ?Sized,
+    AH: ApprovalHandler + ?Sized,
+{
+    match message.role.as_str() {
+        "user" => Ok(QueueOutcome::Agent(
+            run_agent_loop(
+                make_provider,
+                session,
+                message.content.clone(),
+                Principal::from_source(&message.source),
+                turn,
+                token_sink,
+                approval_handler,
+            )
+            .await?,
+        )),
+        "system" => {
+            session.append(
+                ChatMessage::system_with_principal(
+                    message.content.clone(),
+                    Some(Principal::from_source(&message.source)),
+                ),
+                None,
+            )?;
+            Ok(QueueOutcome::Stored)
+        }
+        "assistant" => {
+            let mut assistant = ChatMessage::with_role_with_principal(
+                crate::llm::ChatRole::Assistant,
+                Some(Principal::from_source(&message.source)),
+            );
+            assistant
+                .content
+                .push(MessageContent::text(message.content.clone()));
+            session.append(assistant, None)?;
+            Ok(QueueOutcome::Stored)
+        }
+        other => Ok(QueueOutcome::UnsupportedRole(other.to_string())),
+    }
 }
 
 /// Run the agent loop until the model emits a non-tool stop reason.
@@ -158,13 +222,7 @@ where
             Verdict::Allow => {}
             Verdict::Modify => {}
             Verdict::Deny { reason, gate_id } => {
-                session.append(
-                    ChatMessage::system_with_principal(
-                        format!("Message hard-denied by {gate_id}: {reason}"),
-                        Some(Principal::System),
-                    ),
-                    None,
-                )?;
+                append_inbound_deny(session, &gate_id)?;
                 break 'agent_turn Some(make_denial_verdict(&mut denial_count, gate_id, reason));
             }
             Verdict::Approve {
@@ -183,7 +241,7 @@ where
                     .unwrap_or("<inbound message>");
                 let approved = approval_handler.request_approval(&severity, &reason, command);
                 if !approved {
-                    append_approval_denied(session, &reason, command)?;
+                    append_inbound_approval_denied(session, &gate_id)?;
                     break 'agent_turn Some(make_denial_verdict(
                         &mut denial_count,
                         gate_id,
@@ -217,18 +275,13 @@ where
             StopReason::ToolCalls => {
                 let tool_calls = turn_reply.tool_calls.clone();
                 session.append(turn_reply.assistant_message, turn_meta)?;
-                let tool_result_principal = if turn.is_tainted() {
-                    Principal::System
-                } else {
-                    Principal::Operator
-                };
 
                 for call in &tool_calls {
                     match turn.check_tool_call(call) {
                         Verdict::Allow => {}
                         Verdict::Modify => {}
                         Verdict::Deny { reason, gate_id } => {
-                            append_hard_deny(session, &gate_id, &reason)?;
+                            append_hard_deny(session, &gate_id)?;
                             break 'agent_turn Some(make_denial_verdict(
                                 &mut denial_count,
                                 gate_id,
@@ -245,7 +298,7 @@ where
                             let approved =
                                 approval_handler.request_approval(&severity, &reason, &command);
                             if !approved {
-                                append_approval_denied(session, &reason, &command)?;
+                                append_approval_denied(session, &gate_id)?;
                                 break 'agent_turn Some(make_denial_verdict(
                                     &mut denial_count,
                                     gate_id,
@@ -261,7 +314,7 @@ where
                     Verdict::Allow => {}
                     Verdict::Modify => {}
                     Verdict::Deny { reason, gate_id } => {
-                        append_hard_deny(session, &gate_id, &reason)?;
+                        append_hard_deny(session, &gate_id)?;
                         break 'agent_turn Some(make_denial_verdict(
                             &mut denial_count,
                             gate_id,
@@ -278,7 +331,7 @@ where
                             .and_then(command_from_tool_call)
                             .unwrap_or_else(|| "<command unavailable>".to_string());
                         if !approval_handler.request_approval(&severity, &reason, &command) {
-                            append_approval_denied(session, &reason, &command)?;
+                            append_approval_denied(session, &gate_id)?;
                             break 'agent_turn Some(make_denial_verdict(
                                 &mut denial_count,
                                 gate_id,
@@ -307,7 +360,7 @@ where
                             &call.id,
                             &call.name,
                             result,
-                            Some(tool_result_principal),
+                            Some(Principal::System),
                         ),
                         None,
                     )?;
@@ -346,40 +399,15 @@ where
     TS: TokenSink + Send + ?Sized,
     AH: ApprovalHandler + ?Sized,
 {
-    let principal = Principal::from_source(&message.source);
-    match message.role.as_str() {
-        "user" => Ok(QueueOutcome::Agent(
-            run_agent_loop(
-                make_provider,
-                session,
-                message.content.clone(),
-                principal,
-                turn,
-                token_sink,
-                approval_handler,
-            )
-            .await?,
-        )),
-        "system" => {
-            session.append(
-                ChatMessage::system_with_principal(message.content.clone(), Some(principal)),
-                None,
-            )?;
-            Ok(QueueOutcome::Stored)
-        }
-        "assistant" => {
-            let mut assistant = ChatMessage::with_role_with_principal(
-                crate::llm::ChatRole::Assistant,
-                Some(principal),
-            );
-            assistant
-                .content
-                .push(MessageContent::text(message.content.clone()));
-            session.append(assistant, None)?;
-            Ok(QueueOutcome::Stored)
-        }
-        other => Ok(QueueOutcome::UnsupportedRole(other.to_string())),
-    }
+    process_queued_message(
+        message,
+        session,
+        turn,
+        make_provider,
+        token_sink,
+        approval_handler,
+    )
+    .await
 }
 
 pub async fn drain_queue<F, Fut, P>(
@@ -890,6 +918,111 @@ mod tests {
                 .is_empty()
         );
 
+        let stored = session.history();
+        assert_eq!(stored.len(), 2);
+        assert!(matches!(stored[1].role, crate::llm::ChatRole::Assistant));
+        assert_eq!(stored[1].principal, Principal::System);
+        let note = match &stored[1].content[0] {
+            MessageContent::Text { text } => text,
+            _ => panic!("expected text audit note"),
+        };
+        assert_eq!(note, "Message hard-denied by inbound-deny");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn approval_denial_audit_is_not_system_role_or_raw_command() {
+        let dir = temp_sessions_dir("approval_denial_audit");
+        let provider = SequenceProvider::new(vec![StreamedTurn {
+            assistant_message: ChatMessage {
+                role: crate::llm::ChatRole::Assistant,
+                principal: Principal::Agent,
+                content: vec![MessageContent::ToolCall {
+                    call: ToolCall {
+                        id: "call-1".to_string(),
+                        name: "leak".to_string(),
+                        arguments: serde_json::json!({"command":"reject marker command"})
+                            .to_string(),
+                    },
+                }],
+            },
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "leak".to_string(),
+                arguments: serde_json::json!({"command":"reject marker command"}).to_string(),
+            }],
+            meta: None,
+            stop_reason: StopReason::ToolCalls,
+        }]);
+        let mut session = crate::session::Session::new(&dir).unwrap();
+
+        struct NeedsApproval;
+
+        impl Guard for NeedsApproval {
+            fn name(&self) -> &str {
+                "needs-approval"
+            }
+
+            fn check(
+                &self,
+                event: &mut GuardEvent,
+                _context: &crate::gate::GuardContext,
+            ) -> Verdict {
+                match event {
+                    GuardEvent::ToolCall(_) => Verdict::Approve {
+                        reason: "danger".to_string(),
+                        gate_id: "needs-approval".to_string(),
+                        severity: Severity::High,
+                    },
+                    _ => Verdict::Allow,
+                }
+            }
+        }
+
+        let turn = Turn::new().guard(NeedsApproval);
+        let mut make_provider = {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| false;
+
+        let verdict = run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "reject marker command".to_string(),
+            Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            verdict,
+            TurnVerdict::Denied { reason, gate_id }
+                if reason == "danger" && gate_id == "needs-approval"
+        ));
+
+        let stored = session.history();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[2].role, crate::llm::ChatRole::Assistant);
+        assert_eq!(stored[2].principal, Principal::System);
+        let note = match &stored[2].content[0] {
+            MessageContent::Text { text } => text,
+            _ => panic!("expected text audit note"),
+        };
+        assert_eq!(
+            note,
+            "Tool execution rejected after approval by needs-approval"
+        );
+        assert!(!note.contains("reject marker command"));
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -978,6 +1111,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbound_approval_denial_audit_is_not_system_role_or_raw_command() {
+        let dir = temp_sessions_dir("inbound_approval_denial_audit");
+        let provider = SequenceProvider::new(vec![StreamedTurn {
+            assistant_message: ChatMessage {
+                role: crate::llm::ChatRole::Assistant,
+                principal: Principal::Agent,
+                content: vec![MessageContent::text("unused")],
+            },
+            tool_calls: vec![],
+            meta: None,
+            stop_reason: StopReason::Stop,
+        }]);
+        let mut session = crate::session::Session::new(&dir).unwrap();
+
+        struct NeedsApproval;
+
+        impl Guard for NeedsApproval {
+            fn name(&self) -> &str {
+                "needs-approval"
+            }
+
+            fn check(
+                &self,
+                event: &mut GuardEvent,
+                _context: &crate::gate::GuardContext,
+            ) -> Verdict {
+                match event {
+                    GuardEvent::Inbound(_) => Verdict::Approve {
+                        reason: "danger".to_string(),
+                        gate_id: "needs-approval".to_string(),
+                        severity: Severity::High,
+                    },
+                    _ => Verdict::Allow,
+                }
+            }
+        }
+
+        let turn = Turn::new().guard(NeedsApproval);
+        let mut make_provider = {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| false;
+
+        let verdict = run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "reject marker inbound".to_string(),
+            Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            verdict,
+            TurnVerdict::Denied { reason, gate_id }
+                if reason == "danger" && gate_id == "needs-approval"
+        ));
+
+        let stored = session.history();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[1].role, crate::llm::ChatRole::Assistant);
+        assert_eq!(stored[1].principal, Principal::System);
+        let note = match &stored[1].content[0] {
+            MessageContent::Text { text } => text,
+            _ => panic!("expected text audit note"),
+        };
+        assert_eq!(note, "Message rejected after approval by needs-approval");
+        assert!(!note.contains("reject marker inbound"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hard_deny_audit_is_not_system_role_or_raw_command() {
+        let dir = temp_sessions_dir("hard_deny_audit");
+        let provider = SequenceProvider::new(vec![StreamedTurn {
+            assistant_message: ChatMessage {
+                role: crate::llm::ChatRole::Assistant,
+                principal: Principal::Agent,
+                content: vec![MessageContent::ToolCall {
+                    call: ToolCall {
+                        id: "call-1".to_string(),
+                        name: "leak".to_string(),
+                        arguments: serde_json::json!({"command":"hard deny marker"}).to_string(),
+                    },
+                }],
+            },
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "leak".to_string(),
+                arguments: serde_json::json!({"command":"hard deny marker"}).to_string(),
+            }],
+            meta: None,
+            stop_reason: StopReason::ToolCalls,
+        }]);
+        let mut session = crate::session::Session::new(&dir).unwrap();
+
+        struct HardDeny;
+
+        impl Guard for HardDeny {
+            fn name(&self) -> &str {
+                "hard-deny"
+            }
+
+            fn check(
+                &self,
+                event: &mut GuardEvent,
+                _context: &crate::gate::GuardContext,
+            ) -> Verdict {
+                match event {
+                    GuardEvent::ToolCall(_) => Verdict::Deny {
+                        reason: "blocked".to_string(),
+                        gate_id: "hard-deny".to_string(),
+                    },
+                    _ => Verdict::Allow,
+                }
+            }
+        }
+
+        let turn = Turn::new().guard(HardDeny);
+        let mut make_provider = {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        let verdict = run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "hard deny marker".to_string(),
+            Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            verdict,
+            TurnVerdict::Denied { reason, gate_id }
+                if reason == "blocked" && gate_id == "hard-deny"
+        ));
+
+        let stored = session.history();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[2].role, crate::llm::ChatRole::Assistant);
+        assert_eq!(stored[2].principal, Principal::System);
+        let note = match &stored[2].content[0] {
+            MessageContent::Text { text } => text,
+            _ => panic!("expected text audit note"),
+        };
+        assert_eq!(note, "Tool execution hard-denied by hard-deny");
+        assert!(!note.contains("hard deny marker"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn tool_output_is_redacted_before_persist() {
         let dir = temp_sessions_dir("tool_redaction");
         let provider = SequenceProvider::new(vec![
@@ -1038,6 +1342,39 @@ mod tests {
         let session_file = std::fs::read_to_string(session.today_path()).unwrap();
         assert!(!session_file.contains("sk-proj-abcdefghijklmnopqrstuvwxyz012345"));
         assert!(session_file.contains("[REDACTED]"));
+
+        let tool_message = session
+            .history()
+            .iter()
+            .find(|message| message.role == crate::llm::ChatRole::Tool)
+            .expect("tool message should be persisted");
+        assert_eq!(tool_message.principal, Principal::System);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replayed_tool_result_marks_followup_turn_tainted() {
+        let dir = temp_sessions_dir("replayed_tool_taint");
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        session
+            .append(
+                ChatMessage::tool_result_with_principal(
+                    "call-1",
+                    "execute",
+                    "stdout:\nok",
+                    Some(Principal::System),
+                ),
+                None,
+            )
+            .unwrap();
+
+        let turn = Turn::new();
+        let mut messages = session.history().to_vec();
+
+        let verdict = turn.check_inbound(&mut messages, None);
+        assert!(matches!(verdict, Verdict::Allow | Verdict::Modify));
+        assert!(turn.is_tainted());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -1,9 +1,10 @@
 //! HTTP and WebSocket server for queue-driven agent execution.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -31,7 +32,7 @@ const API_KEY_HEADER: &str = "x-api-key";
 #[derive(Clone)]
 pub struct ServerState {
     store: Arc<Mutex<store::Store>>,
-    worker_lock: Arc<Mutex<()>>,
+    session_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
     sessions_dir: PathBuf,
     api_key: String,
     operator_key: Option<String>,
@@ -93,6 +94,128 @@ struct WsApprovalDecision {
     approved: bool,
 }
 
+impl ServerState {
+    fn session_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .session_locks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        locks
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+}
+
+struct SessionLockLease {
+    state: ServerState,
+    session_id: String,
+    lock: std::sync::Weak<Mutex<()>>,
+}
+
+impl Drop for SessionLockLease {
+    fn drop(&mut self) {
+        let mut locks = self
+            .state
+            .session_locks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(current) = locks.get(&self.session_id)
+            && Arc::as_ptr(current) == self.lock.as_ptr()
+            && Arc::strong_count(current) == 2
+        {
+            locks.remove(&self.session_id);
+        }
+    }
+}
+
+async fn drain_session_queue<F, Fut, P, TS, AH>(
+    state: ServerState,
+    session_id: String,
+    turn: &turn::Turn,
+    make_provider: &mut F,
+    token_sink: &mut TS,
+    approval_handler: &mut AH,
+) -> Result<Option<agent::TurnVerdict>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<P>>,
+    P: llm::LlmProvider,
+    TS: agent::TokenSink + Send + ?Sized,
+    AH: agent::ApprovalHandler + ?Sized,
+{
+    let session_lock = state.session_lock(&session_id);
+    let _session_lock_lease = SessionLockLease {
+        state: state.clone(),
+        session_id: session_id.clone(),
+        lock: Arc::downgrade(&session_lock),
+    };
+    let _session_guard = session_lock.lock().await;
+
+    let mut history = session::Session::new(state.sessions_dir.join(&session_id))
+        .with_context(|| format!("failed to open session {session_id}"))?;
+    history.load_today()?;
+
+    loop {
+        let message = {
+            let mut store = state.store.lock().await;
+            store.dequeue_next_message(&session_id)?
+        };
+
+        let Some(message) = message else {
+            break;
+        };
+
+        let outcome = agent::process_queued_message(
+            &message,
+            &mut history,
+            turn,
+            make_provider,
+            token_sink,
+            approval_handler,
+        )
+        .await;
+
+        match outcome {
+            Ok(agent::QueueOutcome::Agent(verdict)) => {
+                {
+                    let mut store = state.store.lock().await;
+                    store.mark_processed(message.id)?;
+                }
+
+                match verdict {
+                    agent::TurnVerdict::Executed(_) => {}
+                    agent::TurnVerdict::Approved { .. } => {
+                        eprintln!("Command approved by user and executed.");
+                    }
+                    agent::TurnVerdict::Denied { reason, gate_id } => {
+                        return Ok(Some(agent::TurnVerdict::Denied { reason, gate_id }));
+                    }
+                }
+            }
+            Ok(agent::QueueOutcome::Stored) => {
+                let mut store = state.store.lock().await;
+                store.mark_processed(message.id)?;
+            }
+            Ok(agent::QueueOutcome::UnsupportedRole(role)) => {
+                eprintln!(
+                    "unsupported queued role '{role}' for message {}",
+                    message.id
+                );
+                let mut store = state.store.lock().await;
+                store.mark_processed(message.id)?;
+            }
+            Err(error) => {
+                let mut store = state.store.lock().await;
+                store.mark_failed(message.id)?;
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 pub async fn run(port: u16) -> Result<()> {
     let config = config::Config::load("agents.toml").context("failed to load configuration")?;
     let api_key = std::env::var("AUTOPOIESIS_API_KEY")
@@ -111,7 +234,7 @@ pub async fn run(port: u16) -> Result<()> {
     }
     let state = ServerState {
         store: Arc::new(Mutex::new(store)),
-        worker_lock: Arc::new(Mutex::new(())),
+        session_locks: Arc::new(StdMutex::new(HashMap::new())),
         sessions_dir: PathBuf::from("sessions"),
         api_key,
         operator_key: config.operator_key.clone(),
@@ -299,32 +422,9 @@ async fn websocket_session(
             }
         };
 
-        let _worker_guard = state.worker_lock.lock().await;
-        let mut history = match session::Session::new(state.sessions_dir.join(&session_id))
-            .with_context(|| format!("failed to open session {session_id}"))
-        {
-            Ok(history) => history,
-            Err(error) => {
-                let _ = tx.send(WsFrame::Error {
-                    data: format!("error: {error}"),
-                });
-                let _ = tx.send(WsFrame::Done);
-                continue;
-            }
-        };
-        if let Err(error) = history.load_today() {
-            let _ = tx.send(WsFrame::Error {
-                data: format!("error: {error}"),
-            });
-            let _ = tx.send(WsFrame::Done);
-            continue;
-        }
-
-        let mut store = state.store.lock().await;
-        match agent::drain_queue(
-            &mut store,
-            &session_id,
-            &mut history,
+        match drain_session_queue(
+            state.clone(),
+            session_id.clone(),
             &turn,
             &mut provider_factory,
             &mut token_sink,
@@ -443,25 +543,9 @@ fn spawn_http_queue_worker(state: ServerState, session_id: String) {
         };
         let mut token_sink = NoopTokenSink;
         let mut approval_handler = RejectApprovalHandler;
-        let _worker_guard = state.worker_lock.lock().await;
-        let mut history = match session::Session::new(state.sessions_dir.join(&session_id))
-            .with_context(|| format!("failed to open session {session_id}"))
-        {
-            Ok(history) => history,
-            Err(error) => {
-                eprintln!("failed to drain queued HTTP messages for {session_id}: {error}");
-                return;
-            }
-        };
-        if let Err(error) = history.load_today() {
-            eprintln!("failed to drain queued HTTP messages for {session_id}: {error}");
-            return;
-        }
-        let mut store = state.store.lock().await;
-        match agent::drain_queue(
-            &mut store,
-            &session_id,
-            &mut history,
+        match drain_session_queue(
+            state.clone(),
+            session_id.clone(),
             &turn,
             &mut provider_factory,
             &mut token_sink,
@@ -658,7 +742,7 @@ mod tests {
         (
             ServerState {
                 store: Arc::new(Mutex::new(store)),
-                worker_lock: Arc::new(Mutex::new(())),
+                session_locks: Arc::new(StdMutex::new(HashMap::new())),
                 sessions_dir,
                 api_key: "test-key".to_string(),
                 operator_key: Some("operator-key".to_string()),
@@ -717,6 +801,19 @@ mod tests {
         .unwrap()
     }
 
+    fn blocking_turn(label: &'static str) -> StreamedTurn {
+        StreamedTurn {
+            assistant_message: ChatMessage {
+                role: llm::ChatRole::Assistant,
+                principal: Principal::Agent,
+                content: vec![llm::MessageContent::text(label)],
+            },
+            tool_calls: vec![],
+            meta: None,
+            stop_reason: StopReason::Stop,
+        }
+    }
+
     #[derive(Clone)]
     struct StaticProvider {
         turn: StreamedTurn,
@@ -758,6 +855,27 @@ mod tests {
                 .expect("sequence provider mutex poisoned")
                 .pop()
                 .ok_or_else(|| anyhow!("no more turns"))
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingProvider {
+        label: &'static str,
+        barrier: Arc<tokio::sync::Barrier>,
+        starts: tokio::sync::mpsc::UnboundedSender<&'static str>,
+        turn: StreamedTurn,
+    }
+
+    impl llm::LlmProvider for BlockingProvider {
+        async fn stream_completion(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[FunctionTool],
+            _on_token: &mut (dyn FnMut(String) + Send),
+        ) -> Result<StreamedTurn> {
+            let _ = self.starts.send(self.label);
+            self.barrier.wait().await;
+            Ok(self.turn.clone())
         }
     }
 
@@ -1049,6 +1167,349 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "processed");
+    }
+
+    #[tokio::test]
+    async fn different_sessions_do_not_block_each_other() {
+        let (state, _queue_path) = test_state();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let (starts_tx, mut starts_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        for session_id in ["session-a", "session-b"] {
+            let mut store = state.store.lock().await;
+            store.create_session(session_id, None).unwrap();
+            store
+                .enqueue_message(session_id, "user", "hello", "ws")
+                .unwrap();
+        }
+
+        let turn = Arc::new(turn::Turn::new());
+        let state_a = state.clone();
+        let barrier_a = barrier.clone();
+        let starts_a = starts_tx.clone();
+        let turn_a = turn.clone();
+        let worker_a = tokio::spawn(async move {
+            let provider = BlockingProvider {
+                label: "session-a",
+                barrier: barrier_a,
+                starts: starts_a,
+                turn: blocking_turn("session-a"),
+            };
+            let mut provider_factory = move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            };
+            let mut token_sink = |_token: String| {};
+            let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+            drain_session_queue(
+                state_a,
+                "session-a".to_string(),
+                turn_a.as_ref(),
+                &mut provider_factory,
+                &mut token_sink,
+                &mut approval_handler,
+            )
+            .await
+            .unwrap()
+        });
+
+        let state_b = state.clone();
+        let barrier_b = barrier.clone();
+        let starts_b = starts_tx.clone();
+        let turn_b = turn.clone();
+        let worker_b = tokio::spawn(async move {
+            let provider = BlockingProvider {
+                label: "session-b",
+                barrier: barrier_b,
+                starts: starts_b,
+                turn: blocking_turn("session-b"),
+            };
+            let mut provider_factory = move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            };
+            let mut token_sink = |_token: String| {};
+            let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+            drain_session_queue(
+                state_b,
+                "session-b".to_string(),
+                turn_b.as_ref(),
+                &mut provider_factory,
+                &mut token_sink,
+                &mut approval_handler,
+            )
+            .await
+            .unwrap()
+        });
+
+        let mut started = vec![
+            tokio::time::timeout(std::time::Duration::from_secs(2), starts_rx.recv())
+                .await
+                .expect("first session should start")
+                .unwrap(),
+            tokio::time::timeout(std::time::Duration::from_secs(2), starts_rx.recv())
+                .await
+                .expect("second session should start")
+                .unwrap(),
+        ];
+        started.sort_unstable();
+        assert_eq!(started, vec!["session-a", "session-b"]);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let (result_a, result_b) = tokio::join!(worker_a, worker_b);
+            result_a.expect("session-a worker should complete successfully");
+            result_b.expect("session-b worker should complete successfully");
+        })
+        .await
+        .expect("different sessions should not serialize");
+    }
+
+    #[tokio::test]
+    async fn same_session_processing_is_serialized() {
+        let (state, _queue_path) = test_state();
+        let session_id = "serialized-session";
+
+        {
+            let mut store = state.store.lock().await;
+            store.create_session(session_id, None).unwrap();
+            store
+                .enqueue_message(session_id, "user", "hello", "ws")
+                .unwrap();
+        }
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (starts_tx, mut starts_rx) = tokio::sync::mpsc::unbounded_channel();
+        let acquired = Arc::new(tokio::sync::Notify::new());
+        let turn = Arc::new(turn::Turn::new());
+
+        #[derive(Clone)]
+        struct NotifyProvider {
+            label: &'static str,
+            release: Arc<tokio::sync::Notify>,
+            starts: tokio::sync::mpsc::UnboundedSender<&'static str>,
+            turn: StreamedTurn,
+        }
+
+        impl llm::LlmProvider for NotifyProvider {
+            async fn stream_completion(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: &[FunctionTool],
+                _on_token: &mut (dyn FnMut(String) + Send),
+            ) -> Result<StreamedTurn> {
+                let _ = self.starts.send(self.label);
+                self.release.notified().await;
+                Ok(self.turn.clone())
+            }
+        }
+
+        let state_a = state.clone();
+        let release_a = release.clone();
+        let starts_a = starts_tx.clone();
+        let turn_a = turn.clone();
+        let worker_a = tokio::spawn(async move {
+            let provider = NotifyProvider {
+                label: "first",
+                release: release_a,
+                starts: starts_a,
+                turn: blocking_turn("first"),
+            };
+            let mut provider_factory = move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            };
+            let mut token_sink = |_token: String| {};
+            let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+            drain_session_queue(
+                state_a,
+                session_id.to_string(),
+                turn_a.as_ref(),
+                &mut provider_factory,
+                &mut token_sink,
+                &mut approval_handler,
+            )
+            .await
+            .unwrap()
+        });
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), starts_rx.recv())
+                .await
+                .expect("first worker should start")
+                .unwrap(),
+            "first"
+        );
+
+        let state_b = state.clone();
+        let acquired_b = acquired.clone();
+        let worker_b = tokio::spawn(async move {
+            let session_lock = state_b.session_lock(session_id);
+            let _guard = session_lock.lock().await;
+            acquired_b.notify_one();
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), acquired.notified())
+                .await
+                .is_err(),
+            "second worker should wait on the same-session lock"
+        );
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            worker_a
+                .await
+                .expect("first worker should complete successfully");
+            acquired.notified().await;
+            worker_b
+                .await
+                .expect("second worker should complete successfully");
+        })
+        .await
+        .expect("both workers should finish after lock release");
+    }
+
+    #[tokio::test]
+    async fn store_mutex_is_not_held_across_agent_turn() {
+        let (state, _queue_path) = test_state();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (starts_tx, mut starts_rx) = tokio::sync::mpsc::unbounded_channel();
+        let session_id = "store-release-session";
+
+        {
+            let mut store = state.store.lock().await;
+            store.create_session(session_id, None).unwrap();
+            store
+                .enqueue_message(session_id, "user", "hello", "ws")
+                .unwrap();
+        }
+
+        let turn = Arc::new(turn::Turn::new());
+
+        #[derive(Clone)]
+        struct NotifyProvider {
+            label: &'static str,
+            release: Arc<tokio::sync::Notify>,
+            starts: tokio::sync::mpsc::UnboundedSender<&'static str>,
+            turn: StreamedTurn,
+        }
+
+        impl llm::LlmProvider for NotifyProvider {
+            async fn stream_completion(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: &[FunctionTool],
+                _on_token: &mut (dyn FnMut(String) + Send),
+            ) -> Result<StreamedTurn> {
+                let _ = self.starts.send(self.label);
+                self.release.notified().await;
+                Ok(self.turn.clone())
+            }
+        }
+
+        let state_worker = state.clone();
+        let release_worker = release.clone();
+        let starts_worker = starts_tx.clone();
+        let turn_worker = turn.clone();
+        let worker = tokio::spawn(async move {
+            let provider = NotifyProvider {
+                label: "worker",
+                release: release_worker,
+                starts: starts_worker,
+                turn: blocking_turn("worker"),
+            };
+            let mut provider_factory = move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            };
+            let mut token_sink = |_token: String| {};
+            let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+            drain_session_queue(
+                state_worker,
+                session_id.to_string(),
+                turn_worker.as_ref(),
+                &mut provider_factory,
+                &mut token_sink,
+                &mut approval_handler,
+            )
+            .await
+            .unwrap()
+        });
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), starts_rx.recv())
+                .await
+                .expect("worker should start")
+                .unwrap(),
+            "worker"
+        );
+
+        let store_task = {
+            let state = state.clone();
+            async move {
+                let mut store = state.store.lock().await;
+                store.create_session("unblocked", None).unwrap();
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_millis(200), store_task)
+            .await
+            .expect("store mutex should be released before provider execution");
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            worker
+                .await
+                .expect("worker should finish after barrier release");
+        })
+        .await
+        .expect("worker should finish after barrier release");
+    }
+
+    #[tokio::test]
+    async fn session_lock_entry_is_evicted_after_drain() {
+        let (state, _queue_path) = test_state();
+        let session_id = "evict-session";
+
+        {
+            let mut store = state.store.lock().await;
+            store.create_session(session_id, None).unwrap();
+            store
+                .enqueue_message(session_id, "user", "hello", "ws")
+                .unwrap();
+        }
+
+        let turn = Arc::new(turn::Turn::new());
+        let provider = StaticProvider {
+            turn: blocking_turn("evict-session"),
+        };
+        let mut provider_factory = {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        drain_session_queue(
+            state.clone(),
+            session_id.to_string(),
+            turn.as_ref(),
+            &mut provider_factory,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            state
+                .session_locks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
     }
 
     #[tokio::test]

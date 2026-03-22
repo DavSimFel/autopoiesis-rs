@@ -83,12 +83,54 @@ pub(crate) fn guard_message_output(turn: &Turn, message: &mut ChatMessage) {
     for block in &mut message.content {
         if let MessageContent::Text { text } = block {
             *text = guard_text_output(turn, std::mem::take(text));
+        } else if let MessageContent::ToolCall { call } = block {
+            call.arguments = redact_tool_call_arguments(turn, std::mem::take(&mut call.arguments));
         }
     }
 
     message
         .content
         .retain(|block| !matches!(block, MessageContent::Text { text } if text.is_empty()));
+}
+
+fn redact_tool_call_arguments(turn: &Turn, arguments: String) -> String {
+    if arguments.is_empty() {
+        return arguments;
+    }
+
+    match serde_json::from_str::<serde_json::Value>(&arguments) {
+        Ok(mut value) => {
+            fn redact_value(turn: &Turn, value: &mut serde_json::Value) {
+                match value {
+                    serde_json::Value::String(text) => {
+                        *text = guard_text_output(turn, std::mem::take(text));
+                    }
+                    serde_json::Value::Array(items) => {
+                        for item in items {
+                            redact_value(turn, item);
+                        }
+                    }
+                    serde_json::Value::Object(map) => {
+                        let mut redacted = serde_json::Map::new();
+                        for (key, mut value) in std::mem::take(map) {
+                            let redacted_key = guard_text_output(turn, key);
+                            redact_value(turn, &mut value);
+                            redacted.insert(redacted_key, value);
+                        }
+                        *map = redacted;
+                    }
+                    _ => {}
+                }
+            }
+
+            redact_value(turn, &mut value);
+            serde_json::to_string(&value).unwrap_or(arguments)
+        }
+        Err(_) => serde_json::to_string(&serde_json::json!({
+            "redacted": guard_text_output(turn, arguments)
+        }))
+        .unwrap_or_else(|_| "{\"redacted\":\"\"}".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -155,6 +197,128 @@ mod tests {
                 assert_eq!(result.content, "kept");
             }
             _ => panic!("expected tool result"),
+        }
+    }
+
+    #[test]
+    fn guard_message_output_redacts_tool_call_arguments() {
+        let turn = Turn::new().guard(crate::gate::secret_redactor::SecretRedactor::new(&[
+            r"sk-[a-zA-Z0-9_-]{20,}",
+        ]));
+        let mut message = ChatMessage {
+            role: ChatRole::Assistant,
+            principal: Principal::Agent,
+            content: vec![MessageContent::ToolCall {
+                call: ToolCall {
+                    id: "call-1".to_string(),
+                    name: "execute".to_string(),
+                    arguments: json!({"command":"echo sk-proj-abcdefghijklmnopqrstuvwxyz012345"})
+                        .to_string(),
+                },
+            }],
+        };
+
+        guard_message_output(&turn, &mut message);
+
+        match &message.content[0] {
+            MessageContent::ToolCall { call } => {
+                assert!(call.arguments.contains("[REDACTED]"));
+                assert!(
+                    !call
+                        .arguments
+                        .contains("sk-proj-abcdefghijklmnopqrstuvwxyz012345")
+                );
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn guard_message_output_redacts_tool_call_argument_keys() {
+        let turn = Turn::new().guard(crate::gate::secret_redactor::SecretRedactor::new(&[
+            r"sk-[a-zA-Z0-9_-]{20,}",
+        ]));
+        let mut message = ChatMessage {
+            role: ChatRole::Assistant,
+            principal: Principal::Agent,
+            content: vec![MessageContent::ToolCall {
+                call: ToolCall {
+                    id: "call-2".to_string(),
+                    name: "execute".to_string(),
+                    arguments: json!({
+                        "sk-proj-abcdefghijklmnopqrstuvwxyz012345": "value"
+                    })
+                    .to_string(),
+                },
+            }],
+        };
+
+        guard_message_output(&turn, &mut message);
+
+        match &message.content[0] {
+            MessageContent::ToolCall { call } => {
+                let parsed: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
+                let object = parsed.as_object().expect("expected object arguments");
+                assert!(!object.contains_key("sk-proj-abcdefghijklmnopqrstuvwxyz012345"));
+                assert!(object.contains_key("[REDACTED]"));
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn guard_message_output_deny_keeps_tool_call_arguments_valid_json() {
+        let turn = Turn::new().guard(DenyTextGuard);
+        let mut message = ChatMessage {
+            role: ChatRole::Assistant,
+            principal: Principal::Agent,
+            content: vec![MessageContent::ToolCall {
+                call: ToolCall {
+                    id: "call-1".to_string(),
+                    name: "execute".to_string(),
+                    arguments: "{\"command\":\"echo secret\"}".to_string(),
+                },
+            }],
+        };
+
+        guard_message_output(&turn, &mut message);
+
+        match &message.content[0] {
+            MessageContent::ToolCall { call } => {
+                let _parsed: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
+                assert!(!call.arguments.contains("secret"));
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn guard_message_output_preserves_valid_json_for_malformed_tool_call_arguments() {
+        let turn = Turn::new().guard(DenyTextGuard);
+        let mut message = ChatMessage {
+            role: ChatRole::Assistant,
+            principal: Principal::Agent,
+            content: vec![MessageContent::ToolCall {
+                call: ToolCall {
+                    id: "call-3".to_string(),
+                    name: "execute".to_string(),
+                    arguments: "{not valid json".to_string(),
+                },
+            }],
+        };
+
+        guard_message_output(&turn, &mut message);
+
+        match &message.content[0] {
+            MessageContent::ToolCall { call } => {
+                let parsed: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
+                let object = parsed.as_object().expect("expected object arguments");
+                assert_eq!(
+                    object.get("redacted").and_then(|value| value.as_str()),
+                    Some("")
+                );
+            }
+            _ => panic!("expected tool call"),
         }
     }
 }

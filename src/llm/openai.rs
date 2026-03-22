@@ -861,6 +861,33 @@ mod tests {
     }
 
     #[test]
+    fn build_input_keeps_audit_notes_out_of_system_replay_path() {
+        let messages = vec![
+            ChatMessage::system("Primary system instructions"),
+            ChatMessage::user("Hello"),
+            ChatMessage::with_role_with_principal(ChatRole::Assistant, Some(Principal::System)),
+        ];
+        let mut messages = messages;
+        messages[2].content.push(MessageContent::text(
+            "Tool execution rejected after approval by shell-policy",
+        ));
+
+        let (instructions, input) = OpenAIProvider::build_input(&messages);
+
+        assert_eq!(
+            instructions,
+            Some("Primary system instructions".to_string())
+        );
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(
+            input[1]["content"],
+            "Tool execution rejected after approval by shell-policy"
+        );
+    }
+
+    #[test]
     fn build_input_converts_tool_calls_to_function_call_with_call_id() {
         let messages = vec![ChatMessage {
             role: ChatRole::Assistant,
