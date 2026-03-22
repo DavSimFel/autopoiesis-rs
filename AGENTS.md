@@ -8,7 +8,7 @@ How to work in this repo. Read this first.
 
 ```bash
 cargo build --release          # must succeed with zero warnings
-cargo test                     # 124 tests, all must pass (1 ignored)
+cargo test                     # all must pass
 cargo fmt --check              # must pass
 cargo clippy -- -D warnings    # must pass
 cargo test --features integration  # live API tests (skip if no auth)
@@ -36,10 +36,10 @@ docs/audits/         Immutable review logs
 research/            Non-authoritative explorations
 ```
 
-## Architecture rules
+## Architecture rules (intended — see risks.md for what's broken)
 
 1. **One tool.** Shell is the universal tool. Don't add tools — teach the prompt.
-2. **Guard pipeline order.** Deny > Approve > Allow. `resolve_verdict()` in turn.rs.
+2. **Guard pipeline order.** Deny > Approve > Allow in `resolve_verdict()` (turn.rs). Note: this is local verdict precedence only — see [risks.md](docs/current/risks.md) for orchestration-layer gaps.
 3. **No `unsafe` outside RLIMIT.** Only the `pre_exec` closure in tool.rs.
 4. **Traits for composition.** ContextSource, Tool, Guard, LlmProvider, TokenSink, ApprovalHandler.
 5. **Two paths share one Turn.** CLI and server both use `build_default_turn()`. Don't diverge.
@@ -50,7 +50,7 @@ research/            Non-authoritative explorations
 - No `.unwrap()` in non-test code. Never silently swallow errors indicating corruption or I/O failure.
 - tokio for async. `tokio::time::timeout` for shell. `libc::killpg` for timeout cleanup.
 - serde + serde_json. JSONL for sessions.
-- Tests in `#[cfg(test)] mod tests`. Unique temp dir names (timestamp-based).
+- Unit tests in `#[cfg(test)] mod tests` at the bottom of each source file. Integration tests go in `tests/` (behind feature flags). Unique temp dir names (timestamp-based).
 - Test functions describe behavior: `trim_drops_oldest_non_system_messages`.
 
 ## Git workflow

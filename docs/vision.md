@@ -6,7 +6,7 @@
 
 ## Core ideas
 
-**One inbox, any source.** Cron, webhook, user, agent — all feed the same SQLite queue. The agent loop reads the next message, thinks, acts, responds. Never knows or cares where the message came from.
+**One inbox, any source.** Cron, webhook, user, agent — all feed the same SQLite queue. The agent loop reads the next message, thinks, acts, responds. Transport is source-agnostic — the queue doesn't care how the message arrived. But authority is NOT source-agnostic: every message carries a `principal` (operator/user/agent/system) and taint status. The agent doesn't know the transport; it DOES know the trust level.
 
 **Shell is the universal tool.** File I/O, web requests, process management, agent-to-agent calls, self-configuration — all through shell. The prompt teaches the agent what to do. The tool surface stays at one.
 
@@ -29,13 +29,13 @@
 - **Head/Tail** — first/last N lines
 - **JQ** — JSON query (`--jq ".status"`)
 
-No hard budget limit. CLI reports utilization on every change. Agent manages its own context. If it overflows, history trimming drops oldest turns. Hard limits are for safety (guards); context management is for intelligence (the agent's job).
+**Two budget layers.** The safety layer enforces hard ceilings: per-turn token limit, per-session limit, per-day cost cap. These are guard-enforced and non-negotiable — the agent cannot exceed them. The intelligence layer is the agent's own context management: CLI reports utilization on every subscription change, the agent decides what to load/unload, and history trimming drops oldest turns when approaching the ceiling. Hard limits prevent runaway; the agent optimizes within them. Trimming preserves assistant/tool round-trips — never splits a tool call from its result.
 
 **Topics are optional indexes.** A topic is a name + activation state + subscriptions + triggers + relations. All in SQLite, all managed through CLI. When topics aren't needed, subscriptions work standalone (implicitly in `_default` topic).
 
-**CLI is the self-management interface.** The agent manages itself through its own binary via shell. Files for storage, CLI for validated control plane. Every management action is a shell call in history, auditable by guards.
+**CLI is the self-management interface.** The agent manages itself through its own binary via shell. Files for storage, CLI for validated control plane. Every management action is a shell call in history, auditable by guards. Note: this makes context management a privilege escalation surface until taint tracking is built — see [risks.md](current/risks.md).
 
-**Safety is multi-dimensional.** Four gate dimensions work together:
+**Safety is multi-dimensional (target state — not all built yet).** Four gate dimensions work together:
 - **Permissions** — what the agent CAN touch (filesystem, network, resources)
 - **Approval** — human-in-the-loop escalation for risky actions
 - **Taint** — tracks provenance of untrusted input; tainted commands escalate even if they match standing approvals
@@ -49,13 +49,13 @@ Standing approvals + taint tracking together enable practical safe autonomy. Wit
 3. `identity.md` — Agent persona. Self-modifiable within operator bounds.
 4. `context.md` — Operational steering. Working memory, focus, reminders.
 
-Write-protection enforced by guard pipeline (ShellSafety blocks writes to constitution.md + operator.md).
+Write-protection will be enforced by guard pipeline (ShellSafety blocking writes to constitution.md + operator.md). **Not yet built** — currently the agent can write to any file the process user can access. This depends on the security stack (roadmap items 1a-1c).
 
 **Messages carry metadata.** `<meta ts="..." principal="operator|user|agent:id|system" />` on every user message. Makes Chain of Command enforceable per-message.
 
 **Agent-to-agent = message.** T1 spawns T3 by posting a message to a new session. One agent can subscribe files for another session — that's delegation with context.
 
-**SQLite is the backbone.** Session state, message queue, subscription records — one database file. ACID, concurrent-safe, crash-recoverable.
+**SQLite is the backbone.** Session state, message queue, subscription records — one database file. ACID and crash-recoverable. Note: the current queue claim operation is not atomic across processes — see [risks.md](current/risks.md#p1-2). True concurrent safety requires fixing the claim path.
 
 ## Topics at scale
 
@@ -92,14 +92,14 @@ Triggers: cron + webhook only. No file-watching (cron + stat does the same job).
 
 ## Surfaces
 
-**Cross-platform CLI + GUI.** Not IDE-first — IDE is dead or the operator can VSCode Remote into the repo.
+**Cross-platform CLI + GUI.** CLI-first, not IDE-first. IDE integration is not a priority — the operator can VSCode Remote into the repo if needed. The runtime owns the experience, not the editor.
 
 - **CLI** — primary interface. One binary, works everywhere.
 - **Web GUI** — lightweight client for the HTTP/SSE server. Works on any device with a browser.
 - **Android app** — native companion for mobile access.
 - **Desktop** — Windows + Linux native clients (or wrapper over web GUI).
 
-All surfaces talk to the same server/queue. The agent doesn't know or care which surface sent the message. No surface-specific logic in the runtime.
+All surfaces talk to the same server/queue. The agent doesn't know or care which surface sent the message. No surface-specific logic in the runtime. For code-centric workflows, the CLI + worktree isolation (via T2/T3 tiers) replaces what IDE integrations provide in other runtimes.
 
 ## Multi-agent tiers
 
@@ -145,6 +145,13 @@ Two-tiered: shipped and custom.
 - **Summaries** — distilled from journal entries. Agent curates what matters.
 - **Topic files** — working notes per domain/project. Plans, state, questions.
 - **Workspace files** — code, configs, data. First-class context via subscriptions.
+
+**Memory policy (even for MVP):**
+- **Provenance** — every memory entry records its source (which session, which message, which tool call). Memory without provenance is a context-poisoning vector.
+- **Citation** — when the agent uses a memory, it cites the source. Traceable reasoning.
+- **Promotion** — raw journal → reviewed summary → durable fact. Explicit promotion, not silent accumulation.
+- **Pruning** — stale entries are archived or deleted. Agent proposes, operator approves pruning of durable facts. Journal entries auto-archive after configurable TTL.
+- **Taint inheritance** — memories derived from tainted input inherit taint. A fact learned from an untrusted webhook stays tainted until operator-verified.
 
 **V1: Knowledge engine.** Graph-based. Bitemporal. Source-tracked provenance. Truth scoring. Ontology discovery. Hybrid retrieval (FTS + vector + graph traversal).
 

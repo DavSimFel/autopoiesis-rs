@@ -5,7 +5,7 @@
 
 ## Overview
 
-17 source files, ~7.6K lines, 124 tests. One binary: CLI (REPL or one-shot) + HTTP/WS server. One tool: shell.
+17 source files, ~8K lines. One binary: CLI (REPL or one-shot) + HTTP/WS server. One tool: shell. Run `cargo test` for current count.
 
 ## Module map
 
