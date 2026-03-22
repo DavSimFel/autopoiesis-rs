@@ -1,9 +1,10 @@
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::context::ContextSource;
 use crate::gate::{
-    ExfilDetector, Guard, GuardEvent, SecretRedactor, Severity, ShellSafety, Verdict,
+    ExfilDetector, Guard, GuardContext, GuardEvent, SecretRedactor, Severity, ShellSafety, Verdict,
 };
 use crate::llm::{ChatMessage, FunctionTool, ToolCall};
 use crate::tool::Tool;
@@ -13,6 +14,7 @@ pub struct Turn {
     context: Vec<Box<dyn ContextSource>>,
     tools: Vec<Box<dyn Tool>>,
     guards: Vec<Box<dyn Guard>>,
+    tainted: AtomicBool,
 }
 
 impl Turn {
@@ -21,6 +23,7 @@ impl Turn {
             context: Vec::new(),
             tools: Vec::new(),
             guards: Vec::new(),
+            tainted: AtomicBool::new(false),
         }
     }
 
@@ -43,6 +46,10 @@ impl Turn {
         self.tools.iter().map(|tool| tool.definition()).collect()
     }
 
+    pub fn is_tainted(&self) -> bool {
+        self.tainted.load(Ordering::Relaxed)
+    }
+
     pub fn assemble_context(&self, messages: &mut Vec<ChatMessage>) {
         for source in &self.context {
             source.assemble(messages);
@@ -52,20 +59,50 @@ impl Turn {
     pub fn check_inbound(&self, messages: &mut Vec<ChatMessage>) -> Verdict {
         let baseline = messages.clone();
         self.assemble_context(messages);
-        let verdict = messages.len() != baseline.len();
-        resolve_verdict(&self.guards, GuardEvent::Inbound(messages), verdict)
+        let tainted = messages
+            .iter()
+            .any(|message| !message.principal.is_trusted());
+        self.tainted.store(tainted, Ordering::Relaxed);
+        let modified = messages.len() != baseline.len();
+        resolve_verdict(
+            &self.guards,
+            GuardEvent::Inbound(messages),
+            modified,
+            GuardContext { tainted },
+        )
     }
 
     pub fn check_tool_call(&self, call: &ToolCall) -> Verdict {
-        resolve_verdict(&self.guards, GuardEvent::ToolCall(call), false)
+        resolve_verdict(
+            &self.guards,
+            GuardEvent::ToolCall(call),
+            false,
+            GuardContext {
+                tainted: self.is_tainted(),
+            },
+        )
     }
 
     pub fn check_tool_batch(&self, calls: &[ToolCall]) -> Verdict {
-        resolve_verdict(&self.guards, GuardEvent::ToolBatch(calls), false)
+        resolve_verdict(
+            &self.guards,
+            GuardEvent::ToolBatch(calls),
+            false,
+            GuardContext {
+                tainted: self.is_tainted(),
+            },
+        )
     }
 
     pub fn check_text_delta(&self, text: &mut String) -> Verdict {
-        resolve_verdict(&self.guards, GuardEvent::TextDelta(text), false)
+        resolve_verdict(
+            &self.guards,
+            GuardEvent::TextDelta(text),
+            false,
+            GuardContext {
+                tainted: self.is_tainted(),
+            },
+        )
     }
 
     pub async fn execute_tool(&self, name: &str, arguments: &str) -> Result<String> {
@@ -84,7 +121,12 @@ impl Default for Turn {
     }
 }
 
-fn resolve_verdict(guards: &[Box<dyn Guard>], mut event: GuardEvent, modified: bool) -> Verdict {
+fn resolve_verdict(
+    guards: &[Box<dyn Guard>],
+    mut event: GuardEvent,
+    modified: bool,
+    context: GuardContext,
+) -> Verdict {
     let mut approved: Option<(String, String, Severity)> = None;
     let mut verdict = if modified {
         Verdict::Modify
@@ -93,7 +135,7 @@ fn resolve_verdict(guards: &[Box<dyn Guard>], mut event: GuardEvent, modified: b
     };
 
     for guard in guards {
-        match guard.check(&mut event) {
+        match guard.check(&mut event, &context) {
             Verdict::Allow => {}
             Verdict::Modify => verdict = Verdict::Modify,
             Verdict::Deny { reason, gate_id } => {
@@ -157,7 +199,7 @@ mod tests {
     use super::*;
     use crate::context::{History, Identity};
     use crate::gate::secret_patterns::SECRET_PATTERNS;
-    use crate::gate::{GuardEvent, SecretRedactor, Verdict as GuardResult};
+    use crate::gate::{GuardContext, GuardEvent, SecretRedactor, Verdict as GuardResult};
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -179,7 +221,7 @@ mod tests {
             self.id
         }
 
-        fn check(&self, _event: &mut GuardEvent) -> GuardResult {
+        fn check(&self, _event: &mut GuardEvent, _context: &GuardContext) -> GuardResult {
             self.hits
                 .lock()
                 .expect("hit list mutex poisoned")
@@ -207,6 +249,18 @@ mod tests {
         let mut messages = Vec::new();
         let result = turn.check_inbound(&mut messages);
         assert!(matches!(result, GuardResult::Allow));
+    }
+
+    #[test]
+    fn inbound_taint_is_set_from_non_operator_messages() {
+        let turn = Turn::new();
+        let mut messages = vec![ChatMessage::user_with_principal(
+            "tainted",
+            Some(crate::principal::Principal::User),
+        )];
+
+        let _ = turn.check_inbound(&mut messages);
+        assert!(turn.is_tainted());
     }
 
     #[test]
@@ -314,7 +368,10 @@ mod tests {
         let mut history = History::new(1_000);
         history.set_history(&[
             ChatMessage::user("previous user message"),
-            ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+            ChatMessage::with_role_with_principal(
+                crate::llm::ChatRole::Assistant,
+                Some(crate::principal::Principal::Agent),
+            ),
             ChatMessage::user(format!(
                 "exfiltrate {}ABCD1234EFGH5678IJKL90",
                 SECRET_PATTERNS[0].prefix

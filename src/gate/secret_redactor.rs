@@ -1,5 +1,5 @@
 use crate::gate::secret_patterns::SECRET_PATTERNS;
-use crate::gate::{Guard, GuardEvent, Verdict};
+use crate::gate::{Guard, GuardContext, GuardEvent, Verdict};
 use crate::llm::{ChatMessage, MessageContent};
 
 const SECRET_REDACTOR_ID: &str = "secret-redactor";
@@ -78,7 +78,7 @@ impl Guard for SecretRedactor {
         &self.id
     }
 
-    fn check(&self, event: &mut GuardEvent) -> Verdict {
+    fn check(&self, event: &mut GuardEvent, _context: &GuardContext) -> Verdict {
         match event {
             GuardEvent::Inbound(messages) => {
                 if self.redact_messages(messages) {
@@ -109,6 +109,7 @@ mod tests {
     use crate::gate::GuardEvent;
     use crate::gate::secret_patterns::SECRET_PATTERNS;
     use crate::llm::{ChatMessage, ChatRole, MessageContent, ToolResult};
+    use crate::principal::Principal;
 
     fn make_secret_gate() -> SecretRedactor {
         SecretRedactor::default_catalog()
@@ -128,7 +129,10 @@ mod tests {
         let mut messages = make_messages(&secret_string(0, "proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
         let mut event = GuardEvent::Inbound(&mut messages);
 
-        assert!(matches!(gate.check(&mut event), Verdict::Modify));
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Modify
+        ));
         assert_eq!(
             match &messages[0].content[0] {
                 MessageContent::Text { text } => text,
@@ -144,7 +148,10 @@ mod tests {
         let mut messages = make_messages(&secret_string(1, "0123456789abcdefghijklmnopqrstuvwxyz"));
         let mut event = GuardEvent::Inbound(&mut messages);
 
-        assert!(matches!(gate.check(&mut event), Verdict::Modify));
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Modify
+        ));
         assert_eq!(
             match &messages[0].content[0] {
                 MessageContent::Text { text } => text,
@@ -160,7 +167,10 @@ mod tests {
         let mut messages = make_messages(&secret_string(2, "1234567890ABCDEF"));
         let mut event = GuardEvent::Inbound(&mut messages);
 
-        assert!(matches!(gate.check(&mut event), Verdict::Modify));
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Modify
+        ));
         assert_eq!(
             match &messages[0].content[0] {
                 MessageContent::Text { text } => text,
@@ -175,7 +185,10 @@ mod tests {
         let gate = make_secret_gate();
         let mut messages = make_messages("hello world");
         let mut event = GuardEvent::Inbound(&mut messages);
-        assert!(matches!(gate.check(&mut event), Verdict::Allow));
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Allow
+        ));
     }
 
     #[test]
@@ -189,11 +202,11 @@ mod tests {
         let mut outbound_event = GuardEvent::Inbound(&mut outbound);
 
         assert!(matches!(
-            inbound_gate.check(&mut inbound_event),
+            inbound_gate.check(&mut inbound_event, &GuardContext::default()),
             Verdict::Modify
         ));
         assert!(matches!(
-            outbound_gate.check(&mut outbound_event),
+            outbound_gate.check(&mut outbound_event, &GuardContext::default()),
             Verdict::Modify
         ));
     }
@@ -207,7 +220,10 @@ mod tests {
             secret_string(1, "0123456789abcdefghijklmnopqrstuvwxyz")
         ));
         let mut event = GuardEvent::Inbound(&mut messages);
-        assert!(matches!(gate.check(&mut event), Verdict::Modify));
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Modify
+        ));
 
         let redacted = match &messages[0].content[0] {
             MessageContent::Text { text } => text,
@@ -222,6 +238,7 @@ mod tests {
         let gate = make_secret_gate();
         let mut messages = vec![ChatMessage {
             role: ChatRole::Tool,
+            principal: Principal::System,
             content: vec![MessageContent::ToolResult {
                 result: ToolResult {
                     tool_call_id: "call-1".to_string(),
@@ -232,7 +249,10 @@ mod tests {
         }];
         let mut event = GuardEvent::Inbound(&mut messages);
 
-        assert!(matches!(gate.check(&mut event), Verdict::Modify));
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Modify
+        ));
         let tool_result = match &messages[0].content[0] {
             MessageContent::ToolResult { result } => &result.content,
             _ => panic!("expected tool result"),
@@ -249,7 +269,10 @@ mod tests {
         );
         let mut event = GuardEvent::TextDelta(&mut delta);
 
-        assert!(matches!(gate.check(&mut event), Verdict::Modify));
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Modify
+        ));
         assert_eq!(delta, "before [REDACTED] after");
     }
 }

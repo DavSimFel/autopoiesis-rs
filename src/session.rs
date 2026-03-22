@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tiktoken_rs::cl100k_base_singleton;
 
 use crate::llm::{ChatMessage, ChatRole, MessageContent, TurnMeta};
+use crate::principal::Principal;
 use crate::util::utc_timestamp;
 
 /// One line in the JSONL session file.
@@ -28,6 +29,9 @@ pub struct SessionEntry {
     /// Provider metadata (only on assistant messages).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<TurnMeta>,
+    /// Message trust level.
+    #[serde(default)]
+    pub principal: Principal,
     /// Tool call ID (only on tool messages).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
@@ -113,6 +117,7 @@ impl Session {
             content,
             ts: utc_timestamp(),
             meta: meta.cloned(),
+            principal: message.principal,
             call_id,
             tool_name,
             tool_calls: if tool_calls.is_empty() {
@@ -150,8 +155,14 @@ impl Session {
         let token_delta = Self::token_total(entry.meta.as_ref());
 
         let message = match entry.role.as_str() {
-            "system" => Some(ChatMessage::system(entry.content)),
-            "user" => Some(ChatMessage::user(entry.content)),
+            "system" => Some(ChatMessage::system_with_principal(
+                entry.content,
+                Some(entry.principal),
+            )),
+            "user" => Some(ChatMessage::user_with_principal(
+                entry.content,
+                Some(entry.principal),
+            )),
             "assistant" => {
                 let mut content = Vec::new();
                 if !entry.content.is_empty() {
@@ -162,9 +173,13 @@ impl Session {
                         content.push(MessageContent::ToolCall { call });
                     }
                 }
-                Some(ChatMessage {
-                    role: ChatRole::Assistant,
-                    content,
+                Some({
+                    let mut message = ChatMessage::with_role_with_principal(
+                        ChatRole::Assistant,
+                        Some(entry.principal),
+                    );
+                    message.content = content;
+                    message
                 })
             }
             "tool" => match (&entry.call_id, &entry.tool_name) {
@@ -177,10 +192,11 @@ impl Session {
                     );
                     None
                 }
-                (Some(call_id), Some(tool_name)) => Some(ChatMessage::tool_result(
+                (Some(call_id), Some(tool_name)) => Some(ChatMessage::tool_result_with_principal(
                     call_id.clone(),
                     tool_name.clone(),
                     entry.content,
+                    Some(entry.principal),
                 )),
             },
             _ => None,
@@ -359,6 +375,7 @@ impl Session {
                             ChatMessage {
                                 role: ChatRole::Tool,
                                 content,
+                                ..
                             } => {
                                 let matches_call = content.iter().any(|block| match block {
                                     MessageContent::ToolResult { result } => {
@@ -500,7 +517,10 @@ mod tests {
         session.append(ChatMessage::user("hi"), None).unwrap();
         session
             .append(
-                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                ChatMessage::with_role_with_principal(
+                    crate::llm::ChatRole::Assistant,
+                    Some(Principal::Agent),
+                ),
                 Some(meta),
             )
             .unwrap();
@@ -580,6 +600,7 @@ mod tests {
                 content: "yesterday".to_string(),
                 ts: "2026-03-18T00:00:00Z".to_string(),
                 meta: None,
+                principal: Principal::User,
                 call_id: None,
                 tool_name: None,
                 tool_calls: None,
@@ -592,6 +613,7 @@ mod tests {
                 content: "today".to_string(),
                 ts: "2026-03-19T00:00:00Z".to_string(),
                 meta: None,
+                principal: Principal::Agent,
                 call_id: None,
                 tool_name: None,
                 tool_calls: None,
@@ -654,7 +676,10 @@ mod tests {
 
         for _ in 0..2 {
             seed.append(
-                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                ChatMessage::with_role_with_principal(
+                    crate::llm::ChatRole::Assistant,
+                    Some(Principal::Agent),
+                ),
                 Some(meta.clone()),
             )
             .unwrap();
@@ -689,14 +714,20 @@ mod tests {
         session.append(ChatMessage::user("q1"), None).unwrap();
         session
             .append(
-                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                ChatMessage::with_role_with_principal(
+                    crate::llm::ChatRole::Assistant,
+                    Some(Principal::Agent),
+                ),
                 Some(meta1),
             )
             .unwrap();
         session.append(ChatMessage::user("q2"), None).unwrap();
         session
             .append(
-                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                ChatMessage::with_role_with_principal(
+                    crate::llm::ChatRole::Assistant,
+                    Some(Principal::Agent),
+                ),
                 Some(meta2),
             )
             .unwrap();
@@ -768,7 +799,10 @@ mod tests {
             .unwrap();
         session
             .append(
-                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                ChatMessage::with_role_with_principal(
+                    crate::llm::ChatRole::Assistant,
+                    Some(Principal::Agent),
+                ),
                 Some(big_meta.clone()),
             )
             .unwrap();
@@ -777,7 +811,10 @@ mod tests {
             .unwrap();
         session
             .append(
-                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                ChatMessage::with_role_with_principal(
+                    crate::llm::ChatRole::Assistant,
+                    Some(Principal::Agent),
+                ),
                 Some(big_meta),
             )
             .unwrap();
@@ -809,7 +846,10 @@ mod tests {
             .unwrap();
         session
             .append(
-                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                ChatMessage::with_role_with_principal(
+                    crate::llm::ChatRole::Assistant,
+                    Some(Principal::Agent),
+                ),
                 Some(big_meta.clone()),
             )
             .unwrap();
@@ -818,7 +858,10 @@ mod tests {
             .unwrap();
         session
             .append(
-                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                ChatMessage::with_role_with_principal(
+                    crate::llm::ChatRole::Assistant,
+                    Some(Principal::Agent),
+                ),
                 Some(big_meta),
             )
             .unwrap();
@@ -857,6 +900,7 @@ mod tests {
             .append(
                 ChatMessage {
                     role: ChatRole::Assistant,
+                    principal: Principal::Agent,
                     content: vec![MessageContent::ToolCall {
                         call: crate::llm::ToolCall {
                             id: "call-1".to_string(),
@@ -870,14 +914,22 @@ mod tests {
             .unwrap();
         session
             .append(
-                ChatMessage::tool_result("call-1", "execute", "stdout:\nhi"),
+                ChatMessage::tool_result_with_principal(
+                    "call-1",
+                    "execute",
+                    "stdout:\nhi",
+                    Some(Principal::System),
+                ),
                 None,
             )
             .unwrap();
         session.append(ChatMessage::user("second"), None).unwrap();
         session
             .append(
-                ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                ChatMessage::with_role_with_principal(
+                    crate::llm::ChatRole::Assistant,
+                    Some(Principal::Agent),
+                ),
                 Some(big_meta),
             )
             .unwrap();
@@ -919,7 +971,10 @@ mod tests {
             session.add_user_message("think hard").unwrap();
             session
                 .append(
-                    ChatMessage::with_role(crate::llm::ChatRole::Assistant),
+                    ChatMessage::with_role_with_principal(
+                        crate::llm::ChatRole::Assistant,
+                        Some(Principal::Agent),
+                    ),
                     Some(TurnMeta {
                         reasoning_trace: Some("deep thoughts here".to_string()),
                         ..Default::default()
