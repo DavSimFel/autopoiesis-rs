@@ -150,7 +150,9 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
             r"ghp_[a-zA-Z0-9]{36}",
             r"AKIA[0-9A-Z]{16}",
         ]))
-        .guard(crate::guard::ShellSafety::new())
+        .guard(crate::guard::ShellSafety::with_policy(
+            config.shell_policy.clone(),
+        ))
         .guard(crate::guard::ExfilDetector::new())
 }
 
