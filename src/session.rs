@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tiktoken_rs::cl100k_base_singleton;
 
+use crate::gate::BudgetSnapshot;
 use crate::llm::{ChatMessage, ChatRole, MessageContent, TurnMeta};
 use crate::principal::Principal;
 use crate::util::utc_timestamp;
@@ -441,6 +442,55 @@ impl Session {
         }
     }
 
+    fn latest_turn_tokens(&self) -> u64 {
+        self.messages
+            .iter()
+            .zip(self.message_tokens.iter())
+            .rev()
+            .find_map(|(message, token_delta)| {
+                if message.role == ChatRole::Assistant {
+                    Some(*token_delta)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    fn today_token_total(&self) -> Result<u64> {
+        let path = self.today_path();
+        if !path.exists() {
+            return Ok(0);
+        }
+
+        let file = File::open(&path)
+            .with_context(|| format!("failed to open sessions file {}", path.display()))?;
+        let reader = BufReader::new(file);
+        let mut total = 0;
+
+        for raw_line in reader.lines() {
+            let raw_line = raw_line?;
+            if raw_line.trim().is_empty() {
+                continue;
+            }
+
+            let entry: SessionEntry = serde_json::from_str(&raw_line)
+                .with_context(|| format!("failed to parse session entry in {}", path.display()))?;
+            total += Self::token_total(entry.meta.as_ref());
+        }
+
+        Ok(total)
+    }
+
+    /// Read the live budget snapshot used by budget guards.
+    pub fn budget_snapshot(&self) -> Result<BudgetSnapshot> {
+        Ok(BudgetSnapshot {
+            turn_tokens: self.latest_turn_tokens(),
+            session_tokens: self.total_tokens(),
+            day_tokens: self.today_token_total()?,
+        })
+    }
+
     /// Get total token count from provider metadata.
     pub fn total_tokens(&self) -> u64 {
         self.total_tokens
@@ -733,6 +783,71 @@ mod tests {
             .unwrap();
 
         assert_eq!(session.total_tokens(), 180); // 50+10+100+20
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn budget_snapshot_reads_turn_session_and_day_totals() {
+        let dir = temp_sessions_dir("budget_snapshot");
+        let session = Session::new(&dir).unwrap();
+        let yesterday = dir.join("2026-03-18.jsonl");
+        let today = session.today_path();
+
+        write_entries(
+            &yesterday,
+            &[SessionEntry {
+                role: "assistant".to_string(),
+                content: "old".to_string(),
+                ts: "2026-03-18T00:00:00Z".to_string(),
+                meta: Some(TurnMeta {
+                    input_tokens: Some(50),
+                    output_tokens: Some(10),
+                    ..Default::default()
+                }),
+                principal: Principal::Agent,
+                call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            }],
+        );
+        write_entries(
+            &today,
+            &[
+                SessionEntry {
+                    role: "user".to_string(),
+                    content: "prompt".to_string(),
+                    ts: "2026-03-19T00:00:00Z".to_string(),
+                    meta: None,
+                    principal: Principal::User,
+                    call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                },
+                SessionEntry {
+                    role: "assistant".to_string(),
+                    content: "new".to_string(),
+                    ts: "2026-03-19T00:01:00Z".to_string(),
+                    meta: Some(TurnMeta {
+                        input_tokens: Some(20),
+                        output_tokens: Some(5),
+                        ..Default::default()
+                    }),
+                    principal: Principal::Agent,
+                    call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                },
+            ],
+        );
+
+        let mut session = Session::new(&dir).unwrap();
+        session.load_today().unwrap();
+
+        let snapshot = session.budget_snapshot().unwrap();
+        assert_eq!(snapshot.turn_tokens, 25);
+        assert_eq!(snapshot.session_tokens, 85);
+        assert_eq!(snapshot.day_tokens, 25);
 
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -396,9 +396,10 @@ mod tests {
 
         let turn = crate::turn::Turn::new();
         let mut messages = tainted_messages();
-        let _ = turn.check_inbound(&mut messages);
+        let _ = turn.check_inbound(&mut messages, None);
         let context = GuardContext {
             tainted: turn.is_tainted(),
+            ..Default::default()
         };
 
         assert!(matches!(

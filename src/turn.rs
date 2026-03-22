@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::context::ContextSource;
 use crate::gate::{
-    ExfilDetector, Guard, GuardContext, GuardEvent, SecretRedactor, Severity, ShellSafety, Verdict,
+    BudgetGuard, ExfilDetector, Guard, GuardContext, GuardEvent, SecretRedactor, Severity,
+    ShellSafety, Verdict,
 };
 use crate::llm::{ChatMessage, FunctionTool, ToolCall};
 use crate::tool::Tool;
@@ -56,7 +57,11 @@ impl Turn {
         }
     }
 
-    pub fn check_inbound(&self, messages: &mut Vec<ChatMessage>) -> Verdict {
+    pub fn check_inbound(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+        context: Option<GuardContext>,
+    ) -> Verdict {
         let baseline = messages.clone();
         self.assemble_context(messages);
         let tainted = messages
@@ -64,11 +69,13 @@ impl Turn {
             .any(|message| !message.principal.is_trusted());
         self.tainted.store(tainted, Ordering::Relaxed);
         let modified = messages.len() != baseline.len();
+        let mut context = context.unwrap_or_default();
+        context.tainted = tainted;
         resolve_verdict(
             &self.guards,
             GuardEvent::Inbound(messages),
             modified,
-            GuardContext { tainted },
+            context,
         )
     }
 
@@ -79,6 +86,7 @@ impl Turn {
             false,
             GuardContext {
                 tainted: self.is_tainted(),
+                ..Default::default()
             },
         )
     }
@@ -90,6 +98,7 @@ impl Turn {
             false,
             GuardContext {
                 tainted: self.is_tainted(),
+                ..Default::default()
             },
         )
     }
@@ -101,6 +110,7 @@ impl Turn {
             false,
             GuardContext {
                 tainted: self.is_tainted(),
+                ..Default::default()
             },
         )
     }
@@ -186,10 +196,19 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
     vars.insert("cwd".to_string(), cwd);
     vars.insert("tools".to_string(), tools_list);
 
-    Turn::new()
+    let mut turn = Turn::new()
         .context(crate::context::Identity::new("identity", vars, &config.system_prompt).strict())
-        .tool(tool)
-        .guard(SecretRedactor::default_catalog())
+        .tool(tool);
+
+    if let Some(budget) = &config.budget
+        && (budget.max_tokens_per_turn.is_some()
+            || budget.max_tokens_per_session.is_some()
+            || budget.max_tokens_per_day.is_some())
+    {
+        turn = turn.guard(BudgetGuard::new(budget.clone()));
+    }
+
+    turn.guard(SecretRedactor::default_catalog())
         .guard(ShellSafety::with_policy(config.shell_policy.clone()))
         .guard(ExfilDetector::new())
 }
@@ -197,9 +216,12 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{BudgetConfig, Config, ShellPolicy};
     use crate::context::{History, Identity};
     use crate::gate::secret_patterns::SECRET_PATTERNS;
-    use crate::gate::{GuardContext, GuardEvent, SecretRedactor, Verdict as GuardResult};
+    use crate::gate::{
+        BudgetSnapshot, GuardContext, GuardEvent, SecretRedactor, Verdict as GuardResult,
+    };
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -247,7 +269,7 @@ mod tests {
     fn empty_turn_allows_everything() {
         let turn = Turn::new();
         let mut messages = Vec::new();
-        let result = turn.check_inbound(&mut messages);
+        let result = turn.check_inbound(&mut messages, None);
         assert!(matches!(result, GuardResult::Allow));
     }
 
@@ -259,7 +281,7 @@ mod tests {
             Some(crate::principal::Principal::User),
         )];
 
-        let _ = turn.check_inbound(&mut messages);
+        let _ = turn.check_inbound(&mut messages, None);
         assert!(turn.is_tainted());
     }
 
@@ -279,7 +301,7 @@ mod tests {
             ));
 
         let mut messages = Vec::new();
-        let _ = turn.check_inbound(&mut messages);
+        let _ = turn.check_inbound(&mut messages, None);
         let observed = hits.lock().expect("hit list mutex poisoned").clone();
         assert_eq!(observed, vec!["first", "second"]);
     }
@@ -385,13 +407,43 @@ mod tests {
 
         let mut messages = make_messages("x");
         messages.clear();
-        let result = turn.check_inbound(&mut messages);
+        let result = turn.check_inbound(&mut messages, None);
         assert!(matches!(result, GuardResult::Modify));
         assert!(
             messages
                 .iter()
                 .any(|message| message.role == crate::llm::ChatRole::System)
         );
+    }
+
+    #[test]
+    fn build_default_turn_denies_when_budget_ceiling_is_exceeded() {
+        let turn = build_default_turn(&test_config(Some(BudgetConfig {
+            max_tokens_per_turn: Some(100),
+            max_tokens_per_session: None,
+            max_tokens_per_day: None,
+        })));
+
+        let mut messages = make_messages("hello");
+        let result = turn.check_inbound(&mut messages, Some(make_budget_context(101, 0, 0)));
+
+        match result {
+            GuardResult::Deny { reason, gate_id } => {
+                assert_eq!(gate_id, "budget");
+                assert!(reason.contains("turn token ceiling"));
+            }
+            other => panic!("expected budget deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_default_turn_without_budget_config_does_not_block() {
+        let turn = build_default_turn(&test_config(None));
+
+        let mut messages = make_messages("hello");
+        let result = turn.check_inbound(&mut messages, Some(make_budget_context(101, 0, 0)));
+
+        assert!(!matches!(result, GuardResult::Deny { .. }));
     }
 
     fn make_tool_call(cmd: &str) -> ToolCall {
@@ -404,5 +456,29 @@ mod tests {
 
     fn make_messages(text: &str) -> Vec<ChatMessage> {
         vec![ChatMessage::user(text)]
+    }
+
+    fn make_budget_context(turn: u64, session: u64, day: u64) -> GuardContext {
+        GuardContext {
+            budget: BudgetSnapshot {
+                turn_tokens: turn,
+                session_tokens: session,
+                day_tokens: day,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn test_config(budget: Option<BudgetConfig>) -> Config {
+        Config {
+            model: "gpt-5.4".to_string(),
+            system_prompt: "system".to_string(),
+            base_url: "https://example.test".to_string(),
+            reasoning_effort: None,
+            session_name: None,
+            operator_key: None,
+            shell_policy: ShellPolicy::default(),
+            budget,
+        }
     }
 }

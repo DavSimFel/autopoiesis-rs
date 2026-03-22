@@ -22,6 +22,19 @@ pub struct Config {
     pub operator_key: Option<String>,
     /// Shell execution policy loaded from the optional `[shell]` table.
     pub shell_policy: ShellPolicy,
+    /// Optional budget ceilings loaded from the optional `[budget]` table.
+    pub budget: Option<BudgetConfig>,
+}
+
+/// Optional budget ceilings loaded from `[budget]` in `agents.toml`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct BudgetConfig {
+    /// Maximum tokens allowed for the most recent completed turn.
+    pub max_tokens_per_turn: Option<u64>,
+    /// Maximum tokens allowed for the whole session.
+    pub max_tokens_per_session: Option<u64>,
+    /// Maximum tokens allowed for the current day.
+    pub max_tokens_per_day: Option<u64>,
 }
 
 impl Config {
@@ -36,6 +49,7 @@ impl Config {
             session_name: None,
             operator_key: None,
             shell_policy: ShellPolicy::default(),
+            budget: None,
         };
 
         let contents = match std::fs::read_to_string(config_path.as_ref()) {
@@ -78,6 +92,7 @@ impl Config {
         }
 
         config.shell_policy = file_config.shell;
+        config.budget = file_config.budget;
 
         if let Ok(operator_key) = std::env::var("AUTOPOIESIS_OPERATOR_KEY") {
             config.operator_key = Some(operator_key);
@@ -144,6 +159,7 @@ mod tests {
             vec!["git push *".to_string(), "cargo publish *".to_string()]
         );
         assert_eq!(config.shell_policy.default_severity, "high");
+        assert_eq!(config.budget, None);
     }
 
     #[test]
@@ -157,6 +173,7 @@ mod tests {
             "You are a direct and capable coding agent. Execute tasks efficiently."
         );
         assert_default_shell_policy(&config.shell_policy);
+        assert_eq!(config.budget, None);
     }
 
     #[test]
@@ -171,6 +188,7 @@ mod tests {
         assert_eq!(config.session_name, None);
         assert_eq!(config.operator_key, None);
         assert_default_shell_policy(&config.shell_policy);
+        assert_eq!(config.budget, None);
     }
 
     #[test]
@@ -191,6 +209,7 @@ mod tests {
         assert_eq!(config.session_name, None);
         assert_eq!(config.operator_key, None);
         assert_default_shell_policy(&config.shell_policy);
+        assert_eq!(config.budget, None);
     }
 
     #[test]
@@ -219,6 +238,50 @@ mod tests {
         let config = Config::load(&path).expect("expected config to load");
         assert_eq!(config.operator_key, Some("operator-from-file".to_string()));
     }
+
+    #[test]
+    fn loads_budget_config_with_all_fields() {
+        let path = temp_toml_path(
+            "budget_all",
+            "[agent]\nmodel='gpt-budget'\n[budget]\nmax_tokens_per_turn=100\nmax_tokens_per_session=200\nmax_tokens_per_day=300\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(
+            config.budget,
+            Some(BudgetConfig {
+                max_tokens_per_turn: Some(100),
+                max_tokens_per_session: Some(200),
+                max_tokens_per_day: Some(300),
+            })
+        );
+    }
+
+    #[test]
+    fn loads_budget_config_with_partial_fields() {
+        let path = temp_toml_path(
+            "budget_partial",
+            "[agent]\nmodel='gpt-budget'\n[budget]\nmax_tokens_per_session=250\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(
+            config.budget,
+            Some(BudgetConfig {
+                max_tokens_per_turn: None,
+                max_tokens_per_session: Some(250),
+                max_tokens_per_day: None,
+            })
+        );
+    }
+
+    #[test]
+    fn missing_budget_table_keeps_budget_none() {
+        let path = temp_toml_path("budget_missing", "[agent]\nmodel='gpt-budget'\n");
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(config.budget, None);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,6 +290,7 @@ struct AgentFileConfig {
     auth: Option<AuthFileSection>,
     #[serde(default)]
     shell: ShellPolicy,
+    budget: Option<BudgetConfig>,
 }
 
 #[derive(Debug, Deserialize)]

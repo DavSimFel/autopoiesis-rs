@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, from_str};
 
-use crate::gate::{Severity, Verdict};
+use crate::gate::{GuardContext, Severity, Verdict};
 use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall};
 use crate::principal::Principal;
 use crate::session::Session;
@@ -133,7 +133,16 @@ where
             messages.push(user_message.clone());
         }
 
-        let verdict = turn.check_inbound(&mut messages);
+        let budget_context = session
+            .budget_snapshot()
+            .context("failed to read live budget snapshot")?;
+        let verdict = turn.check_inbound(
+            &mut messages,
+            Some(GuardContext {
+                budget: budget_context,
+                ..Default::default()
+            }),
+        );
         if !persisted_user_message {
             let user_message = messages
                 .iter()

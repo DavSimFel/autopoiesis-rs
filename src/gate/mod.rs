@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod exfil_detector;
 pub(crate) mod output_cap;
 pub(crate) mod secret_patterns;
@@ -8,6 +9,7 @@ pub(crate) mod streaming_redact;
 use crate::llm::{ChatMessage, MessageContent};
 use crate::turn::Turn;
 
+pub use budget::BudgetGuard;
 pub use exfil_detector::ExfilDetector;
 pub(crate) use output_cap::{DEFAULT_OUTPUT_CAP_BYTES, cap_tool_output};
 pub use secret_redactor::SecretRedactor;
@@ -46,10 +48,19 @@ pub enum GuardEvent<'a> {
     TextDelta(&'a mut String),
 }
 
+/// Budget counters shared with guards.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BudgetSnapshot {
+    pub turn_tokens: u64,
+    pub session_tokens: u64,
+    pub day_tokens: u64,
+}
+
 /// Shared guard context for a turn evaluation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GuardContext {
     pub tainted: bool,
+    pub budget: BudgetSnapshot,
 }
 
 /// Generic guard interface for inbound and outbound checks.

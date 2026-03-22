@@ -670,6 +670,7 @@ mod tests {
                     session_name: None,
                     operator_key: Some("operator-key".to_string()),
                     shell_policy: config::ShellPolicy::default(),
+                    budget: None,
                 },
                 http_client: Client::new(),
             },
