@@ -112,6 +112,7 @@ mod tests {
         assert_eq!(policy.default, "approve");
         assert!(policy.allow_patterns.is_empty());
         assert!(policy.deny_patterns.is_empty());
+        assert!(policy.standing_approvals.is_empty());
         assert_eq!(policy.default_severity, "medium");
     }
 
@@ -119,7 +120,7 @@ mod tests {
     fn loads_valid_agents_toml_with_all_fields() {
         let path = temp_toml_path(
             "all_fields",
-            "[agent]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning_effort='low'\nsession_name='fix-auth'\n[auth]\noperator_key='operator-secret'\n[shell]\ndefault='allow'\nallow_patterns=['git *','cargo *']\ndeny_patterns=['rm -rf /*']\ndefault_severity='high'\n",
+            "[agent]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning_effort='low'\nsession_name='fix-auth'\n[auth]\noperator_key='operator-secret'\n[shell]\ndefault='allow'\nallow_patterns=['git *','cargo *']\ndeny_patterns=['rm -rf /*']\nstanding_approvals=['git push *','cargo publish *']\ndefault_severity='high'\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -137,6 +138,10 @@ mod tests {
         assert_eq!(
             config.shell_policy.deny_patterns,
             vec!["rm -rf /*".to_string()]
+        );
+        assert_eq!(
+            config.shell_policy.standing_approvals,
+            vec!["git push *".to_string(), "cargo publish *".to_string()]
         );
         assert_eq!(config.shell_policy.default_severity, "high");
     }
@@ -248,6 +253,8 @@ pub struct ShellPolicy {
     pub allow_patterns: Vec<String>,
     /// Glob patterns that are always denied.
     pub deny_patterns: Vec<String>,
+    /// Glob patterns that bypass approval prompts but remain auditable.
+    pub standing_approvals: Vec<String>,
     /// Severity for commands that don't match any pattern.
     pub default_severity: String,
 }
@@ -258,6 +265,7 @@ impl Default for ShellPolicy {
             default: "approve".to_string(),
             allow_patterns: Vec::new(),
             deny_patterns: Vec::new(),
+            standing_approvals: Vec::new(),
             default_severity: "medium".to_string(),
         }
     }

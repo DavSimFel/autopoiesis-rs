@@ -1,4 +1,5 @@
 use serde_json::{Value, from_str};
+use std::sync::Mutex;
 
 use crate::config::ShellPolicy;
 use crate::gate::{Guard, GuardEvent, Severity, Verdict};
@@ -12,6 +13,7 @@ const SHELL_POLICY_SEVERITY_MEDIUM: &str = "medium";
 const SHELL_POLICY_SEVERITY_HIGH: &str = "high";
 const SHELL_POLICY_COMMAND_FIELD: &str = "command";
 const ALLOWLIST_MISS_REASON: &str = "shell command did not match any allowlist pattern";
+const STANDING_APPROVAL_LOG_PREFIX: &str = "[standing-approval] command matched pattern: ";
 
 /// Policy-driven shell validator used for tool call argument inspection.
 pub struct ShellSafety {
@@ -19,12 +21,20 @@ pub struct ShellSafety {
     policy: ShellPolicy,
     default_action: ShellDefaultAction,
     default_severity: Severity,
+    standing_approvals: Vec<String>,
+    standing_approval_matches: Mutex<Vec<StandingApprovalMatch>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShellDefaultAction {
     Allow,
     Approve,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StandingApprovalMatch {
+    command: String,
+    pattern: String,
 }
 
 impl ShellSafety {
@@ -48,12 +58,15 @@ impl ShellSafety {
             value if value.eq_ignore_ascii_case(SHELL_POLICY_SEVERITY_HIGH) => Severity::High,
             _ => Severity::Medium,
         };
+        let standing_approvals = policy.standing_approvals.clone();
 
         Self {
             id: SHELL_POLICY_GUARD_ID.to_string(),
             policy,
             default_action,
             default_severity,
+            standing_approvals,
+            standing_approval_matches: Mutex::new(Vec::new()),
         }
     }
 
@@ -134,6 +147,19 @@ impl ShellSafety {
             return Verdict::Allow;
         }
 
+        if let Some(pattern) = Self::matches_any_pattern(&self.standing_approvals, command) {
+            let mut matches = self
+                .standing_approval_matches
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            matches.push(StandingApprovalMatch {
+                command: command.to_string(),
+                pattern: pattern.to_string(),
+            });
+            eprintln!("{STANDING_APPROVAL_LOG_PREFIX}{pattern}");
+            return Verdict::Allow;
+        }
+
         self.default_verdict(command)
     }
 }
@@ -183,6 +209,7 @@ mod tests {
         default: &str,
         allow_patterns: &[&str],
         deny_patterns: &[&str],
+        standing_approvals: &[&str],
         default_severity: &str,
     ) -> ShellPolicy {
         ShellPolicy {
@@ -192,6 +219,10 @@ mod tests {
                 .map(|pattern| pattern.to_string())
                 .collect(),
             deny_patterns: deny_patterns
+                .iter()
+                .map(|pattern| pattern.to_string())
+                .collect(),
+            standing_approvals: standing_approvals
                 .iter()
                 .map(|pattern| pattern.to_string())
                 .collect(),
@@ -234,18 +265,30 @@ mod tests {
     }
 
     #[test]
-    fn deny_pattern_takes_precedence_over_allow_pattern() {
-        let gate =
-            ShellSafety::with_policy(shell_policy("approve", &["git *"], &["git push *"], "low"));
+    fn deny_pattern_takes_precedence_over_allow_and_standing_pattern() {
+        let gate = ShellSafety::with_policy(shell_policy(
+            "approve",
+            &["git *"],
+            &["git push *"],
+            &["git push *"],
+            "low",
+        ));
         let call = make_tool_call("git push origin main");
         let mut event = make_event_tool(&call);
 
         assert!(matches!(gate.check(&mut event), Verdict::Deny { .. }));
+        assert!(
+            gate.standing_approval_matches
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
     }
 
     #[test]
     fn deny_pattern_blocks_matching_command() {
-        let gate = ShellSafety::with_policy(shell_policy("approve", &[], &["rm -rf /*"], "medium"));
+        let gate =
+            ShellSafety::with_policy(shell_policy("approve", &[], &["rm -rf /*"], &[], "medium"));
         let call = make_tool_call("rm -rf /");
         let mut event = make_event_tool(&call);
 
@@ -254,16 +297,28 @@ mod tests {
 
     #[test]
     fn allow_pattern_allows_matching_command() {
-        let gate = ShellSafety::with_policy(shell_policy("approve", &["git *"], &[], "high"));
+        let gate = ShellSafety::with_policy(shell_policy(
+            "approve",
+            &["git *"],
+            &[],
+            &["git push *"],
+            "high",
+        ));
         let call = make_tool_call("git status");
         let mut event = make_event_tool(&call);
 
         assert!(matches!(gate.check(&mut event), Verdict::Allow));
+        assert!(
+            gate.standing_approval_matches
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
     }
 
     #[test]
     fn unmatched_command_approves_when_default_is_approve() {
-        let gate = ShellSafety::with_policy(shell_policy("approve", &[], &[], "high"));
+        let gate = ShellSafety::with_policy(shell_policy("approve", &[], &[], &[], "high"));
         let call = make_tool_call("python -c 'print(1)'");
         let mut event = make_event_tool(&call);
 
@@ -278,10 +333,74 @@ mod tests {
 
     #[test]
     fn unmatched_command_allows_when_default_is_allow() {
-        let gate = ShellSafety::with_policy(shell_policy("allow", &[], &[], "high"));
+        let gate = ShellSafety::with_policy(shell_policy("allow", &[], &[], &[], "high"));
         let call = make_tool_call("python -c 'print(1)'");
         let mut event = make_event_tool(&call);
 
         assert!(matches!(gate.check(&mut event), Verdict::Allow));
+    }
+
+    #[test]
+    fn standing_approval_allows_matching_command_and_records_audit() {
+        let gate =
+            ShellSafety::with_policy(shell_policy("approve", &[], &[], &["git push *"], "high"));
+        let call = make_tool_call("git push origin main");
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(gate.check(&mut event), Verdict::Allow));
+
+        let matches = gate
+            .standing_approval_matches
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            matches.as_slice(),
+            &[StandingApprovalMatch {
+                command: "git push origin main".to_string(),
+                pattern: "git push *".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn deny_pattern_overrides_standing_approval() {
+        let gate = ShellSafety::with_policy(shell_policy(
+            "approve",
+            &[],
+            &["git push *"],
+            &["git push *"],
+            "high",
+        ));
+        let call = make_tool_call("git push origin main");
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(gate.check(&mut event), Verdict::Deny { .. }));
+        assert!(
+            gate.standing_approval_matches
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn allow_pattern_takes_precedence_over_standing_approval() {
+        let gate = ShellSafety::with_policy(shell_policy(
+            "approve",
+            &["git *"],
+            &[],
+            &["git push *"],
+            "high",
+        ));
+        let call = make_tool_call("git push origin main");
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(gate.check(&mut event), Verdict::Allow));
+        assert!(
+            gate.standing_approval_matches
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
     }
 }
