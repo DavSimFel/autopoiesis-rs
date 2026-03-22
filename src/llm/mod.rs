@@ -5,6 +5,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::principal::Principal;
+
 /// Metadata returned by the provider for a single completion.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TurnMeta {
@@ -102,28 +104,46 @@ impl MessageContent {
 pub struct ChatMessage {
     /// Message sender role.
     pub role: ChatRole,
+    /// Trust level of the message source.
+    #[serde(default)]
+    pub principal: Principal,
     /// Ordered chunks of message content.
     pub content: Vec<MessageContent>,
 }
 
 impl ChatMessage {
     pub fn with_role(role: ChatRole) -> Self {
+        Self::with_role_with_principal(role, None)
+    }
+
+    pub fn with_role_with_principal(role: ChatRole, principal: Option<Principal>) -> Self {
         Self {
             role,
+            principal: principal.unwrap_or_default(),
             content: Vec::new(),
         }
     }
 
     pub fn system(content: impl Into<String>) -> Self {
+        Self::system_with_principal(content, None)
+    }
+
+    pub fn system_with_principal(content: impl Into<String>, principal: Option<Principal>) -> Self {
         Self {
             role: ChatRole::System,
+            principal: principal.unwrap_or_default(),
             content: vec![MessageContent::text(content)],
         }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
+        Self::user_with_principal(content, None)
+    }
+
+    pub fn user_with_principal(content: impl Into<String>, principal: Option<Principal>) -> Self {
         Self {
             role: ChatRole::User,
+            principal: principal.unwrap_or_default(),
             content: vec![MessageContent::text(content)],
         }
     }
@@ -133,8 +153,18 @@ impl ChatMessage {
         name: impl Into<String>,
         content: impl Into<String>,
     ) -> Self {
+        Self::tool_result_with_principal(tool_call_id, name, content, None)
+    }
+
+    pub fn tool_result_with_principal(
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        content: impl Into<String>,
+        principal: Option<Principal>,
+    ) -> Self {
         Self {
             role: ChatRole::Tool,
+            principal: principal.unwrap_or_default(),
             content: vec![MessageContent::tool_result(tool_call_id, name, content)],
         }
     }

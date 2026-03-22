@@ -46,10 +46,16 @@ pub enum GuardEvent<'a> {
     TextDelta(&'a mut String),
 }
 
+/// Shared guard context for a turn evaluation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GuardContext {
+    pub tainted: bool,
+}
+
 /// Generic guard interface for inbound and outbound checks.
 pub trait Guard: Send + Sync {
     fn name(&self) -> &str;
-    fn check(&self, event: &mut GuardEvent) -> Verdict;
+    fn check(&self, event: &mut GuardEvent, context: &GuardContext) -> Verdict;
 }
 
 /// Guard outbound text emitted by the current turn.
@@ -77,7 +83,9 @@ pub(crate) fn guard_message_output(turn: &Turn, message: &mut ChatMessage) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gate::GuardContext;
     use crate::llm::{ChatMessage, ChatRole, MessageContent, ToolCall};
+    use crate::principal::Principal;
     use crate::turn::Turn;
     use serde_json::json;
 
@@ -88,7 +96,7 @@ mod tests {
             "deny-text"
         }
 
-        fn check(&self, event: &mut GuardEvent) -> Verdict {
+        fn check(&self, event: &mut GuardEvent, _context: &GuardContext) -> Verdict {
             match event {
                 GuardEvent::TextDelta(_) => Verdict::Deny {
                     reason: "blocked".to_string(),
@@ -110,6 +118,7 @@ mod tests {
         let turn = Turn::new().guard(DenyTextGuard);
         let mut message = ChatMessage {
             role: ChatRole::Assistant,
+            principal: Principal::Agent,
             content: vec![
                 MessageContent::text("secret"),
                 MessageContent::ToolCall {

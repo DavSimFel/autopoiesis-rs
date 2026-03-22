@@ -5,6 +5,7 @@ use serde_json::{Value, from_str};
 
 use crate::gate::{Severity, Verdict};
 use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall};
+use crate::principal::Principal;
 use crate::session::Session;
 use crate::store::{QueuedMessage, Store};
 use crate::turn::Turn;
@@ -62,16 +63,20 @@ fn command_from_tool_call(call: &ToolCall) -> Option<String> {
 
 fn append_approval_denied(session: &mut Session, reason: &str, command: &str) -> Result<()> {
     session.append(
-        ChatMessage::system(format!(
-            "Tool execution rejected by user: {reason}. Command: {command}"
-        )),
+        ChatMessage::system_with_principal(
+            format!("Tool execution rejected by user: {reason}. Command: {command}"),
+            Some(Principal::System),
+        ),
         None,
     )
 }
 
 fn append_hard_deny(session: &mut Session, by: &str, reason: &str) -> Result<()> {
     session.append(
-        ChatMessage::system(format!("Tool execution hard-denied by {by}: {reason}")),
+        ChatMessage::system_with_principal(
+            format!("Tool execution hard-denied by {by}: {reason}"),
+            Some(Principal::System),
+        ),
         None,
     )
 }
@@ -100,6 +105,7 @@ pub async fn run_agent_loop<F, Fut, P, TS, AH>(
     make_provider: &mut F,
     session: &mut Session,
     user_prompt: String,
+    user_principal: Principal,
     turn: &Turn,
     token_sink: &mut TS,
     approval_handler: &mut AH,
@@ -113,7 +119,7 @@ where
 {
     let user_prompt = format!("[{}] {}", utc_timestamp(), user_prompt);
     let tools = turn.tool_definitions();
-    let user_message = ChatMessage::user(user_prompt);
+    let user_message = ChatMessage::user_with_principal(user_prompt, Some(user_principal));
     let mut persisted_user_message = false;
 
     let mut executed: Vec<ToolCall> = Vec::new();
@@ -144,7 +150,10 @@ where
             Verdict::Modify => {}
             Verdict::Deny { reason, gate_id } => {
                 session.append(
-                    ChatMessage::system(format!("Message hard-denied by {gate_id}: {reason}")),
+                    ChatMessage::system_with_principal(
+                        format!("Message hard-denied by {gate_id}: {reason}"),
+                        Some(Principal::System),
+                    ),
                     None,
                 )?;
                 break 'agent_turn Some(make_denial_verdict(&mut denial_count, gate_id, reason));
@@ -199,6 +208,11 @@ where
             StopReason::ToolCalls => {
                 let tool_calls = turn_reply.tool_calls.clone();
                 session.append(turn_reply.assistant_message, turn_meta)?;
+                let tool_result_principal = if turn.is_tainted() {
+                    Principal::System
+                } else {
+                    Principal::Operator
+                };
 
                 for call in &tool_calls {
                     match turn.check_tool_call(call) {
@@ -279,7 +293,15 @@ where
                         crate::gate::DEFAULT_OUTPUT_CAP_BYTES,
                     )?;
 
-                    session.append(ChatMessage::tool_result(&call.id, &call.name, result), None)?;
+                    session.append(
+                        ChatMessage::tool_result_with_principal(
+                            &call.id,
+                            &call.name,
+                            result,
+                            Some(tool_result_principal),
+                        ),
+                        None,
+                    )?;
                     executed.push(call.clone());
                 }
             }
@@ -315,12 +337,14 @@ where
     TS: TokenSink + Send + ?Sized,
     AH: ApprovalHandler + ?Sized,
 {
+    let principal = Principal::from_source(&message.source);
     match message.role.as_str() {
         "user" => Ok(QueueOutcome::Agent(
             run_agent_loop(
                 make_provider,
                 session,
                 message.content.clone(),
+                principal,
                 turn,
                 token_sink,
                 approval_handler,
@@ -328,17 +352,21 @@ where
             .await?,
         )),
         "system" => {
-            session.append(ChatMessage::system(message.content.clone()), None)?;
+            session.append(
+                ChatMessage::system_with_principal(message.content.clone(), Some(principal)),
+                None,
+            )?;
             Ok(QueueOutcome::Stored)
         }
         "assistant" => {
-            session.append(
-                ChatMessage {
-                    role: crate::llm::ChatRole::Assistant,
-                    content: vec![MessageContent::text(message.content.clone())],
-                },
-                None,
-            )?;
+            let mut assistant = ChatMessage::with_role_with_principal(
+                crate::llm::ChatRole::Assistant,
+                Some(principal),
+            );
+            assistant
+                .content
+                .push(MessageContent::text(message.content.clone()));
+            session.append(assistant, None)?;
             Ok(QueueOutcome::Stored)
         }
         other => Ok(QueueOutcome::UnsupportedRole(other.to_string())),
@@ -412,6 +440,7 @@ mod tests {
     use crate::context::History;
     use crate::gate::{Guard, GuardEvent, SecretRedactor};
     use crate::llm::{FunctionTool, StreamedTurn};
+    use crate::principal::Principal;
     use crate::store::Store;
     use crate::tool::{Shell, Tool, ToolFuture};
     use crate::turn::Turn;
@@ -521,7 +550,7 @@ mod tests {
             "inbound-deny"
         }
 
-        fn check(&self, event: &mut GuardEvent) -> Verdict {
+        fn check(&self, event: &mut GuardEvent, _context: &crate::gate::GuardContext) -> Verdict {
             match event {
                 GuardEvent::Inbound(_) => Verdict::Deny {
                     reason: "blocked by test".to_string(),
@@ -621,6 +650,7 @@ mod tests {
                     turn: StreamedTurn {
                         assistant_message: ChatMessage {
                             role: crate::llm::ChatRole::Assistant,
+                            principal: Principal::Agent,
                             content: vec![MessageContent::text("ok")],
                         },
                         tool_calls: vec![],
@@ -755,6 +785,7 @@ mod tests {
             &mut make_provider,
             &mut session,
             "new command".to_string(),
+            Principal::Operator,
             &turn,
             &mut token_sink,
             &mut approval_handler,
@@ -794,6 +825,7 @@ mod tests {
             &mut make_provider,
             &mut session,
             "please store sk-proj-abcdefghijklmnopqrstuvwxyz012345".to_string(),
+            Principal::Operator,
             &turn,
             &mut token_sink,
             &mut approval_handler,
@@ -829,6 +861,7 @@ mod tests {
             &mut make_provider,
             &mut session,
             "blocked prompt".to_string(),
+            Principal::Operator,
             &turn,
             &mut token_sink,
             &mut approval_handler,
@@ -881,6 +914,7 @@ mod tests {
             &mut make_provider,
             &mut session,
             "store this user prompt".to_string(),
+            Principal::Operator,
             &turn,
             &mut token_sink,
             &mut approval_handler,
@@ -941,6 +975,7 @@ mod tests {
             StreamedTurn {
                 assistant_message: ChatMessage {
                     role: crate::llm::ChatRole::Assistant,
+                    principal: Principal::Agent,
                     content: vec![MessageContent::ToolCall {
                         call: ToolCall {
                             id: "call-1".to_string(),
@@ -960,6 +995,7 @@ mod tests {
             StreamedTurn {
                 assistant_message: ChatMessage {
                     role: crate::llm::ChatRole::Assistant,
+                    principal: Principal::Agent,
                     content: vec![MessageContent::text("done")],
                 },
                 tool_calls: vec![],
@@ -982,6 +1018,7 @@ mod tests {
             &mut make_provider,
             &mut session,
             "use the tool".to_string(),
+            Principal::Operator,
             &turn,
             &mut token_sink,
             &mut approval_handler,

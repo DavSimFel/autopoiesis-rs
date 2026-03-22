@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 
+use crate::principal::Principal;
 use crate::{agent, auth, cli, config, llm, session, store, turn};
 
 const API_KEY_HEADER: &str = "x-api-key";
@@ -36,29 +37,6 @@ pub struct ServerState {
     operator_key: Option<String>,
     config: config::Config,
     http_client: Client,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Principal {
-    Operator,
-    User,
-}
-
-impl Principal {
-    fn role_for_request(self, requested_role: Option<&str>) -> &str {
-        match self {
-            Self::Operator => requested_role.unwrap_or("user"),
-            Self::User => "user",
-        }
-    }
-
-    fn source_for_transport(self, transport: &str) -> String {
-        let suffix = match self {
-            Self::Operator => "operator",
-            Self::User => "user",
-        };
-        format!("{transport}-{suffix}")
-    }
 }
 
 #[derive(Serialize)]
@@ -661,6 +639,7 @@ mod tests {
     use crate::agent::ApprovalHandler;
     use crate::gate::{Guard, GuardEvent, Severity, Verdict};
     use crate::llm::{ChatMessage, FunctionTool, StopReason, StreamedTurn};
+    use crate::principal::Principal;
 
     fn test_state() -> (ServerState, PathBuf) {
         let root = std::env::temp_dir().join(format!(
@@ -912,6 +891,7 @@ mod tests {
                 turn: StreamedTurn {
                     assistant_message: ChatMessage {
                         role: llm::ChatRole::Assistant,
+                        principal: Principal::Agent,
                         content: vec![llm::MessageContent::text("ok")],
                     },
                     tool_calls: vec![],
@@ -971,7 +951,11 @@ mod tests {
                 "needs-approval"
             }
 
-            fn check(&self, event: &mut GuardEvent) -> Verdict {
+            fn check(
+                &self,
+                event: &mut GuardEvent,
+                _context: &crate::gate::GuardContext,
+            ) -> Verdict {
                 match event {
                     GuardEvent::ToolCall(_) => Verdict::Approve {
                         reason: "danger".to_string(),
@@ -995,6 +979,7 @@ mod tests {
             StreamedTurn {
                 assistant_message: ChatMessage {
                     role: llm::ChatRole::Assistant,
+                    principal: Principal::Agent,
                     content: vec![llm::MessageContent::ToolCall {
                         call: tool_call.clone(),
                     }],
@@ -1006,6 +991,7 @@ mod tests {
             StreamedTurn {
                 assistant_message: ChatMessage {
                     role: llm::ChatRole::Assistant,
+                    principal: Principal::Agent,
                     content: vec![llm::MessageContent::text("denied")],
                 },
                 tool_calls: vec![],

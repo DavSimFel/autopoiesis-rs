@@ -12,6 +12,7 @@ use crate::llm::{
     ChatMessage, ChatRole, FunctionTool, LlmProvider, MessageContent, StopReason, StreamedTurn,
     ToolCall, TurnMeta,
 };
+use crate::principal::Principal;
 
 /// HTTP client and request settings for the OpenAI-compatible Responses API.
 #[derive(Debug, Clone)]
@@ -527,7 +528,8 @@ impl LlmProvider for OpenAIProvider {
             })
             .collect();
 
-        let mut assistant_msg = ChatMessage::with_role(ChatRole::Assistant);
+        let mut assistant_msg =
+            ChatMessage::with_role_with_principal(ChatRole::Assistant, Some(Principal::Agent));
         if !assistant_content.is_empty() {
             assistant_msg.content.push(MessageContent::Text {
                 text: assistant_content,
@@ -552,6 +554,7 @@ impl LlmProvider for OpenAIProvider {
 mod tests {
     use super::*;
     use crate::llm::{ChatMessage, ChatRole, MessageContent, ToolCall};
+    use crate::principal::Principal;
 
     fn collect_tokens_from_sse_chunks(chunks: &[&[u8]]) -> (Vec<String>, bool) {
         let mut buffer = String::new();
@@ -861,6 +864,7 @@ mod tests {
     fn build_input_converts_tool_calls_to_function_call_with_call_id() {
         let messages = vec![ChatMessage {
             role: ChatRole::Assistant,
+            principal: Principal::Agent,
             content: vec![MessageContent::ToolCall {
                 call: ToolCall {
                     id: "tc-1".to_string(),
@@ -880,6 +884,7 @@ mod tests {
     fn build_input_converts_tool_results_to_function_call_output_with_call_id() {
         let messages = vec![ChatMessage {
             role: ChatRole::Tool,
+            principal: Principal::System,
             content: vec![MessageContent::tool_result("tc-1", "execute", "ok")],
         }];
         let (_, input) = OpenAIProvider::build_input(&messages);
@@ -915,6 +920,7 @@ mod tests {
             ChatMessage::user("Run the command"),
             ChatMessage {
                 role: ChatRole::Assistant,
+                principal: Principal::Agent,
                 content: vec![MessageContent::ToolCall {
                     call: ToolCall {
                         id: "call-1".to_string(),
@@ -925,6 +931,7 @@ mod tests {
             },
             ChatMessage {
                 role: ChatRole::Tool,
+                principal: Principal::System,
                 content: vec![MessageContent::tool_result(
                     "call-1",
                     "execute",

@@ -2,7 +2,7 @@ use serde_json::{Value, from_str};
 use std::sync::Mutex;
 
 use crate::config::ShellPolicy;
-use crate::gate::{Guard, GuardEvent, Severity, Verdict};
+use crate::gate::{Guard, GuardContext, GuardEvent, Severity, Verdict};
 use crate::llm::ToolCall;
 
 const SHELL_POLICY_GUARD_ID: &str = "shell-policy";
@@ -135,7 +135,7 @@ impl ShellSafety {
         }
     }
 
-    fn evaluate_command(&self, command: &str) -> Verdict {
+    fn evaluate_command(&self, command: &str, tainted: bool) -> Verdict {
         if let Some(pattern) = Self::matches_any_pattern(&self.policy.deny_patterns, command) {
             return Verdict::Deny {
                 reason: format!("shell command matched deny pattern `{pattern}`"),
@@ -147,7 +147,9 @@ impl ShellSafety {
             return Verdict::Allow;
         }
 
-        if let Some(pattern) = Self::matches_any_pattern(&self.standing_approvals, command) {
+        if !tainted
+            && let Some(pattern) = Self::matches_any_pattern(&self.standing_approvals, command)
+        {
             let mut matches = self
                 .standing_approval_matches
                 .lock()
@@ -175,11 +177,11 @@ impl Guard for ShellSafety {
         &self.id
     }
 
-    fn check(&self, event: &mut GuardEvent) -> Verdict {
+    fn check(&self, event: &mut GuardEvent, context: &GuardContext) -> Verdict {
         match event {
             GuardEvent::ToolCall(call) => {
                 let command = self.command_from_args(call).unwrap_or_default();
-                self.evaluate_command(&command)
+                self.evaluate_command(&command, context.tainted)
             }
             _ => Verdict::Allow,
         }
@@ -191,6 +193,7 @@ mod tests {
     use super::*;
     use crate::gate::GuardEvent;
     use crate::llm::ToolCall;
+    use crate::principal::Principal;
     use serde_json::json;
 
     fn make_tool_call(cmd: &str) -> ToolCall {
@@ -230,6 +233,13 @@ mod tests {
         }
     }
 
+    fn tainted_messages() -> Vec<crate::llm::ChatMessage> {
+        vec![crate::llm::ChatMessage::user_with_principal(
+            "tainted input",
+            Some(Principal::User),
+        )]
+    }
+
     #[test]
     fn invalid_command_json_falls_back_to_default_policy() {
         let gate = ShellSafety::new();
@@ -241,7 +251,7 @@ mod tests {
         let mut event = make_event_tool(&call);
 
         assert!(matches!(
-            gate.check(&mut event),
+            gate.check(&mut event, &GuardContext::default()),
             Verdict::Approve {
                 severity: Severity::Medium,
                 ..
@@ -256,7 +266,7 @@ mod tests {
         let mut event = make_event_tool(&call);
 
         assert!(matches!(
-            gate.check(&mut event),
+            gate.check(&mut event, &GuardContext::default()),
             Verdict::Approve {
                 severity: Severity::Medium,
                 ..
@@ -276,7 +286,10 @@ mod tests {
         let call = make_tool_call("git push origin main");
         let mut event = make_event_tool(&call);
 
-        assert!(matches!(gate.check(&mut event), Verdict::Deny { .. }));
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Deny { .. }
+        ));
         assert!(
             gate.standing_approval_matches
                 .lock()
@@ -292,7 +305,10 @@ mod tests {
         let call = make_tool_call("rm -rf /");
         let mut event = make_event_tool(&call);
 
-        assert!(matches!(gate.check(&mut event), Verdict::Deny { .. }));
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Deny { .. }
+        ));
     }
 
     #[test]
@@ -307,7 +323,10 @@ mod tests {
         let call = make_tool_call("git status");
         let mut event = make_event_tool(&call);
 
-        assert!(matches!(gate.check(&mut event), Verdict::Allow));
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Allow
+        ));
         assert!(
             gate.standing_approval_matches
                 .lock()
@@ -323,7 +342,7 @@ mod tests {
         let mut event = make_event_tool(&call);
 
         assert!(matches!(
-            gate.check(&mut event),
+            gate.check(&mut event, &GuardContext::default()),
             Verdict::Approve {
                 severity: Severity::High,
                 ..
@@ -337,7 +356,10 @@ mod tests {
         let call = make_tool_call("python -c 'print(1)'");
         let mut event = make_event_tool(&call);
 
-        assert!(matches!(gate.check(&mut event), Verdict::Allow));
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Allow
+        ));
     }
 
     #[test]
@@ -347,7 +369,10 @@ mod tests {
         let call = make_tool_call("git push origin main");
         let mut event = make_event_tool(&call);
 
-        assert!(matches!(gate.check(&mut event), Verdict::Allow));
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Allow
+        ));
 
         let matches = gate
             .standing_approval_matches
@@ -363,6 +388,32 @@ mod tests {
     }
 
     #[test]
+    fn standing_approval_is_skipped_for_tainted_turns() {
+        let gate =
+            ShellSafety::with_policy(shell_policy("approve", &[], &[], &["git push *"], "high"));
+        let call = make_tool_call("git push origin main");
+        let mut event = make_event_tool(&call);
+
+        let turn = crate::turn::Turn::new();
+        let mut messages = tainted_messages();
+        let _ = turn.check_inbound(&mut messages);
+        let context = GuardContext {
+            tainted: turn.is_tainted(),
+        };
+
+        assert!(matches!(
+            gate.check(&mut event, &context),
+            Verdict::Approve { .. }
+        ));
+        assert!(
+            gate.standing_approval_matches
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn deny_pattern_overrides_standing_approval() {
         let gate = ShellSafety::with_policy(shell_policy(
             "approve",
@@ -374,7 +425,10 @@ mod tests {
         let call = make_tool_call("git push origin main");
         let mut event = make_event_tool(&call);
 
-        assert!(matches!(gate.check(&mut event), Verdict::Deny { .. }));
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Deny { .. }
+        ));
         assert!(
             gate.standing_approval_matches
                 .lock()
@@ -395,7 +449,10 @@ mod tests {
         let call = make_tool_call("git push origin main");
         let mut event = make_event_tool(&call);
 
-        assert!(matches!(gate.check(&mut event), Verdict::Allow));
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Allow
+        ));
         assert!(
             gate.standing_approval_matches
                 .lock()
