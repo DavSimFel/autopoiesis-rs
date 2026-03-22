@@ -148,21 +148,25 @@ async fn main() -> Result<()> {
                     }
 
                     queue.enqueue_message(&session_id, "user", prompt, "cli")?;
-                    agent::drain_queue(
-                        &mut queue,
-                        &session_id,
-                        &mut history,
-                        &turn,
-                        &mut provider_factory,
-                        &mut token_sink,
-                        &mut approval_handler,
-                    )
-                    .await?;
+                    if let Some(agent::TurnVerdict::Denied { reason, gate_id }) =
+                        agent::drain_queue(
+                            &mut queue,
+                            &session_id,
+                            &mut history,
+                            &turn,
+                            &mut provider_factory,
+                            &mut token_sink,
+                            &mut approval_handler,
+                        )
+                        .await?
+                    {
+                        eprintln!("{}", agent::format_denial_message(&reason, &gate_id));
+                    }
                 }
             } else {
                 let prompt = cli.prompt.join(" ");
                 queue.enqueue_message(&session_id, "user", &prompt, "cli")?;
-                agent::drain_queue(
+                if let Some(agent::TurnVerdict::Denied { reason, gate_id }) = agent::drain_queue(
                     &mut queue,
                     &session_id,
                     &mut history,
@@ -171,7 +175,10 @@ async fn main() -> Result<()> {
                     &mut token_sink,
                     &mut approval_handler,
                 )
-                .await?;
+                .await?
+                {
+                    eprintln!("{}", agent::format_denial_message(&reason, &gate_id));
+                }
             }
         }
     }

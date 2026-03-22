@@ -92,7 +92,7 @@ struct EnqueueMessageResponse {
     message_id: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 enum WsFrame {
     Token { data: String },
@@ -343,7 +343,7 @@ async fn websocket_session(
         }
 
         let mut store = state.store.lock().await;
-        if let Err(error) = agent::drain_queue(
+        match agent::drain_queue(
             &mut store,
             &session_id,
             &mut history,
@@ -354,15 +354,28 @@ async fn websocket_session(
         )
         .await
         {
-            let _ = tx.send(WsFrame::Error {
-                data: format!("error: {error}"),
-            });
+            Ok(Some(verdict)) => match verdict {
+                agent::TurnVerdict::Denied { reason, gate_id } => {
+                    eprintln!("{}", agent::format_denial_message(&reason, &gate_id));
+                    send_ws_terminal_denial(&tx, &reason);
+                    break;
+                }
+                _ => unreachable!("drain_queue only returns denial verdicts"),
+            },
+            Ok(None) => {}
+            Err(error) => {
+                let _ = tx.send(WsFrame::Error {
+                    data: format!("error: {error}"),
+                });
+            }
         }
 
         let _ = tx.send(WsFrame::Done);
     }
 
+    drop(approval_handler);
     drop(tx);
+    reader.abort();
     let _ = writer.await;
     let _ = reader.await;
 }
@@ -467,7 +480,7 @@ fn spawn_http_queue_worker(state: ServerState, session_id: String) {
             return;
         }
         let mut store = state.store.lock().await;
-        if let Err(error) = agent::drain_queue(
+        match agent::drain_queue(
             &mut store,
             &session_id,
             &mut history,
@@ -478,7 +491,16 @@ fn spawn_http_queue_worker(state: ServerState, session_id: String) {
         )
         .await
         {
-            eprintln!("failed to drain queued HTTP messages for {session_id}: {error}");
+            Ok(Some(verdict)) => match verdict {
+                agent::TurnVerdict::Denied { reason, gate_id } => {
+                    eprintln!("{}", agent::format_denial_message(&reason, &gate_id));
+                }
+                _ => unreachable!("drain_queue only returns denial verdicts"),
+            },
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("failed to drain queued HTTP messages for {session_id}: {error}");
+            }
         }
     });
 }
@@ -555,6 +577,13 @@ impl agent::ApprovalHandler for RejectApprovalHandler {
     ) -> bool {
         false
     }
+}
+
+fn send_ws_terminal_denial(tx: &mpsc::UnboundedSender<WsFrame>, reason: &str) {
+    let _ = tx.send(WsFrame::Error {
+        data: reason.to_string(),
+    });
+    let _ = tx.send(WsFrame::Done);
 }
 
 struct WsApprovalHandler {
@@ -896,17 +925,20 @@ mod tests {
         history.load_today().unwrap();
         let mut store = state.store.lock().await;
 
-        agent::drain_queue(
-            &mut store,
-            session_id,
-            &mut history,
-            &turn,
-            &mut provider_factory,
-            &mut token_sink,
-            &mut approval_handler,
-        )
-        .await
-        .unwrap();
+        assert!(
+            agent::drain_queue(
+                &mut store,
+                session_id,
+                &mut history,
+                &turn,
+                &mut provider_factory,
+                &mut token_sink,
+                &mut approval_handler,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
 
         let conn = rusqlite::Connection::open(queue_path).unwrap();
         let status: String = conn
@@ -921,15 +953,15 @@ mod tests {
 
     #[tokio::test]
     async fn drain_queue_uses_supplied_approval_handler() {
-        let (state, _queue_path) = test_state();
+        let (state, queue_path) = test_state();
         let session_id = "approval-session";
-        {
+        let message_id = {
             let mut store = state.store.lock().await;
             store.create_session(session_id, None).unwrap();
             store
                 .enqueue_message(session_id, "user", "run risky command", "ws")
-                .unwrap();
-        }
+                .unwrap()
+        };
 
         struct NeedsApproval;
 
@@ -997,7 +1029,7 @@ mod tests {
         history.load_today().unwrap();
         let mut store = state.store.lock().await;
 
-        agent::drain_queue(
+        let denial = agent::drain_queue(
             &mut store,
             session_id,
             &mut history,
@@ -1009,10 +1041,26 @@ mod tests {
         .await
         .unwrap();
 
+        assert!(matches!(
+            denial,
+            Some(agent::TurnVerdict::Denied { reason, gate_id })
+                if reason == "danger" && gate_id == "needs-approval"
+        ));
+
         assert_eq!(
             *approvals.lock().expect("approval counter mutex poisoned"),
             1
         );
+
+        let conn = rusqlite::Connection::open(queue_path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM messages WHERE id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "processed");
     }
 
     #[tokio::test]
@@ -1042,5 +1090,20 @@ mod tests {
             .unwrap();
 
         assert!(!handle.join().unwrap());
+    }
+
+    #[tokio::test]
+    async fn ws_terminal_denial_emits_error_then_done() {
+        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
+        send_ws_terminal_denial(&frame_tx, "denied by policy");
+
+        match frame_rx.recv().await.unwrap() {
+            WsFrame::Error { data } => {
+                assert_eq!(data, "denied by policy");
+            }
+            other => panic!("expected error frame, got {other:?}"),
+        }
+
+        assert!(matches!(frame_rx.recv().await.unwrap(), WsFrame::Done));
     }
 }
