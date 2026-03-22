@@ -189,6 +189,297 @@ fn guard_message_output(turn: &Turn, message: &mut ChatMessage) {
         .retain(|block| !matches!(block, MessageContent::Text { text } if text.is_empty()));
 }
 
+#[derive(Clone, Copy)]
+enum StreamingSecretPrefix {
+    SkProject,
+    GithubPat,
+    AwsKey,
+}
+
+const STREAMING_SECRET_PREFIXES: [(&str, StreamingSecretPrefix); 3] = [
+    ("sk-", StreamingSecretPrefix::SkProject),
+    ("ghp_", StreamingSecretPrefix::GithubPat),
+    ("AKIA", StreamingSecretPrefix::AwsKey),
+];
+
+fn is_sk_secret_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+}
+
+fn is_github_pat_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+}
+
+fn is_aws_key_byte(byte: u8) -> bool {
+    byte.is_ascii_uppercase() || byte.is_ascii_digit()
+}
+
+fn streaming_secret_holdback() -> usize {
+    STREAMING_SECRET_PREFIXES
+        .iter()
+        .map(|(prefix, _)| prefix.len())
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(1)
+}
+
+fn find_earliest_secret_prefix(text: &str) -> Option<(usize, StreamingSecretPrefix)> {
+    STREAMING_SECRET_PREFIXES
+        .into_iter()
+        .filter_map(|(needle, prefix)| text.find(needle).map(|index| (index, prefix)))
+        .min_by_key(|(index, _)| *index)
+}
+
+enum StreamingSecretDecision {
+    NeedMore,
+    EmitLiteral {
+        consumed_bytes: usize,
+    },
+    EmitRedacted {
+        consumed_bytes: usize,
+        continue_redacting: bool,
+    },
+}
+
+fn analyze_sk_secret_candidate(rest: &str, final_flush: bool) -> StreamingSecretDecision {
+    let bytes = rest.as_bytes();
+    let mut allowed_len = 0usize;
+
+    while allowed_len < bytes.len() && is_sk_secret_byte(bytes[allowed_len]) {
+        allowed_len += 1;
+    }
+
+    if allowed_len < 20 {
+        if allowed_len == bytes.len() {
+            if final_flush {
+                StreamingSecretDecision::EmitRedacted {
+                    consumed_bytes: 3 + allowed_len,
+                    continue_redacting: false,
+                }
+            } else {
+                StreamingSecretDecision::NeedMore
+            }
+        } else {
+            StreamingSecretDecision::EmitLiteral {
+                consumed_bytes: 3 + allowed_len,
+            }
+        }
+    } else if allowed_len == bytes.len() {
+        if final_flush {
+            StreamingSecretDecision::EmitRedacted {
+                consumed_bytes: 3 + allowed_len,
+                continue_redacting: false,
+            }
+        } else {
+            StreamingSecretDecision::EmitRedacted {
+                consumed_bytes: 3 + allowed_len,
+                continue_redacting: true,
+            }
+        }
+    } else {
+        StreamingSecretDecision::EmitRedacted {
+            consumed_bytes: 3 + allowed_len,
+            continue_redacting: false,
+        }
+    }
+}
+
+fn analyze_fixed_length_secret_candidate(
+    rest: &str,
+    prefix_len: usize,
+    required_len: usize,
+    allowed: fn(u8) -> bool,
+    final_flush: bool,
+) -> StreamingSecretDecision {
+    let bytes = rest.as_bytes();
+    let mut allowed_len = 0usize;
+
+    while allowed_len < bytes.len() && allowed(bytes[allowed_len]) && allowed_len < required_len {
+        allowed_len += 1;
+    }
+
+    if allowed_len < required_len {
+        if allowed_len == bytes.len() {
+            if final_flush {
+                StreamingSecretDecision::EmitLiteral {
+                    consumed_bytes: prefix_len + allowed_len,
+                }
+            } else {
+                StreamingSecretDecision::NeedMore
+            }
+        } else {
+            StreamingSecretDecision::EmitLiteral {
+                consumed_bytes: prefix_len + allowed_len,
+            }
+        }
+    } else {
+        StreamingSecretDecision::EmitRedacted {
+            consumed_bytes: prefix_len + required_len,
+            continue_redacting: false,
+        }
+    }
+}
+
+fn take_prefix(buffer: &mut String, byte_len: usize) -> String {
+    buffer.drain(..byte_len).collect()
+}
+
+struct StreamingTextBuffer {
+    pending: String,
+    in_sk_secret: bool,
+}
+
+impl StreamingTextBuffer {
+    fn new() -> Self {
+        Self {
+            pending: String::new(),
+            in_sk_secret: false,
+        }
+    }
+
+    fn emit_segment<TS: TokenSink + ?Sized>(turn: &Turn, token_sink: &mut TS, segment: String) {
+        let redacted_output = guard_text_output(turn, segment);
+        if !redacted_output.is_empty() {
+            token_sink.on_token(redacted_output);
+        }
+    }
+
+    fn flush<TS: TokenSink + ?Sized>(
+        &mut self,
+        turn: &Turn,
+        token_sink: &mut TS,
+        final_flush: bool,
+    ) {
+        loop {
+            if self.pending.is_empty() {
+                if final_flush {
+                    self.in_sk_secret = false;
+                }
+                break;
+            }
+
+            if self.in_sk_secret {
+                let bytes = self.pending.as_bytes();
+                let mut allowed_len = 0usize;
+                while allowed_len < bytes.len() && is_sk_secret_byte(bytes[allowed_len]) {
+                    allowed_len += 1;
+                }
+
+                if allowed_len > 0 {
+                    self.pending.drain(..allowed_len);
+                }
+
+                if self.pending.is_empty() {
+                    if final_flush {
+                        self.in_sk_secret = false;
+                    }
+                    break;
+                }
+
+                self.in_sk_secret = false;
+                continue;
+            }
+
+            if let Some((prefix_index, prefix_kind)) = find_earliest_secret_prefix(&self.pending) {
+                if prefix_index > 0 {
+                    let safe_prefix = take_prefix(&mut self.pending, prefix_index);
+                    Self::emit_segment(turn, token_sink, safe_prefix);
+                    continue;
+                }
+
+                let rest = match prefix_kind {
+                    StreamingSecretPrefix::SkProject => {
+                        analyze_sk_secret_candidate(&self.pending[3..], final_flush)
+                    }
+                    StreamingSecretPrefix::GithubPat => analyze_fixed_length_secret_candidate(
+                        &self.pending[4..],
+                        4,
+                        36,
+                        is_github_pat_byte,
+                        final_flush,
+                    ),
+                    StreamingSecretPrefix::AwsKey => analyze_fixed_length_secret_candidate(
+                        &self.pending[4..],
+                        4,
+                        16,
+                        is_aws_key_byte,
+                        final_flush,
+                    ),
+                };
+
+                match rest {
+                    StreamingSecretDecision::NeedMore => break,
+                    StreamingSecretDecision::EmitLiteral { consumed_bytes } => {
+                        let segment = take_prefix(&mut self.pending, consumed_bytes);
+                        Self::emit_segment(turn, token_sink, segment);
+                    }
+                    StreamingSecretDecision::EmitRedacted {
+                        consumed_bytes,
+                        continue_redacting,
+                    } => {
+                        let _ = take_prefix(&mut self.pending, consumed_bytes);
+                        Self::emit_segment(turn, token_sink, "[REDACTED]".to_string());
+                        self.in_sk_secret = continue_redacting;
+                    }
+                }
+
+                continue;
+            }
+
+            let char_count = self.pending.chars().count();
+            let holdback = streaming_secret_holdback();
+            if final_flush {
+                let segment = std::mem::take(&mut self.pending);
+                Self::emit_segment(turn, token_sink, segment);
+                break;
+            }
+
+            // Keep a short tail buffered so a secret prefix split across tokens
+            // stays visible in the next flush instead of leaking as literal text.
+            if char_count <= holdback {
+                break;
+            }
+
+            let emit_char_count = char_count - holdback;
+            let split_byte = self
+                .pending
+                .char_indices()
+                .nth(emit_char_count)
+                .map(|(index, _)| index)
+                .unwrap_or(self.pending.len());
+            let segment = take_prefix(&mut self.pending, split_byte);
+            Self::emit_segment(turn, token_sink, segment);
+        }
+    }
+
+    fn push<TS: TokenSink + ?Sized>(&mut self, turn: &Turn, token_sink: &mut TS, token: String) {
+        self.pending.push_str(&token);
+        self.flush(turn, token_sink, false);
+    }
+
+    fn finish<TS: TokenSink + ?Sized>(&mut self, turn: &Turn, token_sink: &mut TS) {
+        self.flush(turn, token_sink, true);
+    }
+}
+
+fn safe_call_id_for_filename(call_id: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut safe = String::from("call_");
+    for byte in call_id.as_bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => safe.push(*byte as char),
+            _ => write!(&mut safe, "_{:02X}", byte).expect("writing to String cannot fail"),
+        }
+    }
+
+    if safe == "call_" {
+        safe.push_str("empty");
+    }
+
+    safe
+}
+
 fn cap_tool_output(
     sessions_dir: &Path,
     call_id: &str,
@@ -203,7 +494,7 @@ fn cap_tool_output(
         )
     })?;
 
-    let result_path = results_dir.join(format!("{call_id}.txt"));
+    let result_path = results_dir.join(format!("{}.txt", safe_call_id_for_filename(call_id)));
     fs::write(&result_path, &output)
         .with_context(|| format!("failed to write tool output to {}", result_path.display()))?;
 
@@ -304,18 +595,13 @@ where
         }
 
         let provider = make_provider().await?;
-        let mut streamed_output = String::new();
+        let mut streaming_output = StreamingTextBuffer::new();
         let mut turn_reply = provider
             .stream_completion(&messages, &tools, &mut |token| {
-                streamed_output.push_str(&token)
+                streaming_output.push(turn, token_sink, token);
             })
             .await?;
-        if !streamed_output.is_empty() {
-            let redacted_output = guard_text_output(turn, streamed_output);
-            if !redacted_output.is_empty() {
-                token_sink.on_token(redacted_output);
-            }
-        }
+        streaming_output.finish(turn, token_sink);
         guard_message_output(turn, &mut turn_reply.assistant_message);
         let turn_meta = turn_reply.meta;
 
@@ -595,6 +881,75 @@ mod tests {
                 on_token(token.clone());
             }
             Ok(self.turn.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingStreamingProvider {
+        streamed_tokens: Vec<String>,
+        turn: StreamedTurn,
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl crate::llm::LlmProvider for RecordingStreamingProvider {
+        async fn stream_completion(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[FunctionTool],
+            on_token: &mut (dyn FnMut(String) + Send),
+        ) -> Result<StreamedTurn> {
+            for token in &self.streamed_tokens {
+                self.events
+                    .lock()
+                    .expect("event log mutex poisoned")
+                    .push(format!("provider-before:{token}"));
+                on_token(token.clone());
+                self.events
+                    .lock()
+                    .expect("event log mutex poisoned")
+                    .push(format!("provider-after:{token}"));
+            }
+            Ok(self.turn.clone())
+        }
+    }
+
+    struct CompletionRecordingSink {
+        tokens: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        completes: std::sync::Arc<std::sync::Mutex<usize>>,
+    }
+
+    impl CompletionRecordingSink {
+        fn new() -> (
+            Self,
+            std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+            std::sync::Arc<std::sync::Mutex<usize>>,
+        ) {
+            let tokens = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let completes = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+            (
+                Self {
+                    tokens: tokens.clone(),
+                    completes: completes.clone(),
+                },
+                tokens,
+                completes,
+            )
+        }
+    }
+
+    impl TokenSink for CompletionRecordingSink {
+        fn on_token(&mut self, token: String) {
+            self.tokens
+                .lock()
+                .expect("completion sink token mutex poisoned")
+                .push(token);
+        }
+
+        fn on_complete(&mut self) {
+            *self
+                .completes
+                .lock()
+                .expect("completion sink completion mutex poisoned") += 1;
         }
     }
 
@@ -1167,6 +1522,235 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbound_text_is_streamed_incrementally_to_sink() {
+        let dir = temp_sessions_dir("outbound_incremental_stream");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = RecordingStreamingProvider {
+            streamed_tokens: vec!["hello ".to_string(), "world".to_string()],
+            turn: StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::text("hello world")],
+                },
+                tool_calls: vec![],
+                meta: None,
+                stop_reason: StopReason::Stop,
+            },
+            events: events.clone(),
+        };
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let turn = Turn::new();
+        let mut make_provider = move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        };
+        let events_for_sink = events.clone();
+        let mut token_sink = move |token: String| {
+            events_for_sink
+                .lock()
+                .expect("event log mutex poisoned")
+                .push(format!("sink:{token}"));
+        };
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "stream a response".to_string(),
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        let recorded = events.lock().expect("event log mutex poisoned").clone();
+        let first_sink = recorded
+            .iter()
+            .position(|event| event.starts_with("sink:"))
+            .expect("expected streamed output");
+        let completion_marker = recorded
+            .iter()
+            .position(|event| event == "provider-after:world")
+            .expect("expected second provider token");
+        assert!(
+            first_sink < completion_marker,
+            "expected sink output before completion"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn on_complete_is_only_emitted_after_final_stop() {
+        let dir = temp_sessions_dir("on_complete_count");
+        let provider = SequenceProvider::new(vec![
+            StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::text("thinking")],
+                },
+                tool_calls: vec![],
+                meta: None,
+                stop_reason: StopReason::ToolCalls,
+            },
+            StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::text("done")],
+                },
+                tool_calls: vec![],
+                meta: None,
+                stop_reason: StopReason::Stop,
+            },
+        ]);
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let turn = Turn::new();
+        let mut make_provider = move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        };
+        let (mut token_sink, _tokens, completes) = CompletionRecordingSink::new();
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "finish the turn".to_string(),
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *completes.lock().expect("completion count mutex poisoned"),
+            1
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbound_secret_split_across_tokens_is_redacted_before_sink() {
+        let dir = temp_sessions_dir("outbound_split_secret");
+        let provider = StreamingProvider {
+            streamed_tokens: vec![
+                "hello sk-proj-abc".to_string(),
+                "defghijklmnopqrstuvwxyz012345 world".to_string(),
+            ],
+            turn: StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::text(
+                        "hello sk-proj-abcdefghijklmnopqrstuvwxyz012345 world",
+                    )],
+                },
+                tool_calls: vec![],
+                meta: None,
+                stop_reason: StopReason::Stop,
+            },
+        };
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let turn = Turn::new().guard(SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"]));
+        let mut make_provider = move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        };
+        let streamed = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let streamed_tokens = streamed.clone();
+        let mut token_sink = move |token: String| {
+            streamed_tokens
+                .lock()
+                .expect("streamed token mutex poisoned")
+                .push_str(&token);
+        };
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "reply with a split secret".to_string(),
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        let streamed = streamed.lock().expect("streamed token mutex poisoned");
+        assert_eq!(streamed.as_str(), "hello [REDACTED] world");
+        assert!(
+            !streamed
+                .as_str()
+                .contains("sk-proj-abcdefghijklmnopqrstuvwxyz012345")
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbound_fixed_length_secret_prefixes_are_redacted_before_sink() {
+        let dir = temp_sessions_dir("outbound_fixed_length_secrets");
+        let provider = StreamingProvider {
+            streamed_tokens: vec![
+                "lead gh".to_string(),
+                "p_0123456789abcdefghijklmnopqrstuvwxyz mid AKIA123456".to_string(),
+                "7890ABCDEF tail".to_string(),
+            ],
+            turn: StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    content: vec![MessageContent::text(
+                        "lead ghp_0123456789abcdefghijklmnopqrstuvwxyz mid AKIA1234567890ABCDEF tail",
+                    )],
+                },
+                tool_calls: vec![],
+                meta: None,
+                stop_reason: StopReason::Stop,
+            },
+        };
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let turn = Turn::new().guard(SecretRedactor::new(&[
+            r"sk-[a-zA-Z0-9_-]{20,}",
+            r"ghp_[a-zA-Z0-9]{36}",
+            r"AKIA[0-9A-Z]{16}",
+        ]));
+        let mut make_provider = move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        };
+        let streamed = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let streamed_tokens = streamed.clone();
+        let mut token_sink = move |token: String| {
+            streamed_tokens
+                .lock()
+                .expect("streamed token mutex poisoned")
+                .push_str(&token);
+        };
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "redact fixed-length secrets".to_string(),
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        let streamed = streamed.lock().expect("streamed token mutex poisoned");
+        assert_eq!(streamed.as_str(), "lead [REDACTED] mid [REDACTED] tail");
+        assert!(!streamed.as_str().contains("ghp_"));
+        assert!(!streamed.as_str().contains("AKIA"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn tool_output_is_redacted_before_persist() {
         let dir = temp_sessions_dir("tool_redaction");
         let provider = SequenceProvider::new(vec![
@@ -1293,9 +1877,39 @@ mod tests {
             .expect("tool result should be persisted");
         assert_eq!(tool_result_text(tool_message), Some(output.as_str()));
 
-        let result_path = dir.join("results").join(format!("{call_id}.txt"));
+        let result_path = dir
+            .join("results")
+            .join(format!("{}.txt", safe_call_id_for_filename(call_id)));
         assert!(result_path.exists(), "result file should be created");
         assert_eq!(std::fs::read_to_string(result_path).unwrap(), output);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cap_tool_output_sanitizes_call_id_before_path_use() {
+        let dir = temp_sessions_dir("cap_tool_output_sanitized");
+        let call_id = "../../escape;rm -rf /";
+        let output = "line\n".repeat(2048);
+        let sanitized = safe_call_id_for_filename(call_id);
+
+        let capped =
+            cap_tool_output(&dir, call_id, output.clone(), DEFAULT_OUTPUT_CAP_BYTES).unwrap();
+
+        let result_path = dir.join("results").join(format!("{sanitized}.txt"));
+        let result_path_str = result_path.display().to_string();
+        assert!(
+            result_path.exists(),
+            "sanitized result file should be created"
+        );
+        assert_eq!(std::fs::read_to_string(&result_path).unwrap(), output);
+        assert!(capped.contains(&result_path_str));
+        assert!(!capped.contains(call_id));
+        assert!(
+            sanitized
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1309,7 +1923,9 @@ mod tests {
             cap_tool_output(&dir, "call-dir", output.clone(), DEFAULT_OUTPUT_CAP_BYTES).unwrap();
 
         assert_eq!(capped, output);
-        let result_path = dir.join("results").join("call-dir.txt");
+        let result_path = dir
+            .join("results")
+            .join(format!("{}.txt", safe_call_id_for_filename("call-dir")));
         assert!(result_path.exists(), "result file should be created");
         assert_eq!(std::fs::read_to_string(result_path).unwrap(), output);
 
@@ -1381,7 +1997,9 @@ mod tests {
             .expect("tool result should be persisted");
         let tool_result = tool_result_text(tool_message).expect("tool result text should exist");
         assert!(!tool_result.contains(&output));
-        let expected_path = dir.join("results").join(format!("{call_id}.txt"));
+        let expected_path = dir
+            .join("results")
+            .join(format!("{}.txt", safe_call_id_for_filename(call_id)));
         let expected_path_str = expected_path.display().to_string();
         assert!(tool_result.contains(&format!(
             "[output exceeded inline limit (2048 lines, 10 KB) -> {expected_path_str}]"
@@ -1391,7 +2009,9 @@ mod tests {
             "To read specific lines: sed -n '10,20p' {expected_path_str}"
         )));
 
-        let result_path = dir.join("results").join(format!("{call_id}.txt"));
+        let result_path = dir
+            .join("results")
+            .join(format!("{}.txt", safe_call_id_for_filename(call_id)));
         assert!(result_path.exists(), "result file should be created");
         assert_eq!(std::fs::read_to_string(result_path).unwrap(), output);
 

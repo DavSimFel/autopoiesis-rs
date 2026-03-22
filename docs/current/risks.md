@@ -15,11 +15,6 @@
 - CLI and server both use `sessions/queue.sqlite`. Running both concurrently = duplicate execution risk.
 - **Files:** `src/store.rs` (dequeue_next_message)
 
-### P1-3: Provider-controlled call_id is unsanitized
-- `call_id` from SSE events flows directly into filesystem paths (`results/{call_id}.txt`) and into shell command suggestions in the cap metadata. No sanitization.
-- Path traversal and shell injection via malformed provider responses are possible.
-- **Files:** `src/agent.rs` (cap_tool_output)
-
 ### P1-4: SSE parser drops trailing events
 - If the stream ends without a trailing newline, final non-text events (function_call_arguments.done, response.completed, [DONE]) are parsed then ignored.
 - Tool calls and completion metadata can silently disappear.
@@ -57,3 +52,7 @@
 
 ### ~~P0-3: Approval denial does not terminate the turn~~ (33ef098)
 - `make_denial_verdict()` increments a denial counter; after `MAX_DENIALS_PER_TURN` (2), the loop returns `TurnVerdict::Denied`. All denial paths use `break 'agent_turn` to exit cleanly.
+
+### ~~P1-3: Provider-controlled call_id is unsanitized~~ (8e743c3)
+- `call_id` is sanitized before being used in filesystem paths and shell command suggestions in `cap_tool_output()`.
+- **Files:** `src/agent.rs`

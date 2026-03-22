@@ -1,6 +1,6 @@
 [agent]
 model = "gpt-5.4-mini"
-reasoning_effort = "xheigh"
+reasoning_effort = "xhigh"
 
 [shell]
 default = "approve"
