@@ -90,7 +90,7 @@ main.rs          CLI entrypoint, REPL, server launch
 ## Tests
 
 ```bash
-cargo test                        # 124 unit tests
+cargo test                        # run unit tests
 cargo test --features integration # + live API tests (requires auth)
 cargo fmt --check                 # formatting
 cargo clippy -- -D warnings       # lints

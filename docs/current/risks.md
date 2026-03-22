@@ -3,30 +3,6 @@
 > **Single source of truth for known hazards.** Both AGENTS.md and docs/vision.md link here.
 > Updated: 2026-03-22
 
-## P0 — Critical
-
-### P0-1: Shell is not meaningfully contained
-- `ShellSafety` and `ExfilDetector` are regex heuristics over command strings. Trivially bypassed via `python -c`, `perl -e`, `node -e`, shell builtins, string concatenation (`co""nstitution.md`), or any unflagged binary.
-- RLIMIT restricts NPROC/FSIZE/CPU but not filesystem, network, credentials, or syscalls.
-- **Do not treat the guard pipeline as a security boundary.** It is risk reduction, not containment.
-- **Files:** `src/guard.rs` (ShellSafety, ExfilDetector), `src/tool.rs`
-- **Fix:** Flip shell default to approve-unless-whitelisted. Add `[shell]` policy config to `agents.toml`. Real sandboxing (seccomp/landlock) is a later milestone.
-
-### P0-2: HTTP callers can inject arbitrary message roles
-- `EnqueueMessageRequest` accepts `role` from the caller. Anyone with the API key can write `system` or `assistant` messages into persistent history.
-- These messages replay on every future turn — prompt integrity is broken.
-- **Do not assume the first system message is operator-controlled** when messages can arrive via HTTP.
-- **Files:** `src/server.rs` (EnqueueMessageRequest, enqueue handler), `src/agent.rs` (drain_queue)
-- **Fix:** HTTP/WS always enqueue as `user`. Only CLI/internal paths may set other roles.
-
-### P0-3: Approval denial does not terminate the turn
-- When approval is denied (inbound or tool call), the agent loop appends a denial note and `continue`s back into the model. `TurnVerdict::Denied` exists but is never returned.
-- HTTP uses `RejectApprovalHandler`, so every approval-required action auto-denies then loops back into the model indefinitely, burning tokens.
-- The claim "Deny short-circuits" is true at the `turn.rs` guard layer but false at the `agent.rs` orchestration layer.
-- **Do not assume denied approvals stop execution.**
-- **Files:** `src/agent.rs` (run_agent_loop), `src/server.rs` (WS handler)
-- **Fix:** Return `TurnVerdict::Denied` on denial, add max-denial counter, terminate cleanly.
-
 ## P1 — High
 
 ### P1-1: Global server serialization
@@ -67,5 +43,17 @@
 ### Identity hierarchy has no enforcement
 - constitution.md and operator.md are described as immutable/operator-only. No guard rule blocks writes to these paths. `echo "new rules" > identity/constitution.md` works.
 
-### No caller principal
-- Server auth is one static API key. No concept of who is calling. Once you have the key, you have full access to all sessions and can inject any role (see P0-2).
+### No caller principal beyond operator/user key split
+- Server auth distinguishes operator vs user via separate API keys, but there is no per-caller identity. Once you have the user key, you have full access to all sessions.
+
+## Fixed
+
+### ~~P0-1: Shell is not meaningfully contained~~ (a54f212)
+- Shell default flipped to approve-unless-whitelisted. `ShellSafety::with_policy()` reads `[shell]` config from `agents.toml` with explicit allow/deny patterns and configurable default severity.
+- **Note:** the guard pipeline is still heuristic, not a security boundary. Real sandboxing (seccomp/landlock) remains a later milestone (roadmap 3d).
+
+### ~~P0-2: HTTP callers can inject arbitrary message roles~~ (b03843b)
+- `Principal` enum enforces role based on auth key. User-key callers always enqueue as `user`. Only operator-key callers may request alternate roles (defaulting to `user`).
+
+### ~~P0-3: Approval denial does not terminate the turn~~ (33ef098)
+- `make_denial_verdict()` increments a denial counter; after `MAX_DENIALS_PER_TURN` (2), the loop returns `TurnVerdict::Denied`. All denial paths use `break 'agent_turn` to exit cleanly.

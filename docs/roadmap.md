@@ -8,7 +8,7 @@
 
 | # | Item | Depends on | Scope |
 |---|------|-----------|-------|
-| 1a | P0 fixes (role injection, denial termination, shell default-approve) | — | 3 PRs |
+| ~~1a~~ | ~~P0 fixes (role injection, denial termination, shell default-approve)~~ | — | ~~3 PRs~~ ✓ |
 | 1b | Standing approvals (`[shell.standing_approvals]` in agents.toml) | 1a | 1 PR |
 | 1c | Taint tracking (`<meta principal="..."/>` on messages, guard integration) | 1b | 1 PR |
 | 1d | Budget enforcement (per-turn/session/day token ceilings) | 1a | 1 PR |
@@ -55,3 +55,6 @@
 - Persistent named sessions (`--session <name>`)
 - Server path sanitization (session_id validation)
 - Stale message recovery on startup
+- **P0-1:** Shell default-approve with configurable policy — `[shell]` in agents.toml (#8)
+- **P0-2:** HTTP role enforcement via Principal enum (#6)
+- **P0-3:** Approval denial terminates turn — MAX_DENIALS_PER_TURN + break (#7)

@@ -24,7 +24,7 @@ cargo test --features integration  # live API tests (skip if no auth)
 ## Project structure
 
 ```
-src/                 17 Rust source files (~7.6K lines)
+src/                 17 Rust source files (~7.9K lines)
 identity/            Runtime prompt files (constitution, identity, context)
 agents.toml          Model config
 sessions/            JSONL history + SQLite queue (gitignored)
