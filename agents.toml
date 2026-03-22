@@ -1,3 +1,9 @@
 [agent]
 model = "gpt-5.3-codex-spark"
 reasoning_effort = "medium"
+
+[shell]
+default = "approve"
+allow_patterns = ["cargo *", "git *", "cat *", "ls *", "grep *", "head *", "tail *", "sed *", "awk *", "wc *", "find *", "echo *", "pwd", "which *", "env", "date", "uname *"]
+deny_patterns = ["rm -rf /*", "rm -rf ~*", "curl * | sh*", "wget * | sh*", "> /dev/sd*"]
+default_severity = "medium"

@@ -20,6 +20,8 @@ pub struct Config {
     pub session_name: Option<String>,
     /// Optional operator API key for privileged HTTP access.
     pub operator_key: Option<String>,
+    /// Shell execution policy loaded from the optional `[shell]` table.
+    pub shell_policy: ShellPolicy,
 }
 
 impl Config {
@@ -33,6 +35,7 @@ impl Config {
             reasoning_effort: None,
             session_name: None,
             operator_key: None,
+            shell_policy: ShellPolicy::default(),
         };
 
         let contents = match std::fs::read_to_string(config_path.as_ref()) {
@@ -74,6 +77,8 @@ impl Config {
             config.operator_key = Some(operator_key);
         }
 
+        config.shell_policy = file_config.shell;
+
         if let Ok(operator_key) = std::env::var("AUTOPOIESIS_OPERATOR_KEY") {
             config.operator_key = Some(operator_key);
         }
@@ -103,11 +108,18 @@ mod tests {
         path.to_string_lossy().to_string()
     }
 
+    fn assert_default_shell_policy(policy: &ShellPolicy) {
+        assert_eq!(policy.default, "approve");
+        assert!(policy.allow_patterns.is_empty());
+        assert!(policy.deny_patterns.is_empty());
+        assert_eq!(policy.default_severity, "medium");
+    }
+
     #[test]
     fn loads_valid_agents_toml_with_all_fields() {
         let path = temp_toml_path(
             "all_fields",
-            "[agent]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning_effort='low'\nsession_name='fix-auth'\n[auth]\noperator_key='operator-secret'\n",
+            "[agent]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning_effort='low'\nsession_name='fix-auth'\n[auth]\noperator_key='operator-secret'\n[shell]\ndefault='allow'\nallow_patterns=['git *','cargo *']\ndeny_patterns=['rm -rf /*']\ndefault_severity='high'\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -117,6 +129,16 @@ mod tests {
         assert_eq!(config.reasoning_effort, Some("low".to_string()));
         assert_eq!(config.session_name, Some("fix-auth".to_string()));
         assert_eq!(config.operator_key, Some("operator-secret".to_string()));
+        assert_eq!(config.shell_policy.default, "allow");
+        assert_eq!(
+            config.shell_policy.allow_patterns,
+            vec!["git *".to_string(), "cargo *".to_string()]
+        );
+        assert_eq!(
+            config.shell_policy.deny_patterns,
+            vec!["rm -rf /*".to_string()]
+        );
+        assert_eq!(config.shell_policy.default_severity, "high");
     }
 
     #[test]
@@ -129,6 +151,7 @@ mod tests {
             config.system_prompt,
             "You are a direct and capable coding agent. Execute tasks efficiently."
         );
+        assert_default_shell_policy(&config.shell_policy);
     }
 
     #[test]
@@ -142,6 +165,7 @@ mod tests {
         assert_eq!(config.reasoning_effort, None);
         assert_eq!(config.session_name, None);
         assert_eq!(config.operator_key, None);
+        assert_default_shell_policy(&config.shell_policy);
     }
 
     #[test]
@@ -161,6 +185,7 @@ mod tests {
         assert_eq!(config.reasoning_effort, None);
         assert_eq!(config.session_name, None);
         assert_eq!(config.operator_key, None);
+        assert_default_shell_policy(&config.shell_policy);
     }
 
     #[test]
@@ -195,6 +220,8 @@ mod tests {
 struct AgentFileConfig {
     agent: AgentFileSection,
     auth: Option<AuthFileSection>,
+    #[serde(default)]
+    shell: ShellPolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,4 +236,29 @@ struct AgentFileSection {
 #[derive(Debug, Deserialize)]
 struct AuthFileSection {
     operator_key: Option<String>,
+}
+
+/// Shell execution policy loaded from `[shell]` in `agents.toml`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ShellPolicy {
+    /// "approve" (default) or "allow".
+    pub default: String,
+    /// Glob patterns that are auto-allowed.
+    pub allow_patterns: Vec<String>,
+    /// Glob patterns that are always denied.
+    pub deny_patterns: Vec<String>,
+    /// Severity for commands that don't match any pattern.
+    pub default_severity: String,
+}
+
+impl Default for ShellPolicy {
+    fn default() -> Self {
+        Self {
+            default: "approve".to_string(),
+            allow_patterns: Vec::new(),
+            deny_patterns: Vec::new(),
+            default_severity: "medium".to_string(),
+        }
+    }
 }

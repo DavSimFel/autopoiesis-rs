@@ -690,6 +690,7 @@ mod tests {
                     reasoning_effort: None,
                     session_name: None,
                     operator_key: Some("operator-key".to_string()),
+                    shell_policy: config::ShellPolicy::default(),
                 },
                 http_client: Client::new(),
             },
