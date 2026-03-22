@@ -11,7 +11,7 @@ Legacy codebase: `/root/autopoiesis` (Python, still running in prod, no new deve
 
 ### autopoiesis-rs layout
 ```
-src/           — Rust source (~7.5K lines, 17 files)
+src/           — Rust source (~7.6K lines, 17 files)
 identity/      — System prompt files (constitution, identity, context)
 agents.toml    — Model config (model name, reasoning effort)
 sessions/      — JSONL history + SQLite queue (gitignored)

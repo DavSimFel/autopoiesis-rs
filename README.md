@@ -90,9 +90,23 @@ main.rs          CLI entrypoint, REPL, server launch
 ## Tests
 
 ```bash
-cargo test                        # 92 unit tests
+cargo test                        # 124 unit tests
 cargo test --features integration # + live API tests (requires auth)
+cargo fmt --check                 # formatting
+cargo clippy -- -D warnings       # lints
 ```
+
+## Safety
+
+The guard pipeline (SecretRedactor, ShellSafety, ExfilDetector) provides **risk reduction, not containment**. Shell commands run as the current user with full filesystem and network access. RLIMIT caps NPROC/FSIZE/CPU only. See [docs/current/risks.md](docs/current/risks.md) for known hazards.
+
+## Documentation
+
+- [docs/current/architecture.md](docs/current/architecture.md) — how the code works today
+- [docs/current/risks.md](docs/current/risks.md) — known broken invariants and hazards
+- [docs/roadmap.md](docs/roadmap.md) — build order and priorities
+- [docs/vision.md](docs/vision.md) — future-state design
+- [AGENTS.md](AGENTS.md) — instructions for AI agents working on this repo
 
 ## License
 
