@@ -88,13 +88,75 @@ Triggers: cron + webhook only. No file-watching (cron + stat does the same job).
 ./autopoiesis session list
 ```
 
+## Surfaces
+
+**Cross-platform CLI + GUI.** Not IDE-first — IDE is dead or the operator can VSCode Remote into the repo.
+
+- **CLI** — primary interface. One binary, works everywhere.
+- **Web GUI** — lightweight client for the HTTP/SSE server. Works on any device with a browser.
+- **Android app** — native companion for mobile access.
+- **Desktop** — Windows + Linux native clients (or wrapper over web GUI).
+
+All surfaces talk to the same server/queue. The agent doesn't know or care which surface sent the message. No surface-specific logic in the runtime.
+
+## Multi-agent tiers
+
+**User → T1 → T2 → T3.** Three tiers, clear responsibilities:
+
+- **T1 (personal assistant)** — one per user. Always running. Handles direct conversation, routing, and delegation. Lightweight model (Sonnet-class).
+- **T2 (planner/orchestrator)** — domain-scoped. Pure planner, no code. Manages dozens of parallel T3 executors. When a topic gets too busy, aprs spins up a dedicated T2 instance for that domain.
+- **T3 (ephemeral executor)** — blind worker. Gets a topic + prompt, executes, reports results, dies. T2 sets up the workspace: git worktree, subscribed files, relevant context. T3 does zero exploration.
+
+**T1/T2 = one brain, two speeds.** Same identity, same workspace. T2 is T1 with a bigger model and reasoning budget. T3 is disposable.
+
+**Worktree isolation for parallel coding.** T2 creates a git worktree in T3's workspace. T3 works on its branch, pushes, opens PR. Multiple T3s work in parallel without conflicts.
+
+**Scaling pattern:**
+```
+User
+ └── T1 (personal, always on)
+      ├── T2-gym (dedicated: gym management)
+      │    ├── T3 (scheduling task)
+      │    ├── T3 (member analysis)
+      │    └── T3 (email drafts)
+      ├── T2-code (dedicated: autopoiesis dev)
+      │    ├── T3 (fix P0-2, worktree /tmp/fix-p0-2)
+      │    └── T3 (build subscriptions, worktree /tmp/feat-subs)
+      └── T3 (quick one-off, no T2 needed)
+```
+
 ## Skills
 
 Two-tiered: shipped and custom.
 
 *Shipped skills* are core cognitive capabilities: web search, deep research, coding, planning. Thought patterns injected into context, not runtime plugins.
 
-*Custom skills* are built by the agent. When it needs a new integration, it reads docs, generates the connector, tests, deploys — all through shell. Autopoiesis ships zero vendor connectors.
+*Custom skills* are ALL ingress/egress adapters. The core idea: aprs custom-codes everything. When it needs a new integration, it reads API docs, generates the connector, tests, deploys — all through shell. MCP, A2A, webhooks — ingress/egress adapters managed through shell and queue, not new tools. Autopoiesis ships zero vendor connectors.
+
+## Memory
+
+**MVP: 100% file-based.** Topics + journal + summaries + file workspace.
+
+- **Journal** — append-only daily files. Raw events, decisions, observations.
+- **Summaries** — distilled from journal entries. Agent curates what matters.
+- **Topic files** — working notes per domain/project. Plans, state, questions.
+- **Workspace files** — code, configs, data. First-class context via subscriptions.
+
+**V1: Knowledge engine.** Graph-based. Bitemporal. Source-tracked provenance. Truth scoring. Ontology discovery. Hybrid retrieval (FTS + vector + graph traversal).
+
+**Progression:** files → files + search → graph knowledge engine. Each layer subsumes the previous.
+
+## Observability and evaluation
+
+**MVP: Observability.** Every shell call, guard verdict, approval decision, subscription change, and queue transition is logged and auditable via SQLite + JSONL. Entire execution history replayable from disk.
+
+**V1: Evaluation.** Structured eval framework. Test cases (input + expected behavior), scored results, regression detection, constitution compliance scoring, gate promotion based on eval.
+
+**V2: Autonomous experiments.** The agent designs and runs its own experiments. Tests hypotheses about its behavior. Self-tunes persona dimensions based on measured outcomes. Proposes identity changes backed by evidence.
+
+## Multimodal stance
+
+**Text + shell first.** Voice, vision, avatars, device peripherals are out of scope for the core runtime. If needed, they arrive as ingress/egress adapters (speech-to-text writes to inbox, text-to-speech reads from outbox). The one-tool principle holds.
 
 ## Open questions
 
