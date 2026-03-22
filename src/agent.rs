@@ -15,6 +15,7 @@ use crate::turn::Turn;
 use crate::util::utc_timestamp;
 
 const DEFAULT_OUTPUT_CAP_BYTES: usize = 4096;
+const MAX_DENIALS_PER_TURN: usize = 2;
 
 /// Receiver of streaming tokens emitted by the model during completion.
 pub trait TokenSink {
@@ -150,6 +151,25 @@ fn append_hard_deny(session: &mut Session, by: &str, reason: &str) -> Result<()>
     )
 }
 
+fn make_denial_verdict(denial_count: &mut usize, gate_id: String, reason: String) -> TurnVerdict {
+    *denial_count += 1;
+    if *denial_count >= MAX_DENIALS_PER_TURN {
+        TurnVerdict::Denied {
+            reason: format!(
+                "stopped after {} denied actions this turn; last denial by {gate_id}: {reason}",
+                *denial_count
+            ),
+            gate_id,
+        }
+    } else {
+        TurnVerdict::Denied { reason, gate_id }
+    }
+}
+
+pub fn format_denial_message(reason: &str, gate_id: &str) -> String {
+    format!("Command hard-denied by {gate_id}: {reason}")
+}
+
 fn guard_text_output(turn: &Turn, text: String) -> String {
     let mut text = text;
     match turn.check_text_delta(&mut text) {
@@ -222,8 +242,9 @@ where
 
     let mut executed: Vec<ToolCall> = Vec::new();
     let mut had_user_approval = false;
+    let mut denial_count = 0usize;
 
-    'agent_turn: loop {
+    let denied_turn = 'agent_turn: loop {
         session.ensure_context_within_limit();
         let mut messages = session.history().to_vec();
         if !persisted_user_message {
@@ -250,11 +271,11 @@ where
                     ChatMessage::system(format!("Message hard-denied by {gate_id}: {reason}")),
                     None,
                 )?;
-                continue;
+                break 'agent_turn Some(make_denial_verdict(&mut denial_count, gate_id, reason));
             }
             Verdict::Approve {
                 reason,
-                gate_id: _,
+                gate_id,
                 severity,
             } => {
                 let command = messages
@@ -269,7 +290,11 @@ where
                 let approved = approval_handler.request_approval(&severity, &reason, command);
                 if !approved {
                     append_approval_denied(session, &reason, command)?;
-                    continue;
+                    break 'agent_turn Some(make_denial_verdict(
+                        &mut denial_count,
+                        gate_id,
+                        reason,
+                    ));
                 }
             }
         }
@@ -305,11 +330,15 @@ where
                         Verdict::Modify => {}
                         Verdict::Deny { reason, gate_id } => {
                             append_hard_deny(session, &gate_id, &reason)?;
-                            continue 'agent_turn;
+                            break 'agent_turn Some(make_denial_verdict(
+                                &mut denial_count,
+                                gate_id,
+                                reason,
+                            ));
                         }
                         Verdict::Approve {
                             reason,
-                            gate_id: _,
+                            gate_id,
                             severity,
                         } => {
                             let command = command_from_tool_call(call)
@@ -318,7 +347,11 @@ where
                                 approval_handler.request_approval(&severity, &reason, &command);
                             if !approved {
                                 append_approval_denied(session, &reason, &command)?;
-                                continue 'agent_turn;
+                                break 'agent_turn Some(make_denial_verdict(
+                                    &mut denial_count,
+                                    gate_id,
+                                    reason,
+                                ));
                             }
                             had_user_approval = true;
                         }
@@ -330,11 +363,15 @@ where
                     Verdict::Modify => {}
                     Verdict::Deny { reason, gate_id } => {
                         append_hard_deny(session, &gate_id, &reason)?;
-                        continue 'agent_turn;
+                        break 'agent_turn Some(make_denial_verdict(
+                            &mut denial_count,
+                            gate_id,
+                            reason,
+                        ));
                     }
                     Verdict::Approve {
                         reason,
-                        gate_id: _,
+                        gate_id,
                         severity,
                     } => {
                         let command = tool_calls
@@ -343,7 +380,11 @@ where
                             .unwrap_or_else(|| "<command unavailable>".to_string());
                         if !approval_handler.request_approval(&severity, &reason, &command) {
                             append_approval_denied(session, &reason, &command)?;
-                            continue 'agent_turn;
+                            break 'agent_turn Some(make_denial_verdict(
+                                &mut denial_count,
+                                gate_id,
+                                reason,
+                            ));
                         }
                         had_user_approval = true;
                     }
@@ -378,7 +419,9 @@ where
                 return Ok(TurnVerdict::Executed(executed));
             }
         }
-    }
+    };
+
+    denied_turn.context("agent loop exited without a terminal denial")
 }
 
 pub async fn process_message<F, Fut, P, TS, AH>(
@@ -434,7 +477,7 @@ pub async fn drain_queue<F, Fut, P>(
     make_provider: &mut F,
     token_sink: &mut (dyn TokenSink + Send),
     approval_handler: &mut (dyn ApprovalHandler + Send),
-) -> Result<()>
+) -> Result<Option<TurnVerdict>>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<P>>,
@@ -460,7 +503,7 @@ where
                         eprintln!("Command approved by user and executed.");
                     }
                     TurnVerdict::Denied { reason, gate_id } => {
-                        eprintln!("Command hard-denied by {gate_id}: {reason}");
+                        return Ok(Some(TurnVerdict::Denied { reason, gate_id }));
                     }
                 }
             }
@@ -481,7 +524,7 @@ where
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -612,6 +655,24 @@ mod tests {
             _on_token: &mut (dyn FnMut(String) + Send),
         ) -> Result<StreamedTurn> {
             Err(anyhow::anyhow!("provider failure"))
+        }
+    }
+
+    struct InboundDenyGuard;
+
+    impl crate::guard::Guard for InboundDenyGuard {
+        fn name(&self) -> &str {
+            "inbound-deny"
+        }
+
+        fn check(&self, event: &mut crate::guard::GuardEvent) -> Verdict {
+            match event {
+                crate::guard::GuardEvent::Inbound(_) => Verdict::Deny {
+                    reason: "blocked by test".to_string(),
+                    gate_id: "inbound-deny".to_string(),
+                },
+                _ => Verdict::Allow,
+            }
         }
     }
 
@@ -751,17 +812,20 @@ mod tests {
         let mut token_sink = |_token: String| {};
         let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
 
-        drain_queue(
-            &mut store,
-            session_id,
-            &mut session,
-            &turn,
-            &mut provider_factory,
-            &mut token_sink,
-            &mut approval_handler,
-        )
-        .await
-        .unwrap();
+        assert!(
+            drain_queue(
+                &mut store,
+                session_id,
+                &mut session,
+                &turn,
+                &mut provider_factory,
+                &mut token_sink,
+                &mut approval_handler,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
 
         assert_eq!(
             *provider_calls
@@ -924,6 +988,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbound_denial_returns_denied_without_looping() {
+        let dir = temp_sessions_dir("inbound_denial");
+        let (provider, observed_message_counts) = InspectingProvider::new();
+        let mut session = crate::session::Session::new(&dir).unwrap();
+
+        let turn = Turn::new().guard(InboundDenyGuard);
+        let mut make_provider = {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        let verdict = run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "blocked prompt".to_string(),
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            verdict,
+            TurnVerdict::Denied { reason, gate_id }
+                if reason == "blocked by test" && gate_id == "inbound-deny"
+        ));
+        assert!(
+            observed_message_counts
+                .lock()
+                .expect("observed message count mutex poisoned")
+                .is_empty()
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn context_insertion_does_not_replace_persisted_user_message() {
         let dir = temp_sessions_dir("persist_user_with_context");
         let identity_dir = dir.join("identity");
@@ -972,6 +1079,38 @@ mod tests {
         assert!(content.contains("store this user prompt"));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn max_denial_counter_returns_summary_after_threshold() {
+        let mut denial_count = 0usize;
+
+        let first = make_denial_verdict(
+            &mut denial_count,
+            "guard-1".to_string(),
+            "first denial".to_string(),
+        );
+        assert!(matches!(
+            first,
+            TurnVerdict::Denied { ref reason, ref gate_id }
+                if reason == "first denial" && gate_id == "guard-1"
+        ));
+
+        let second = make_denial_verdict(
+            &mut denial_count,
+            "guard-2".to_string(),
+            "second denial".to_string(),
+        );
+        match second {
+            TurnVerdict::Denied { reason, gate_id } => {
+                assert_eq!(gate_id, "guard-2");
+                assert!(reason.contains("stopped after 2 denied actions this turn"));
+                assert!(reason.contains("last denial by guard-2: second denial"));
+            }
+            _ => panic!("expected denied verdict"),
+        }
+
+        assert_eq!(denial_count, 2);
     }
 
     #[tokio::test]
