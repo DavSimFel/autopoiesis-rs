@@ -10,6 +10,8 @@
 
 **Shell is the universal tool.** File I/O, web requests, process management, agent-to-agent calls, self-configuration — all through shell. The prompt teaches the agent what to do. The tool surface stays at one.
 
+**PTY shell is the big brother.** The shell evolves from batch `sh -lc` to a full PTY. This unlocks persistent interactive sessions — SSH connections that stay alive across turns, REPLs, long-running processes the agent monitors and interacts with. The agent can maintain persistent remote SSH connections, run `top` and read the output, interact with database CLIs, or drive any interactive terminal program. Same one tool, dramatically more capable.
+
 **Shell output is capped. Full results live in files.** Every shell execution saves full output to `sessions/{id}/results/{call_id}.txt`. Output below threshold is also inline in history. Output above threshold: only metadata in history. To read the content, the agent **subscribes**. This is the forcing mechanism.
 
 **Subscriptions are explicit context management.** A subscription injects file content into the context pipeline. Subscriptions are standalone — optionally grouped by topic. The agent subscribes via CLI (`./autopoiesis sub add <path>`). Subscriptions are:
@@ -104,10 +106,12 @@ All surfaces talk to the same server/queue. The agent doesn't know or care which
 **User → T1 → T2 → T3.** Three tiers, clear responsibilities:
 
 - **T1 (personal assistant)** — one per user. Always running. Handles direct conversation, routing, and delegation. Lightweight model (Sonnet-class).
-- **T2 (planner/orchestrator)** — domain-scoped. Pure planner, no code. Manages dozens of parallel T3 executors. When a topic gets too busy, aprs spins up a dedicated T2 instance for that domain.
+- **T2 (planner/orchestrator)** — domain-scoped. Pure planner, no code. Manages dozens of parallel T3 executors. Every user gets a "personal" T2 by default. When a topic (like "managing my gym") outgrows the personal T2, aprs spins up a dedicated T2 instance for that domain. T1 can talk to any T2 — personal or domain-specific.
 - **T3 (ephemeral executor)** — blind worker. Gets a topic + prompt, executes, reports results, dies. T2 sets up the workspace: git worktree, subscribed files, relevant context. T3 does zero exploration.
 
 **T1/T2 = one brain, two speeds.** Same identity, same workspace. T2 is T1 with a bigger model and reasoning budget. T3 is disposable.
+
+**T1 talks to any T2.** The personal T1 is the user's single interface. It routes to the personal T2 for general work, or to domain-specific T2s for specialized domains. T2s are autonomous within their domain — T1 delegates and checks in, doesn't micromanage.
 
 **Worktree isolation for parallel coding.** T2 creates a git worktree in T3's workspace. T3 works on its branch, pushes, opens PR. Multiple T3s work in parallel without conflicts.
 
@@ -156,7 +160,7 @@ Two-tiered: shipped and custom.
 
 ## Multimodal stance
 
-**Text + shell first.** Voice, vision, avatars, device peripherals are out of scope for the core runtime. If needed, they arrive as ingress/egress adapters (speech-to-text writes to inbox, text-to-speech reads from outbox). The one-tool principle holds.
+**Omni-modal as far as possible.** The CLI is text+shell. The GUI introduces rich modality: canvas (interactive visual workspace), image/file rendering, voice input/output, and whatever the surface supports. The runtime itself stays message-based — modalities are content types in the inbox, not new tools. The one-tool principle holds for execution; the surfaces expand what the agent can perceive and present.
 
 ## Open questions
 
