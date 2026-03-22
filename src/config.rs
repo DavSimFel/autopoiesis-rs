@@ -18,6 +18,8 @@ pub struct Config {
     pub reasoning_effort: Option<String>,
     /// Optional default CLI session name loaded from configuration.
     pub session_name: Option<String>,
+    /// Optional operator API key for privileged HTTP access.
+    pub operator_key: Option<String>,
 }
 
 impl Config {
@@ -30,6 +32,7 @@ impl Config {
             base_url: "https://chatgpt.com/backend-api/codex/responses".to_string(),
             reasoning_effort: None,
             session_name: None,
+            operator_key: None,
         };
 
         let contents = match std::fs::read_to_string(config_path.as_ref()) {
@@ -63,6 +66,18 @@ impl Config {
             config.session_name = Some(session_name);
         }
 
+        if let Some(operator_key) = file_config
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.operator_key.clone())
+        {
+            config.operator_key = Some(operator_key);
+        }
+
+        if let Ok(operator_key) = std::env::var("AUTOPOIESIS_OPERATOR_KEY") {
+            config.operator_key = Some(operator_key);
+        }
+
         Ok(config)
     }
 }
@@ -92,7 +107,7 @@ mod tests {
     fn loads_valid_agents_toml_with_all_fields() {
         let path = temp_toml_path(
             "all_fields",
-            "[agent]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning_effort='low'\nsession_name='fix-auth'\n",
+            "[agent]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning_effort='low'\nsession_name='fix-auth'\n[auth]\noperator_key='operator-secret'\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -101,6 +116,7 @@ mod tests {
         assert_eq!(config.base_url, "https://example.test/api");
         assert_eq!(config.reasoning_effort, Some("low".to_string()));
         assert_eq!(config.session_name, Some("fix-auth".to_string()));
+        assert_eq!(config.operator_key, Some("operator-secret".to_string()));
     }
 
     #[test]
@@ -125,6 +141,7 @@ mod tests {
         );
         assert_eq!(config.reasoning_effort, None);
         assert_eq!(config.session_name, None);
+        assert_eq!(config.operator_key, None);
     }
 
     #[test]
@@ -143,6 +160,7 @@ mod tests {
         );
         assert_eq!(config.reasoning_effort, None);
         assert_eq!(config.session_name, None);
+        assert_eq!(config.operator_key, None);
     }
 
     #[test]
@@ -160,11 +178,23 @@ mod tests {
         let result = Config::load(&path);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn loads_operator_key_from_auth_section() {
+        let path = temp_toml_path(
+            "operator_key",
+            "[agent]\nmodel='gpt-auth'\n[auth]\noperator_key='operator-from-file'\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(config.operator_key, Some("operator-from-file".to_string()));
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct AgentFileConfig {
     agent: AgentFileSection,
+    auth: Option<AuthFileSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,4 +204,9 @@ struct AgentFileSection {
     base_url: Option<String>,
     reasoning_effort: Option<String>,
     session_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthFileSection {
+    operator_key: Option<String>,
 }
