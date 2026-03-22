@@ -1,8 +1,9 @@
 pub mod agent;
 pub mod auth;
+pub mod cli;
 pub mod config;
 pub mod context;
-pub mod guard;
+pub mod gate;
 pub mod identity;
 pub mod llm;
 pub mod server;

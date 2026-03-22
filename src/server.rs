@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::{agent, auth, config, llm, session, store, turn};
+use crate::{agent, auth, cli, config, llm, session, store, turn};
 
 const API_KEY_HEADER: &str = "x-api-key";
 
@@ -356,7 +356,7 @@ async fn websocket_session(
         {
             Ok(Some(verdict)) => match verdict {
                 agent::TurnVerdict::Denied { reason, gate_id } => {
-                    eprintln!("{}", agent::format_denial_message(&reason, &gate_id));
+                    eprintln!("{}", cli::format_denial_message(&reason, &gate_id));
                     send_ws_terminal_denial(&tx, &reason);
                     break;
                 }
@@ -493,7 +493,7 @@ fn spawn_http_queue_worker(state: ServerState, session_id: String) {
         {
             Ok(Some(verdict)) => match verdict {
                 agent::TurnVerdict::Denied { reason, gate_id } => {
-                    eprintln!("{}", agent::format_denial_message(&reason, &gate_id));
+                    eprintln!("{}", cli::format_denial_message(&reason, &gate_id));
                 }
                 _ => unreachable!("drain_queue only returns denial verdicts"),
             },
@@ -571,7 +571,7 @@ struct RejectApprovalHandler;
 impl agent::ApprovalHandler for RejectApprovalHandler {
     fn request_approval(
         &mut self,
-        _severity: &crate::guard::Severity,
+        _severity: &crate::gate::Severity,
         _reason: &str,
         _command: &str,
     ) -> bool {
@@ -618,7 +618,7 @@ impl WsApprovalHandler {
 impl agent::ApprovalHandler for WsApprovalHandler {
     fn request_approval(
         &mut self,
-        severity: &crate::guard::Severity,
+        severity: &crate::gate::Severity,
         reason: &str,
         command: &str,
     ) -> bool {
@@ -642,11 +642,11 @@ impl agent::ApprovalHandler for WsApprovalHandler {
     }
 }
 
-fn severity_label(severity: crate::guard::Severity) -> &'static str {
+fn severity_label(severity: crate::gate::Severity) -> &'static str {
     match severity {
-        crate::guard::Severity::Low => "low",
-        crate::guard::Severity::Medium => "medium",
-        crate::guard::Severity::High => "high",
+        crate::gate::Severity::Low => "low",
+        crate::gate::Severity::Medium => "medium",
+        crate::gate::Severity::High => "high",
     }
 }
 
@@ -659,7 +659,7 @@ mod tests {
     use tower::util::ServiceExt;
 
     use crate::agent::ApprovalHandler;
-    use crate::guard::{Severity, Verdict};
+    use crate::gate::{Guard, GuardEvent, Severity, Verdict};
     use crate::llm::{ChatMessage, FunctionTool, StopReason, StreamedTurn};
 
     fn test_state() -> (ServerState, PathBuf) {
@@ -966,14 +966,14 @@ mod tests {
 
         struct NeedsApproval;
 
-        impl crate::guard::Guard for NeedsApproval {
+        impl Guard for NeedsApproval {
             fn name(&self) -> &str {
                 "needs-approval"
             }
 
-            fn check(&self, event: &mut crate::guard::GuardEvent) -> Verdict {
+            fn check(&self, event: &mut GuardEvent) -> Verdict {
                 match event {
-                    crate::guard::GuardEvent::ToolCall(_) => Verdict::Approve {
+                    GuardEvent::ToolCall(_) => Verdict::Approve {
                         reason: "danger".to_string(),
                         gate_id: "needs-approval".to_string(),
                         severity: Severity::High,

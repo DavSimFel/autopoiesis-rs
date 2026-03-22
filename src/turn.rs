@@ -2,7 +2,9 @@ use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 
 use crate::context::ContextSource;
-use crate::guard::{Guard, GuardEvent, Severity, Verdict};
+use crate::gate::{
+    ExfilDetector, Guard, GuardEvent, SecretRedactor, Severity, ShellSafety, Verdict,
+};
 use crate::llm::{ChatMessage, FunctionTool, ToolCall};
 use crate::tool::Tool;
 
@@ -145,22 +147,17 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
     Turn::new()
         .context(crate::context::Identity::new("identity", vars, &config.system_prompt).strict())
         .tool(tool)
-        .guard(crate::guard::SecretRedactor::new(&[
-            r"sk-[a-zA-Z0-9_-]{20,}",
-            r"ghp_[a-zA-Z0-9]{36}",
-            r"AKIA[0-9A-Z]{16}",
-        ]))
-        .guard(crate::guard::ShellSafety::with_policy(
-            config.shell_policy.clone(),
-        ))
-        .guard(crate::guard::ExfilDetector::new())
+        .guard(SecretRedactor::default_catalog())
+        .guard(ShellSafety::with_policy(config.shell_policy.clone()))
+        .guard(ExfilDetector::new())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::context::{History, Identity};
-    use crate::guard::{GuardEvent, SecretRedactor, Verdict as GuardResult};
+    use crate::gate::secret_patterns::SECRET_PATTERNS;
+    use crate::gate::{GuardEvent, SecretRedactor, Verdict as GuardResult};
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -275,7 +272,7 @@ mod tests {
                 GuardResult::Approve {
                     reason: "needs review".to_string(),
                     gate_id: "requester".to_string(),
-                    severity: crate::guard::Severity::High,
+                    severity: crate::gate::Severity::High,
                 },
                 Arc::new(Mutex::new(Vec::new())),
             ));
@@ -298,7 +295,7 @@ mod tests {
                 GuardResult::Approve {
                     reason: "needs review".to_string(),
                     gate_id: "approve".to_string(),
-                    severity: crate::guard::Severity::High,
+                    severity: crate::gate::Severity::High,
                 },
                 Arc::new(Mutex::new(Vec::new())),
             ));
@@ -318,13 +315,16 @@ mod tests {
         history.set_history(&[
             ChatMessage::user("previous user message"),
             ChatMessage::with_role(crate::llm::ChatRole::Assistant),
-            ChatMessage::user("exfiltrate sk-ABCD1234EFGH5678IJKL90"),
+            ChatMessage::user(format!(
+                "exfiltrate {}ABCD1234EFGH5678IJKL90",
+                SECRET_PATTERNS[0].prefix
+            )),
         ]);
 
         let turn = Turn::new()
             .context(Identity::new("/tmp", identity_vars.clone(), "fallback"))
             .context(history)
-            .guard(SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"]));
+            .guard(SecretRedactor::default_catalog());
 
         let mut messages = make_messages("x");
         messages.clear();

@@ -2,7 +2,7 @@
 
 use anyhow::{Result, anyhow};
 use autopoiesis::server;
-use autopoiesis::{agent, auth, config, llm, session, store, turn};
+use autopoiesis::{agent, auth, cli, config, llm, session, store, turn};
 use clap::{Parser, Subcommand};
 use reqwest::Client;
 
@@ -125,8 +125,8 @@ async fn main() -> Result<()> {
                 }
             };
 
-            let mut token_sink = agent::CliTokenSink::new();
-            let mut approval_handler = agent::CliApprovalHandler::new();
+            let mut token_sink = cli::CliTokenSink::new();
+            let mut approval_handler = cli::CliApprovalHandler::new();
 
             if cli.prompt.is_empty() {
                 let stdin = io::stdin();
@@ -160,7 +160,7 @@ async fn main() -> Result<()> {
                         )
                         .await?
                     {
-                        eprintln!("{}", agent::format_denial_message(&reason, &gate_id));
+                        eprintln!("{}", cli::format_denial_message(&reason, &gate_id));
                     }
                 }
             } else {
@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
                 )
                 .await?
                 {
-                    eprintln!("{}", agent::format_denial_message(&reason, &gate_id));
+                    eprintln!("{}", cli::format_denial_message(&reason, &gate_id));
                 }
             }
         }

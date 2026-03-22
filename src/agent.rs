@@ -1,20 +1,14 @@
 //! Agent orchestration loop coordinating model turns and tool execution.
 
-use std::fs;
-use std::io::{self, Write};
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use serde_json::{Value, from_str};
 
-use crate::guard::{Severity, Verdict};
+use crate::gate::{Severity, Verdict};
 use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall};
 use crate::session::Session;
 use crate::store::{QueuedMessage, Store};
 use crate::turn::Turn;
 use crate::util::utc_timestamp;
-
-const DEFAULT_OUTPUT_CAP_BYTES: usize = 4096;
 const MAX_DENIALS_PER_TURN: usize = 2;
 
 /// Receiver of streaming tokens emitted by the model during completion.
@@ -43,75 +37,6 @@ where
 {
     fn request_approval(&mut self, severity: &Severity, reason: &str, command: &str) -> bool {
         self(severity, reason, command)
-    }
-}
-
-/// CLI token sink implementation.
-pub struct CliTokenSink;
-
-impl CliTokenSink {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for CliTokenSink {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TokenSink for CliTokenSink {
-    fn on_token(&mut self, token: String) {
-        print!("{token}");
-        if let Err(err) = io::stdout().flush() {
-            eprintln!("failed to flush stdout: {err}");
-        }
-    }
-
-    fn on_complete(&mut self) {
-        println!();
-    }
-}
-
-/// CLI approval handler implementation.
-pub struct CliApprovalHandler;
-
-impl CliApprovalHandler {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for CliApprovalHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ApprovalHandler for CliApprovalHandler {
-    fn request_approval(&mut self, severity: &Severity, reason: &str, command: &str) -> bool {
-        let prefix = match severity {
-            Severity::Low => "⚠️",
-            Severity::Medium => "🟡",
-            Severity::High => "🔴",
-        };
-
-        eprintln!("\n{prefix} {reason}");
-        eprintln!("  Command: {command}");
-        eprint!("  Approve? [y/n]: ");
-        if io::stdout().flush().is_err() {
-            return false;
-        }
-
-        let mut input = String::new();
-        match io::stdin().read_line(&mut input) {
-            Ok(_) => input.trim().eq_ignore_ascii_case("y"),
-            Err(error) => {
-                eprintln!("failed to read approval input: {error}");
-                false
-            }
-        }
     }
 }
 
@@ -168,346 +93,6 @@ fn make_denial_verdict(denial_count: &mut usize, gate_id: String, reason: String
 
 pub fn format_denial_message(reason: &str, gate_id: &str) -> String {
     format!("Command hard-denied by {gate_id}: {reason}")
-}
-
-fn guard_text_output(turn: &Turn, text: String) -> String {
-    let mut text = text;
-    match turn.check_text_delta(&mut text) {
-        Verdict::Deny { .. } => String::new(),
-        Verdict::Allow | Verdict::Modify | Verdict::Approve { .. } => text,
-    }
-}
-
-fn guard_message_output(turn: &Turn, message: &mut ChatMessage) {
-    for block in &mut message.content {
-        if let MessageContent::Text { text } = block {
-            *text = guard_text_output(turn, std::mem::take(text));
-        }
-    }
-    message
-        .content
-        .retain(|block| !matches!(block, MessageContent::Text { text } if text.is_empty()));
-}
-
-#[derive(Clone, Copy)]
-enum StreamingSecretPrefix {
-    SkProject,
-    GithubPat,
-    AwsKey,
-}
-
-const STREAMING_SECRET_PREFIXES: [(&str, StreamingSecretPrefix); 3] = [
-    ("sk-", StreamingSecretPrefix::SkProject),
-    ("ghp_", StreamingSecretPrefix::GithubPat),
-    ("AKIA", StreamingSecretPrefix::AwsKey),
-];
-
-fn is_sk_secret_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
-}
-
-fn is_github_pat_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-}
-
-fn is_aws_key_byte(byte: u8) -> bool {
-    byte.is_ascii_uppercase() || byte.is_ascii_digit()
-}
-
-fn streaming_secret_holdback() -> usize {
-    STREAMING_SECRET_PREFIXES
-        .iter()
-        .map(|(prefix, _)| prefix.len())
-        .max()
-        .unwrap_or(0)
-        .saturating_sub(1)
-}
-
-fn find_earliest_secret_prefix(text: &str) -> Option<(usize, StreamingSecretPrefix)> {
-    STREAMING_SECRET_PREFIXES
-        .into_iter()
-        .filter_map(|(needle, prefix)| text.find(needle).map(|index| (index, prefix)))
-        .min_by_key(|(index, _)| *index)
-}
-
-enum StreamingSecretDecision {
-    NeedMore,
-    EmitLiteral {
-        consumed_bytes: usize,
-    },
-    EmitRedacted {
-        consumed_bytes: usize,
-        continue_redacting: bool,
-    },
-}
-
-fn analyze_sk_secret_candidate(rest: &str, final_flush: bool) -> StreamingSecretDecision {
-    let bytes = rest.as_bytes();
-    let mut allowed_len = 0usize;
-
-    while allowed_len < bytes.len() && is_sk_secret_byte(bytes[allowed_len]) {
-        allowed_len += 1;
-    }
-
-    if allowed_len < 20 {
-        if allowed_len == bytes.len() {
-            if final_flush {
-                StreamingSecretDecision::EmitRedacted {
-                    consumed_bytes: 3 + allowed_len,
-                    continue_redacting: false,
-                }
-            } else {
-                StreamingSecretDecision::NeedMore
-            }
-        } else {
-            StreamingSecretDecision::EmitLiteral {
-                consumed_bytes: 3 + allowed_len,
-            }
-        }
-    } else if allowed_len == bytes.len() {
-        if final_flush {
-            StreamingSecretDecision::EmitRedacted {
-                consumed_bytes: 3 + allowed_len,
-                continue_redacting: false,
-            }
-        } else {
-            StreamingSecretDecision::EmitRedacted {
-                consumed_bytes: 3 + allowed_len,
-                continue_redacting: true,
-            }
-        }
-    } else {
-        StreamingSecretDecision::EmitRedacted {
-            consumed_bytes: 3 + allowed_len,
-            continue_redacting: false,
-        }
-    }
-}
-
-fn analyze_fixed_length_secret_candidate(
-    rest: &str,
-    prefix_len: usize,
-    required_len: usize,
-    allowed: fn(u8) -> bool,
-    final_flush: bool,
-) -> StreamingSecretDecision {
-    let bytes = rest.as_bytes();
-    let mut allowed_len = 0usize;
-
-    while allowed_len < bytes.len() && allowed(bytes[allowed_len]) && allowed_len < required_len {
-        allowed_len += 1;
-    }
-
-    if allowed_len < required_len {
-        if allowed_len == bytes.len() {
-            if final_flush {
-                StreamingSecretDecision::EmitLiteral {
-                    consumed_bytes: prefix_len + allowed_len,
-                }
-            } else {
-                StreamingSecretDecision::NeedMore
-            }
-        } else {
-            StreamingSecretDecision::EmitLiteral {
-                consumed_bytes: prefix_len + allowed_len,
-            }
-        }
-    } else {
-        StreamingSecretDecision::EmitRedacted {
-            consumed_bytes: prefix_len + required_len,
-            continue_redacting: false,
-        }
-    }
-}
-
-fn take_prefix(buffer: &mut String, byte_len: usize) -> String {
-    buffer.drain(..byte_len).collect()
-}
-
-struct StreamingTextBuffer {
-    pending: String,
-    in_sk_secret: bool,
-}
-
-impl StreamingTextBuffer {
-    fn new() -> Self {
-        Self {
-            pending: String::new(),
-            in_sk_secret: false,
-        }
-    }
-
-    fn emit_segment<TS: TokenSink + ?Sized>(turn: &Turn, token_sink: &mut TS, segment: String) {
-        let redacted_output = guard_text_output(turn, segment);
-        if !redacted_output.is_empty() {
-            token_sink.on_token(redacted_output);
-        }
-    }
-
-    fn flush<TS: TokenSink + ?Sized>(
-        &mut self,
-        turn: &Turn,
-        token_sink: &mut TS,
-        final_flush: bool,
-    ) {
-        loop {
-            if self.pending.is_empty() {
-                if final_flush {
-                    self.in_sk_secret = false;
-                }
-                break;
-            }
-
-            if self.in_sk_secret {
-                let bytes = self.pending.as_bytes();
-                let mut allowed_len = 0usize;
-                while allowed_len < bytes.len() && is_sk_secret_byte(bytes[allowed_len]) {
-                    allowed_len += 1;
-                }
-
-                if allowed_len > 0 {
-                    self.pending.drain(..allowed_len);
-                }
-
-                if self.pending.is_empty() {
-                    if final_flush {
-                        self.in_sk_secret = false;
-                    }
-                    break;
-                }
-
-                self.in_sk_secret = false;
-                continue;
-            }
-
-            if let Some((prefix_index, prefix_kind)) = find_earliest_secret_prefix(&self.pending) {
-                if prefix_index > 0 {
-                    let safe_prefix = take_prefix(&mut self.pending, prefix_index);
-                    Self::emit_segment(turn, token_sink, safe_prefix);
-                    continue;
-                }
-
-                let rest = match prefix_kind {
-                    StreamingSecretPrefix::SkProject => {
-                        analyze_sk_secret_candidate(&self.pending[3..], final_flush)
-                    }
-                    StreamingSecretPrefix::GithubPat => analyze_fixed_length_secret_candidate(
-                        &self.pending[4..],
-                        4,
-                        36,
-                        is_github_pat_byte,
-                        final_flush,
-                    ),
-                    StreamingSecretPrefix::AwsKey => analyze_fixed_length_secret_candidate(
-                        &self.pending[4..],
-                        4,
-                        16,
-                        is_aws_key_byte,
-                        final_flush,
-                    ),
-                };
-
-                match rest {
-                    StreamingSecretDecision::NeedMore => break,
-                    StreamingSecretDecision::EmitLiteral { consumed_bytes } => {
-                        let segment = take_prefix(&mut self.pending, consumed_bytes);
-                        Self::emit_segment(turn, token_sink, segment);
-                    }
-                    StreamingSecretDecision::EmitRedacted {
-                        consumed_bytes,
-                        continue_redacting,
-                    } => {
-                        let _ = take_prefix(&mut self.pending, consumed_bytes);
-                        Self::emit_segment(turn, token_sink, "[REDACTED]".to_string());
-                        self.in_sk_secret = continue_redacting;
-                    }
-                }
-
-                continue;
-            }
-
-            let char_count = self.pending.chars().count();
-            let holdback = streaming_secret_holdback();
-            if final_flush {
-                let segment = std::mem::take(&mut self.pending);
-                Self::emit_segment(turn, token_sink, segment);
-                break;
-            }
-
-            // Keep a short tail buffered so a secret prefix split across tokens
-            // stays visible in the next flush instead of leaking as literal text.
-            if char_count <= holdback {
-                break;
-            }
-
-            let emit_char_count = char_count - holdback;
-            let split_byte = self
-                .pending
-                .char_indices()
-                .nth(emit_char_count)
-                .map(|(index, _)| index)
-                .unwrap_or(self.pending.len());
-            let segment = take_prefix(&mut self.pending, split_byte);
-            Self::emit_segment(turn, token_sink, segment);
-        }
-    }
-
-    fn push<TS: TokenSink + ?Sized>(&mut self, turn: &Turn, token_sink: &mut TS, token: String) {
-        self.pending.push_str(&token);
-        self.flush(turn, token_sink, false);
-    }
-
-    fn finish<TS: TokenSink + ?Sized>(&mut self, turn: &Turn, token_sink: &mut TS) {
-        self.flush(turn, token_sink, true);
-    }
-}
-
-fn safe_call_id_for_filename(call_id: &str) -> String {
-    use std::fmt::Write as _;
-
-    let mut safe = String::from("call_");
-    for byte in call_id.as_bytes() {
-        match byte {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => safe.push(*byte as char),
-            _ => write!(&mut safe, "_{:02X}", byte).expect("writing to String cannot fail"),
-        }
-    }
-
-    if safe == "call_" {
-        safe.push_str("empty");
-    }
-
-    safe
-}
-
-fn cap_tool_output(
-    sessions_dir: &Path,
-    call_id: &str,
-    output: String,
-    threshold: usize,
-) -> Result<String> {
-    let results_dir = sessions_dir.join("results");
-    fs::create_dir_all(&results_dir).with_context(|| {
-        format!(
-            "failed to create results directory {}",
-            results_dir.display()
-        )
-    })?;
-
-    let result_path = results_dir.join(format!("{}.txt", safe_call_id_for_filename(call_id)));
-    fs::write(&result_path, &output)
-        .with_context(|| format!("failed to write tool output to {}", result_path.display()))?;
-
-    if output.len() <= threshold {
-        return Ok(output);
-    }
-
-    let line_count = output.lines().count();
-    let size_kb = output.len().div_ceil(1024);
-    let path_display = result_path.display();
-    Ok(format!(
-        "[output exceeded inline limit ({line_count} lines, {size_kb} KB) -> {path_display}]\nTo read: cat {path_display}\nTo read specific lines: sed -n '10,20p' {path_display}"
-    ))
 }
 
 /// Run the agent loop until the model emits a non-tool stop reason.
@@ -595,14 +180,19 @@ where
         }
 
         let provider = make_provider().await?;
-        let mut streaming_output = StreamingTextBuffer::new();
-        let mut turn_reply = provider
-            .stream_completion(&messages, &tools, &mut |token| {
-                streaming_output.push(turn, token_sink, token);
-            })
-            .await?;
-        streaming_output.finish(turn, token_sink);
-        guard_message_output(turn, &mut turn_reply.assistant_message);
+        let mut streaming_output = crate::gate::StreamingTextBuffer::new();
+        let mut redact_text = |segment: String| crate::gate::guard_text_output(turn, segment);
+        let mut emit_token = |token: String| token_sink.on_token(token);
+        let mut turn_reply = {
+            let mut on_token = |token: String| {
+                streaming_output.push(&mut redact_text, &mut emit_token, token);
+            };
+            provider
+                .stream_completion(&messages, &tools, &mut on_token)
+                .await?
+        };
+        streaming_output.finish(&mut redact_text, &mut emit_token);
+        crate::gate::guard_message_output(turn, &mut turn_reply.assistant_message);
         let turn_meta = turn_reply.meta;
 
         match turn_reply.stop_reason {
@@ -681,12 +271,12 @@ where
                         Ok(output) => output,
                         Err(err) => format!(r#"{{"error": "{err}"}}"#),
                     };
-                    let result = guard_text_output(turn, result);
-                    let result = cap_tool_output(
+                    let result = crate::gate::guard_text_output(turn, result);
+                    let result = crate::gate::cap_tool_output(
                         session.sessions_dir(),
                         &call.id,
                         result,
-                        DEFAULT_OUTPUT_CAP_BYTES,
+                        crate::gate::DEFAULT_OUTPUT_CAP_BYTES,
                     )?;
 
                     session.append(ChatMessage::tool_result(&call.id, &call.name, result), None)?;
@@ -820,7 +410,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::context::History;
-    use crate::guard::SecretRedactor;
+    use crate::gate::{Guard, GuardEvent, SecretRedactor};
     use crate::llm::{FunctionTool, StreamedTurn};
     use crate::store::Store;
     use crate::tool::{Shell, Tool, ToolFuture};
@@ -861,95 +451,6 @@ mod tests {
                 meta: None,
                 stop_reason: StopReason::Stop,
             })
-        }
-    }
-
-    #[derive(Clone)]
-    struct StreamingProvider {
-        streamed_tokens: Vec<String>,
-        turn: StreamedTurn,
-    }
-
-    impl crate::llm::LlmProvider for StreamingProvider {
-        async fn stream_completion(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: &[FunctionTool],
-            on_token: &mut (dyn FnMut(String) + Send),
-        ) -> Result<StreamedTurn> {
-            for token in &self.streamed_tokens {
-                on_token(token.clone());
-            }
-            Ok(self.turn.clone())
-        }
-    }
-
-    #[derive(Clone)]
-    struct RecordingStreamingProvider {
-        streamed_tokens: Vec<String>,
-        turn: StreamedTurn,
-        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    impl crate::llm::LlmProvider for RecordingStreamingProvider {
-        async fn stream_completion(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: &[FunctionTool],
-            on_token: &mut (dyn FnMut(String) + Send),
-        ) -> Result<StreamedTurn> {
-            for token in &self.streamed_tokens {
-                self.events
-                    .lock()
-                    .expect("event log mutex poisoned")
-                    .push(format!("provider-before:{token}"));
-                on_token(token.clone());
-                self.events
-                    .lock()
-                    .expect("event log mutex poisoned")
-                    .push(format!("provider-after:{token}"));
-            }
-            Ok(self.turn.clone())
-        }
-    }
-
-    struct CompletionRecordingSink {
-        tokens: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-        completes: std::sync::Arc<std::sync::Mutex<usize>>,
-    }
-
-    impl CompletionRecordingSink {
-        fn new() -> (
-            Self,
-            std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-            std::sync::Arc<std::sync::Mutex<usize>>,
-        ) {
-            let tokens = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let completes = std::sync::Arc::new(std::sync::Mutex::new(0usize));
-            (
-                Self {
-                    tokens: tokens.clone(),
-                    completes: completes.clone(),
-                },
-                tokens,
-                completes,
-            )
-        }
-    }
-
-    impl TokenSink for CompletionRecordingSink {
-        fn on_token(&mut self, token: String) {
-            self.tokens
-                .lock()
-                .expect("completion sink token mutex poisoned")
-                .push(token);
-        }
-
-        fn on_complete(&mut self) {
-            *self
-                .completes
-                .lock()
-                .expect("completion sink completion mutex poisoned") += 1;
         }
     }
 
@@ -1015,14 +516,14 @@ mod tests {
 
     struct InboundDenyGuard;
 
-    impl crate::guard::Guard for InboundDenyGuard {
+    impl Guard for InboundDenyGuard {
         fn name(&self) -> &str {
             "inbound-deny"
         }
 
-        fn check(&self, event: &mut crate::guard::GuardEvent) -> Verdict {
+        fn check(&self, event: &mut GuardEvent) -> Verdict {
             match event {
-                crate::guard::GuardEvent::Inbound(_) => Verdict::Deny {
+                GuardEvent::Inbound(_) => Verdict::Deny {
                     reason: "blocked by test".to_string(),
                     gate_id: "inbound-deny".to_string(),
                 },
@@ -1055,34 +556,6 @@ mod tests {
         }
     }
 
-    struct StaticOutputTool {
-        name: &'static str,
-        output: String,
-    }
-
-    impl Tool for StaticOutputTool {
-        fn name(&self) -> &str {
-            self.name
-        }
-
-        fn definition(&self) -> FunctionTool {
-            FunctionTool {
-                name: self.name.to_string(),
-                description: "Return static output".to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false,
-                }),
-            }
-        }
-
-        fn execute(&self, _arguments: &str) -> ToolFuture<'_> {
-            let output = self.output.clone();
-            Box::pin(async move { Ok(output) })
-        }
-    }
-
     fn temp_sessions_dir(prefix: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "aprs_agent_test_{prefix}_{}",
@@ -1110,13 +583,6 @@ mod tests {
     fn message_text(message: &ChatMessage) -> Option<&str> {
         message.content.iter().find_map(|block| match block {
             MessageContent::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-    }
-
-    fn tool_result_text(message: &ChatMessage) -> Option<&str> {
-        message.content.iter().find_map(|block| match block {
-            MessageContent::ToolResult { result } => Some(result.content.as_str()),
             _ => None,
         })
     }
@@ -1469,288 +935,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbound_redaction_is_streamed_and_persisted_before_session_write() {
-        let dir = temp_sessions_dir("outbound_redaction");
-        let provider = StreamingProvider {
-            streamed_tokens: vec!["sk-proj-abcdefghijklmnopqrstuvwxyz012345".to_string()],
-            turn: StreamedTurn {
-                assistant_message: ChatMessage {
-                    role: crate::llm::ChatRole::Assistant,
-                    content: vec![MessageContent::text(
-                        "sk-proj-abcdefghijklmnopqrstuvwxyz012345",
-                    )],
-                },
-                tool_calls: vec![],
-                meta: None,
-                stop_reason: StopReason::Stop,
-            },
-        };
-        let mut session = crate::session::Session::new(&dir).unwrap();
-        let turn = Turn::new().guard(SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"]));
-        let mut make_provider = move || {
-            let provider = provider.clone();
-            async move { Ok::<_, anyhow::Error>(provider) }
-        };
-        let streamed = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let streamed_tokens = streamed.clone();
-        let mut token_sink = move |token: String| {
-            streamed_tokens
-                .lock()
-                .expect("streamed token mutex poisoned")
-                .push_str(&token);
-        };
-        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
-
-        run_agent_loop(
-            &mut make_provider,
-            &mut session,
-            "reply with the secret".to_string(),
-            &turn,
-            &mut token_sink,
-            &mut approval_handler,
-        )
-        .await
-        .unwrap();
-
-        let streamed = streamed.lock().expect("streamed token mutex poisoned");
-        assert_eq!(streamed.as_str(), "[REDACTED]");
-        let session_file = std::fs::read_to_string(session.today_path()).unwrap();
-        assert!(!session_file.contains("sk-proj-abcdefghijklmnopqrstuvwxyz012345"));
-        assert!(session_file.contains("[REDACTED]"));
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn outbound_text_is_streamed_incrementally_to_sink() {
-        let dir = temp_sessions_dir("outbound_incremental_stream");
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = RecordingStreamingProvider {
-            streamed_tokens: vec!["hello ".to_string(), "world".to_string()],
-            turn: StreamedTurn {
-                assistant_message: ChatMessage {
-                    role: crate::llm::ChatRole::Assistant,
-                    content: vec![MessageContent::text("hello world")],
-                },
-                tool_calls: vec![],
-                meta: None,
-                stop_reason: StopReason::Stop,
-            },
-            events: events.clone(),
-        };
-        let mut session = crate::session::Session::new(&dir).unwrap();
-        let turn = Turn::new();
-        let mut make_provider = move || {
-            let provider = provider.clone();
-            async move { Ok::<_, anyhow::Error>(provider) }
-        };
-        let events_for_sink = events.clone();
-        let mut token_sink = move |token: String| {
-            events_for_sink
-                .lock()
-                .expect("event log mutex poisoned")
-                .push(format!("sink:{token}"));
-        };
-        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
-
-        run_agent_loop(
-            &mut make_provider,
-            &mut session,
-            "stream a response".to_string(),
-            &turn,
-            &mut token_sink,
-            &mut approval_handler,
-        )
-        .await
-        .unwrap();
-
-        let recorded = events.lock().expect("event log mutex poisoned").clone();
-        let first_sink = recorded
-            .iter()
-            .position(|event| event.starts_with("sink:"))
-            .expect("expected streamed output");
-        let completion_marker = recorded
-            .iter()
-            .position(|event| event == "provider-after:world")
-            .expect("expected second provider token");
-        assert!(
-            first_sink < completion_marker,
-            "expected sink output before completion"
-        );
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn on_complete_is_only_emitted_after_final_stop() {
-        let dir = temp_sessions_dir("on_complete_count");
-        let provider = SequenceProvider::new(vec![
-            StreamedTurn {
-                assistant_message: ChatMessage {
-                    role: crate::llm::ChatRole::Assistant,
-                    content: vec![MessageContent::text("thinking")],
-                },
-                tool_calls: vec![],
-                meta: None,
-                stop_reason: StopReason::ToolCalls,
-            },
-            StreamedTurn {
-                assistant_message: ChatMessage {
-                    role: crate::llm::ChatRole::Assistant,
-                    content: vec![MessageContent::text("done")],
-                },
-                tool_calls: vec![],
-                meta: None,
-                stop_reason: StopReason::Stop,
-            },
-        ]);
-        let mut session = crate::session::Session::new(&dir).unwrap();
-        let turn = Turn::new();
-        let mut make_provider = move || {
-            let provider = provider.clone();
-            async move { Ok::<_, anyhow::Error>(provider) }
-        };
-        let (mut token_sink, _tokens, completes) = CompletionRecordingSink::new();
-        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
-
-        run_agent_loop(
-            &mut make_provider,
-            &mut session,
-            "finish the turn".to_string(),
-            &turn,
-            &mut token_sink,
-            &mut approval_handler,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            *completes.lock().expect("completion count mutex poisoned"),
-            1
-        );
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn outbound_secret_split_across_tokens_is_redacted_before_sink() {
-        let dir = temp_sessions_dir("outbound_split_secret");
-        let provider = StreamingProvider {
-            streamed_tokens: vec![
-                "hello sk-proj-abc".to_string(),
-                "defghijklmnopqrstuvwxyz012345 world".to_string(),
-            ],
-            turn: StreamedTurn {
-                assistant_message: ChatMessage {
-                    role: crate::llm::ChatRole::Assistant,
-                    content: vec![MessageContent::text(
-                        "hello sk-proj-abcdefghijklmnopqrstuvwxyz012345 world",
-                    )],
-                },
-                tool_calls: vec![],
-                meta: None,
-                stop_reason: StopReason::Stop,
-            },
-        };
-        let mut session = crate::session::Session::new(&dir).unwrap();
-        let turn = Turn::new().guard(SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"]));
-        let mut make_provider = move || {
-            let provider = provider.clone();
-            async move { Ok::<_, anyhow::Error>(provider) }
-        };
-        let streamed = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let streamed_tokens = streamed.clone();
-        let mut token_sink = move |token: String| {
-            streamed_tokens
-                .lock()
-                .expect("streamed token mutex poisoned")
-                .push_str(&token);
-        };
-        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
-
-        run_agent_loop(
-            &mut make_provider,
-            &mut session,
-            "reply with a split secret".to_string(),
-            &turn,
-            &mut token_sink,
-            &mut approval_handler,
-        )
-        .await
-        .unwrap();
-
-        let streamed = streamed.lock().expect("streamed token mutex poisoned");
-        assert_eq!(streamed.as_str(), "hello [REDACTED] world");
-        assert!(
-            !streamed
-                .as_str()
-                .contains("sk-proj-abcdefghijklmnopqrstuvwxyz012345")
-        );
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn outbound_fixed_length_secret_prefixes_are_redacted_before_sink() {
-        let dir = temp_sessions_dir("outbound_fixed_length_secrets");
-        let provider = StreamingProvider {
-            streamed_tokens: vec![
-                "lead gh".to_string(),
-                "p_0123456789abcdefghijklmnopqrstuvwxyz mid AKIA123456".to_string(),
-                "7890ABCDEF tail".to_string(),
-            ],
-            turn: StreamedTurn {
-                assistant_message: ChatMessage {
-                    role: crate::llm::ChatRole::Assistant,
-                    content: vec![MessageContent::text(
-                        "lead ghp_0123456789abcdefghijklmnopqrstuvwxyz mid AKIA1234567890ABCDEF tail",
-                    )],
-                },
-                tool_calls: vec![],
-                meta: None,
-                stop_reason: StopReason::Stop,
-            },
-        };
-        let mut session = crate::session::Session::new(&dir).unwrap();
-        let turn = Turn::new().guard(SecretRedactor::new(&[
-            r"sk-[a-zA-Z0-9_-]{20,}",
-            r"ghp_[a-zA-Z0-9]{36}",
-            r"AKIA[0-9A-Z]{16}",
-        ]));
-        let mut make_provider = move || {
-            let provider = provider.clone();
-            async move { Ok::<_, anyhow::Error>(provider) }
-        };
-        let streamed = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let streamed_tokens = streamed.clone();
-        let mut token_sink = move |token: String| {
-            streamed_tokens
-                .lock()
-                .expect("streamed token mutex poisoned")
-                .push_str(&token);
-        };
-        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
-
-        run_agent_loop(
-            &mut make_provider,
-            &mut session,
-            "redact fixed-length secrets".to_string(),
-            &turn,
-            &mut token_sink,
-            &mut approval_handler,
-        )
-        .await
-        .unwrap();
-
-        let streamed = streamed.lock().expect("streamed token mutex poisoned");
-        assert_eq!(streamed.as_str(), "lead [REDACTED] mid [REDACTED] tail");
-        assert!(!streamed.as_str().contains("ghp_"));
-        assert!(!streamed.as_str().contains("AKIA"));
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[tokio::test]
     async fn tool_output_is_redacted_before_persist() {
         let dir = temp_sessions_dir("tool_redaction");
         let provider = SequenceProvider::new(vec![
@@ -1808,212 +992,6 @@ mod tests {
         let session_file = std::fs::read_to_string(session.today_path()).unwrap();
         assert!(!session_file.contains("sk-proj-abcdefghijklmnopqrstuvwxyz012345"));
         assert!(session_file.contains("[REDACTED]"));
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn tool_output_below_threshold_is_inline_and_saved_to_file() {
-        let dir = temp_sessions_dir("tool_output_inline");
-        let call_id = "call-inline";
-        let output = "stdout:\nsmall output\nstderr:\n\nexit_code=0".to_string();
-        let provider = SequenceProvider::new(vec![
-            StreamedTurn {
-                assistant_message: ChatMessage {
-                    role: crate::llm::ChatRole::Assistant,
-                    content: vec![MessageContent::ToolCall {
-                        call: ToolCall {
-                            id: call_id.to_string(),
-                            name: "static".to_string(),
-                            arguments: "{}".to_string(),
-                        },
-                    }],
-                },
-                tool_calls: vec![ToolCall {
-                    id: call_id.to_string(),
-                    name: "static".to_string(),
-                    arguments: "{}".to_string(),
-                }],
-                meta: None,
-                stop_reason: StopReason::ToolCalls,
-            },
-            StreamedTurn {
-                assistant_message: ChatMessage {
-                    role: crate::llm::ChatRole::Assistant,
-                    content: vec![MessageContent::text("done")],
-                },
-                tool_calls: vec![],
-                meta: None,
-                stop_reason: StopReason::Stop,
-            },
-        ]);
-        let mut session = crate::session::Session::new(&dir).unwrap();
-        let turn = Turn::new().tool(StaticOutputTool {
-            name: "static",
-            output: output.clone(),
-        });
-        let mut make_provider = move || {
-            let provider = provider.clone();
-            async move { Ok::<_, anyhow::Error>(provider) }
-        };
-        let mut token_sink = |_token: String| {};
-        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
-
-        run_agent_loop(
-            &mut make_provider,
-            &mut session,
-            "use the tool".to_string(),
-            &turn,
-            &mut token_sink,
-            &mut approval_handler,
-        )
-        .await
-        .unwrap();
-
-        let tool_message = session
-            .history()
-            .iter()
-            .find(|message| matches!(message.role, crate::llm::ChatRole::Tool))
-            .expect("tool result should be persisted");
-        assert_eq!(tool_result_text(tool_message), Some(output.as_str()));
-
-        let result_path = dir
-            .join("results")
-            .join(format!("{}.txt", safe_call_id_for_filename(call_id)));
-        assert!(result_path.exists(), "result file should be created");
-        assert_eq!(std::fs::read_to_string(result_path).unwrap(), output);
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn cap_tool_output_sanitizes_call_id_before_path_use() {
-        let dir = temp_sessions_dir("cap_tool_output_sanitized");
-        let call_id = "../../escape;rm -rf /";
-        let output = "line\n".repeat(2048);
-        let sanitized = safe_call_id_for_filename(call_id);
-
-        let capped =
-            cap_tool_output(&dir, call_id, output.clone(), DEFAULT_OUTPUT_CAP_BYTES).unwrap();
-
-        let result_path = dir.join("results").join(format!("{sanitized}.txt"));
-        let result_path_str = result_path.display().to_string();
-        assert!(
-            result_path.exists(),
-            "sanitized result file should be created"
-        );
-        assert_eq!(std::fs::read_to_string(&result_path).unwrap(), output);
-        assert!(capped.contains(&result_path_str));
-        assert!(!capped.contains(call_id));
-        assert!(
-            sanitized
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-        );
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn cap_tool_output_creates_results_directory() {
-        let dir = temp_sessions_dir("cap_tool_output_dir");
-        let output = "stdout:\nhello\nstderr:\n\nexit_code=0".to_string();
-
-        let capped =
-            cap_tool_output(&dir, "call-dir", output.clone(), DEFAULT_OUTPUT_CAP_BYTES).unwrap();
-
-        assert_eq!(capped, output);
-        let result_path = dir
-            .join("results")
-            .join(format!("{}.txt", safe_call_id_for_filename("call-dir")));
-        assert!(result_path.exists(), "result file should be created");
-        assert_eq!(std::fs::read_to_string(result_path).unwrap(), output);
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn tool_output_above_threshold_is_capped_with_metadata_pointer() {
-        let dir = temp_sessions_dir("tool_output_capped");
-        let call_id = "call-capped";
-        let output = "line\n".repeat(2048);
-        let provider = SequenceProvider::new(vec![
-            StreamedTurn {
-                assistant_message: ChatMessage {
-                    role: crate::llm::ChatRole::Assistant,
-                    content: vec![MessageContent::ToolCall {
-                        call: ToolCall {
-                            id: call_id.to_string(),
-                            name: "static".to_string(),
-                            arguments: "{}".to_string(),
-                        },
-                    }],
-                },
-                tool_calls: vec![ToolCall {
-                    id: call_id.to_string(),
-                    name: "static".to_string(),
-                    arguments: "{}".to_string(),
-                }],
-                meta: None,
-                stop_reason: StopReason::ToolCalls,
-            },
-            StreamedTurn {
-                assistant_message: ChatMessage {
-                    role: crate::llm::ChatRole::Assistant,
-                    content: vec![MessageContent::text("done")],
-                },
-                tool_calls: vec![],
-                meta: None,
-                stop_reason: StopReason::Stop,
-            },
-        ]);
-        let mut session = crate::session::Session::new(&dir).unwrap();
-        let turn = Turn::new().tool(StaticOutputTool {
-            name: "static",
-            output: output.clone(),
-        });
-        let mut make_provider = move || {
-            let provider = provider.clone();
-            async move { Ok::<_, anyhow::Error>(provider) }
-        };
-        let mut token_sink = |_token: String| {};
-        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
-
-        run_agent_loop(
-            &mut make_provider,
-            &mut session,
-            "use the tool".to_string(),
-            &turn,
-            &mut token_sink,
-            &mut approval_handler,
-        )
-        .await
-        .unwrap();
-
-        let tool_message = session
-            .history()
-            .iter()
-            .find(|message| matches!(message.role, crate::llm::ChatRole::Tool))
-            .expect("tool result should be persisted");
-        let tool_result = tool_result_text(tool_message).expect("tool result text should exist");
-        assert!(!tool_result.contains(&output));
-        let expected_path = dir
-            .join("results")
-            .join(format!("{}.txt", safe_call_id_for_filename(call_id)));
-        let expected_path_str = expected_path.display().to_string();
-        assert!(tool_result.contains(&format!(
-            "[output exceeded inline limit (2048 lines, 10 KB) -> {expected_path_str}]"
-        )));
-        assert!(tool_result.contains(&format!("To read: cat {expected_path_str}")));
-        assert!(tool_result.contains(&format!(
-            "To read specific lines: sed -n '10,20p' {expected_path_str}"
-        )));
-
-        let result_path = dir
-            .join("results")
-            .join(format!("{}.txt", safe_call_id_for_filename(call_id)));
-        assert!(result_path.exists(), "result file should be created");
-        assert_eq!(std::fs::read_to_string(result_path).unwrap(), output);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
