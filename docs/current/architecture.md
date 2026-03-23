@@ -5,7 +5,7 @@
 
 ## Overview
 
-27 source files, ~13.4K lines, 208 tests (201+5+2 run, 1 ignored). One binary: CLI (REPL or one-shot) + HTTP/WS server. One tool: shell. CLI also exposes `sub add/remove/list` for subscription management. Run `cargo test` for current count.
+27 source files, ~13.4K lines, 209 tests (208 run, 1 ignored). One binary: CLI (REPL or one-shot) + HTTP/WS server. One tool: shell. CLI also exposes `sub add/remove/list` for subscription management. Run `cargo test` for current count.
 
 ## Module map
 
@@ -75,7 +75,7 @@ BudgetGuard is only wired when `[budget]` config exists.
 Verdict precedence: Deny > Approve > Allow. `resolve_verdict()` in turn.rs.
 Guards check inbound messages, tool calls, and outbound text.
 ShellSafety uses a configurable policy (`[shell]` in agents.toml) with allow/deny patterns, standing approvals (skipped when tainted), and a default action.
-`GuardContext` carries `tainted: bool` + `BudgetSnapshot`. Taint is set when any message in history has a non-operator principal.
+`GuardContext` carries `tainted: bool` + `BudgetSnapshot`. Taint is set when any message in history has a `User` or `System` principal (via `Principal::is_taint_source()`). Agent-authored messages do not taint.
 **Note:** these are heuristics, not a security boundary. See [risks.md](risks.md).
 
 ### Shell output cap

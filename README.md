@@ -39,10 +39,10 @@ cargo build --release
 ## Server API
 
 ```
+GET  /api/health                      Health check
+GET  /api/sessions                    List sessions
 POST /api/sessions                    Create session
 POST /api/sessions/:id/messages       Enqueue message
-GET  /api/sessions/:id/messages/next  Dequeue next pending message
-GET  /api/health                      Health check
 WS   /api/ws/:session_id              Streaming chat (send JSON, receive token stream)
 ```
 
@@ -68,23 +68,34 @@ Template variables (`{{model}}`, `{{cwd}}`, `{{tools}}`) are resolved at runtime
 ## Architecture
 
 ```
-main.rs          CLI entrypoint, REPL, server launch
-├─ agent.rs      Agent loop: turn orchestration, tool execution, approval flow
-├─ turn.rs       Context assembly + guard checks + tool dispatch
-├─ context.rs    ContextSource trait: Identity (prompt files) + History (token-budgeted replay)
-├─ tool.rs       Shell tool: async execution, RLIMIT caps, process-group timeout kill
-├─ guard.rs      Guard pipeline: SecretRedactor, ShellSafety, ExfilDetector
-├─ session.rs    JSONL persistence, token tracking, context trimming
-├─ store.rs      SQLite session registry + message queue
-├─ server.rs     axum HTTP + WebSocket, API key auth middleware
+main.rs            CLI entrypoint, REPL, server launch, sub add/remove/list
+├─ agent.rs        Agent loop: turn orchestration, tool execution, approval flow
+├─ turn.rs         Context assembly + guard checks + tool dispatch
+├─ context.rs      ContextSource trait: Identity (prompt files) + History (replay)
+├─ tool.rs         Shell tool: async execution, RLIMIT caps, process-group timeout kill
+├─ gate/
+│  ├─ mod.rs       Guard trait, Verdict/Severity, guard_text_output/guard_message_output
+│  ├─ shell_safety.rs     Policy-driven allow/deny, standing approvals, compound command detection
+│  ├─ secret_redactor.rs  Regex secret redaction in message content
+│  ├─ secret_patterns.rs  Shared pattern catalog + protected credential path detection
+│  ├─ streaming_redact.rs Byte-by-byte secret redaction during SSE streaming
+│  ├─ exfil_detector.rs   Cross-call read+send pattern detection
+│  ├─ budget.rs    Per-turn/session/day token ceiling enforcement
+│  └─ output_cap.rs       Shell output cap + file-backed result storage
+├─ subscription.rs File subscriptions: filters, content loading, token utilization
+├─ session.rs      JSONL persistence, token tracking, context trimming, budget snapshots
+├─ store.rs        SQLite session registry + message queue + subscriptions
+├─ server.rs       axum HTTP + WebSocket, Principal-based auth middleware
 ├─ llm/
-│  ├─ mod.rs     LlmProvider trait, message types, tool call structs
-│  └─ openai.rs  OpenAI Responses API, SSE streaming, token counting
-├─ auth.rs       OAuth device flow, token refresh
-├─ config.rs     agents.toml loading
-├─ identity.rs   System prompt from identity/*.md files
-├─ template.rs   {{var}} template rendering
-└─ util.rs       Timestamps, helpers
+│  ├─ mod.rs       LlmProvider trait, message types, tool call structs
+│  └─ openai.rs    OpenAI Responses API, SSE streaming, token counting
+├─ auth.rs         OAuth device flow, token refresh
+├─ config.rs       agents.toml loading, ShellPolicy, BudgetConfig
+├─ principal.rs    Principal enum, trust + taint source mapping
+├─ identity.rs     System prompt from identity/*.md files
+├─ cli.rs          CLI display helpers, denial formatting
+├─ template.rs     {{var}} template rendering
+└─ util.rs         Timestamps, helpers
 ```
 
 ## Tests

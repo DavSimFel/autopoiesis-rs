@@ -12,9 +12,9 @@
 | ~~1b~~ | ~~Standing approvals (`standing_approvals = [...]` under `[shell]` in agents.toml)~~ | ~~1a~~ | ~~PR #10~~ ✓ |
 | ~~1c~~ | ~~Taint tracking (Principal enum, GuardContext.tainted, standing approvals gated)~~ | ~~1b~~ | ~~PR #11~~ ✓ |
 | ~~1d~~ | ~~Budget enforcement (per-turn/session/day token ceilings via BudgetGuard)~~ | ~~1a~~ | ~~direct to main~~ ✓ |
-| 1e | P0 fixes round 2 (shell metachar bypass, auth.json exposure, taint over-fire) | 1a-1d | 1 PR |
+| ~~1e~~ | ~~P0 fixes round 2 (shell metachar bypass, auth.json exposure, taint over-fire)~~ | ~~1a-1d~~ | ~~direct to main~~ ✓ |
 
-**Note:** 1b-1d are implemented but have known bugs — see [risks.md](current/risks.md). 1e addresses the critical findings from the 2026-03-23 review.
+**Note:** Security stack complete. All P0s resolved. Remaining P1s tracked in [risks.md](current/risks.md).
 
 ### 2. Context management (after security)
 
@@ -40,7 +40,7 @@
 - Guard pipeline (SecretRedactor, ShellSafety, ExfilDetector)
 - Turn architecture (ContextSource + Tool + Guard trait composition)
 - Approval system with severity levels + REPL prompt flow
-- Session persistence (daily JSONL, tool_call round-trip — note: denied tool_calls lack matching tool_result, see risks.md P1-8)
+- Session persistence (daily JSONL, tool_call round-trip — P1-8 fixed: denied calls persist text-only)
 - Identity system v1 (constitution + identity + context, template vars)
 - Constitution v1 (4 laws, 1st person, research-backed)
 - OAuth device flow auth
@@ -62,7 +62,7 @@
 - **1b:** Standing approvals — `standing_approvals` list under `[shell]` in agents.toml (#10)
 - **1c:** Taint tracking — Principal propagation, GuardContext.tainted, standing approvals skipped when tainted (#11)
 - **1d:** Budget enforcement — BudgetGuard with per-turn/session/day ceilings, session-total accounting
-- Gate split refactor — agent.rs 2020→1434 lines, guard.rs → 7 gate/ submodules + cli.rs
+- Gate split refactor — guard.rs → 7 gate/ submodules + cli.rs
 - Per-session server locking (replaced global worker_lock)
 - **P0-4:** Shell metacharacter bypass — compound commands force approval
 - **P0-5:** Credential file exposure — protected paths always denied

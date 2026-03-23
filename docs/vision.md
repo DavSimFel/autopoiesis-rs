@@ -60,7 +60,7 @@
 
 **V1: Agent-to-agent = message.** T1 spawns T3 by posting a message to a new session. One agent can subscribe files for another session — that's delegation with context.
 
-**MVP: SQLite + JSONL are the backbone (built).** Message queue and session registry live in SQLite (`sessions/queue.sqlite`). Session history lives in JSONL (`sessions/{name}/*.jsonl`). Subscription records don't exist yet. **Note:** queue claiming is not atomic across processes — see [risks.md](current/risks.md#p1-2). Session append is not atomic (memory before disk) — see [risks.md](current/risks.md#p1-9).
+**MVP: SQLite + JSONL are the backbone (built).** Message queue and session registry live in SQLite (`sessions/queue.sqlite`). Session history lives in JSONL (`sessions/{name}/*.jsonl`). Subscription records live in the same SQLite database (`subscriptions` table with unique `(topic, path)` index). **Note:** queue claiming is not atomic across processes — see [risks.md](current/risks.md#p1-2). Session append is not atomic (memory before disk) — see [risks.md](current/risks.md#p1-9).
 
 ## Topics at scale
 
