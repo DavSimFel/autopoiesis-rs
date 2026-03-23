@@ -10,6 +10,7 @@ pub mod principal;
 pub mod server;
 pub mod session;
 pub mod store;
+pub mod subscription;
 pub mod template;
 pub mod tool;
 pub mod turn;
