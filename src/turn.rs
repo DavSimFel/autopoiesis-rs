@@ -74,7 +74,7 @@ impl Turn {
         self.assemble_context(messages);
         let tainted = messages
             .iter()
-            .any(|message| !message.principal.is_trusted());
+            .any(|message| message.principal.is_taint_source());
         self.tainted.store(tainted, Ordering::Relaxed);
         let mut context = context.unwrap_or_default();
         context.tainted = tainted;
@@ -291,12 +291,86 @@ mod tests {
     }
 
     #[test]
-    fn inbound_taint_is_set_from_non_operator_messages() {
+    fn inbound_taint_is_set_from_user_messages() {
         let turn = Turn::new();
         let mut messages = vec![ChatMessage::user_with_principal(
             "tainted",
             Some(crate::principal::Principal::User),
         )];
+
+        let _ = turn.check_inbound(&mut messages, None);
+        assert!(turn.is_tainted());
+    }
+
+    #[test]
+    fn inbound_taint_is_set_from_system_messages() {
+        let turn = Turn::new();
+        let mut messages = vec![ChatMessage::user_with_principal(
+            "system content",
+            Some(crate::principal::Principal::System),
+        )];
+
+        let _ = turn.check_inbound(&mut messages, None);
+        assert!(turn.is_tainted());
+    }
+
+    #[test]
+    fn agent_messages_do_not_taint_turn() {
+        let turn = Turn::new();
+        let mut messages = vec![
+            ChatMessage::user_with_principal(
+                "operator says hello",
+                Some(crate::principal::Principal::Operator),
+            ),
+            ChatMessage::with_role_with_principal(
+                crate::llm::ChatRole::Assistant,
+                Some(crate::principal::Principal::Agent),
+            ),
+            ChatMessage::user_with_principal(
+                "operator follows up",
+                Some(crate::principal::Principal::Operator),
+            ),
+        ];
+
+        let _ = turn.check_inbound(&mut messages, None);
+        assert!(!turn.is_tainted());
+    }
+
+    #[test]
+    fn operator_only_session_with_assistant_replies_is_not_tainted() {
+        let turn = Turn::new();
+        let mut messages = vec![
+            ChatMessage::user_with_principal("turn 1", Some(crate::principal::Principal::Operator)),
+            ChatMessage::with_role_with_principal(
+                crate::llm::ChatRole::Assistant,
+                Some(crate::principal::Principal::Agent),
+            ),
+            ChatMessage::user_with_principal("turn 2", Some(crate::principal::Principal::Operator)),
+            ChatMessage::with_role_with_principal(
+                crate::llm::ChatRole::Assistant,
+                Some(crate::principal::Principal::Agent),
+            ),
+            ChatMessage::user_with_principal("turn 3", Some(crate::principal::Principal::Operator)),
+        ];
+
+        let _ = turn.check_inbound(&mut messages, None);
+        assert!(!turn.is_tainted());
+    }
+
+    #[test]
+    fn user_message_in_history_still_taints_even_with_agent_messages() {
+        let turn = Turn::new();
+        let mut messages = vec![
+            ChatMessage::user_with_principal("user input", Some(crate::principal::Principal::User)),
+            ChatMessage::with_role_with_principal(
+                crate::llm::ChatRole::Assistant,
+                Some(crate::principal::Principal::Agent),
+            ),
+            ChatMessage::user_with_principal(
+                "operator follows up",
+                Some(crate::principal::Principal::Operator),
+            ),
+        ];
 
         let _ = turn.check_inbound(&mut messages, None);
         assert!(turn.is_tainted());

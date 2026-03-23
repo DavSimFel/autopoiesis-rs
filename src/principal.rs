@@ -17,6 +17,14 @@ impl Principal {
         matches!(self, Self::Operator)
     }
 
+    /// Whether this principal represents external (untrusted) input that should
+    /// taint a conversation. Only User and System are taint sources — Agent
+    /// messages (assistant replies, tool results) are internally generated and
+    /// should not disable standing approvals in operator-only sessions.
+    pub fn is_taint_source(&self) -> bool {
+        matches!(self, Self::User | Self::System)
+    }
+
     /// Map a queue source string to a principal.
     pub fn from_source(source: &str) -> Self {
         if source == "cli" {
@@ -72,5 +80,13 @@ mod tests {
         assert!(!Principal::User.is_trusted());
         assert!(!Principal::System.is_trusted());
         assert!(!Principal::Agent.is_trusted());
+    }
+
+    #[test]
+    fn taint_sources_are_user_and_system_only() {
+        assert!(!Principal::Operator.is_taint_source());
+        assert!(Principal::User.is_taint_source());
+        assert!(Principal::System.is_taint_source());
+        assert!(!Principal::Agent.is_taint_source());
     }
 }
