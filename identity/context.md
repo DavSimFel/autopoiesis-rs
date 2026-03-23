@@ -11,20 +11,23 @@ Legacy codebase: `/root/autopoiesis` (Python, still running in prod, no new deve
 
 ### autopoiesis-rs layout
 ```
-src/           — Rust source (~7.6K lines, 17 files)
+src/           — Rust source (~10.6K lines, 26 files)
+  gate/        — Guard pipeline (budget, secret redaction, shell safety, exfil detection, output cap)
+  llm/         — LLM provider trait + OpenAI Responses API
 identity/      — System prompt files (constitution, identity, context)
-agents.toml    — Model config (model name, reasoning effort)
+agents.toml    — Model config, shell policy, budget limits
 sessions/      — JSONL history + SQLite queue (gitignored)
 tests/         — Integration tests
+docs/          — Architecture, roadmap, risks, vision
 AGENTS.md      — Coding agent instructions
-VISION.md      — Architecture and roadmap
 ```
 
 ### Key source files
 - `agent.rs` — Agent loop, turn orchestration, token sink
-- `server.rs` — axum HTTP + WebSocket server
-- `session.rs` — JSONL persistence, trimming, token tracking
-- `guard.rs` — Secret redaction, shell safety, exfil detection
+- `server.rs` — axum HTTP + WebSocket server, per-session locking
+- `session.rs` — JSONL persistence, trimming, token tracking, budget snapshots
+- `gate/` — Guard pipeline: BudgetGuard, SecretRedactor, ShellSafety (standing approvals), ExfilDetector
+- `principal.rs` — Principal enum (Operator/User/System/Agent), trust mapping
 - `tool.rs` — Shell execution with RLIMIT sandbox
 - `llm/openai.rs` — OpenAI Responses API, SSE streaming
 

@@ -1,58 +1,81 @@
 # Current Risks and Broken Invariants
 
 > **Single source of truth for known hazards.** Both AGENTS.md and docs/vision.md link here.
-> Updated: 2026-03-22
+> Updated: 2026-03-23
+
+## P0 — Critical
+
+### P0-4: Shell allowlist bypass via metacharacters
+- Allow/deny/standing-approval matching is raw whole-command globbing. Patterns like `cat *`, `git *` match shell metacharacter chains. `cat foo; rm -rf /` matches `cat *`. Any "safe" prefix can smuggle arbitrary follow-on commands.
+- **Files:** `src/gate/shell_safety.rs` (pattern matching), `agents.toml` (shipped patterns)
+
+### P0-5: Auth.json exposed via allowlisted commands
+- `~/.autopoiesis/auth.json` contains OAuth credentials (access_token, refresh_token, id_token). The secret redactor only knows `sk-`, `ghp_`, `AKIA` patterns. With `cat *` in the allowlist, `cat ~/.autopoiesis/auth.json` is auto-approved and raw tokens are persisted in session history.
+- **Files:** `src/auth.rs`, `src/gate/secret_patterns.rs`, `agents.toml`
 
 ## P1 — High
 
-### P1-1: Global server serialization
-- `worker_lock` is a global mutex held for the full agent turn (LLM call + tool execution + persistence). One slow session blocks all others.
-- The store mutex is also held across `drain_queue()`.
-- **Files:** `src/server.rs` (worker_lock, state.store)
+### P1-7: Taint permanently on after first assistant reply
+- Taint is computed from `!message.principal.is_trusted()` across all history. Since assistant replies are stored as `Principal::Agent`, any multi-turn session becomes permanently tainted after the first assistant response. This disables standing approvals for every later turn, making them effectively dead.
+- **Files:** `src/turn.rs` (check_inbound taint computation), `src/principal.rs`
+
+### P1-8: Denied tool calls persisted without matching tool_result
+- Assistant `tool_call`s are persisted before approval completes. When denied, session keeps the tool_call without any tool_result. Replaying this to the provider breaks the round-trip invariant.
+- **Files:** `src/agent.rs` (tool call persistence), `src/session.rs`
+
+### P1-9: Session.append not atomic (memory before disk)
+- `Session::append` mutates in-memory history and token counters before writing to disk. If `append_entry_to_file` fails, memory and JSONL are out of sync.
+- **Files:** `src/session.rs` (append method)
+
+### P1-10: Budget enforcement is post-turn, not a ceiling
+- Budget guard only checks already-completed turn/session/day totals before the next inbound message. The current turn can exceed every configured ceiling. Guard only notices on the following turn.
+- **Files:** `src/agent.rs`, `src/gate/budget.rs`, `src/session.rs`
+
+### P1-11: Inbound approval shows system prompt, not user message
+- Approval prompt displays the first text block in assembled context (usually system prompt/identity), not the actual user content being approved.
+- **Files:** `src/agent.rs` (approval handler call)
 
 ### P1-2: Queue claiming is not atomic
-- `dequeue_next_message()` does SELECT then UPDATE in a transaction, but without an atomic claim predicate. Two processes sharing the same SQLite DB can claim the same row.
-- CLI and server both use `sessions/queue.sqlite`. Running both concurrently = duplicate execution risk.
+- `dequeue_next_message()` does SELECT then UPDATE without an atomic claim predicate. Two processes sharing the same SQLite DB can claim the same row.
 - **Files:** `src/store.rs` (dequeue_next_message)
 
 ### P1-4: SSE parser drops trailing events
-- If the stream ends without a trailing newline, final non-text events (function_call_arguments.done, response.completed, [DONE]) are parsed then ignored.
-- Tool calls and completion metadata can silently disappear.
-- **Files:** `src/llm/openai.rs` (streaming loop trailing-buffer handling)
+- If the stream ends without a trailing newline, final non-text events are parsed then ignored.
+- **Files:** `src/llm/openai.rs` (trailing-buffer handling)
 
 ### P1-5: Session replay silently drops unknown entries
-- Unknown roles are mapped to `None` and discarded. Malformed tool entries are dropped with a warning.
-- Corrupt or partially written history can mutate the replayed conversation without failing fast.
+- Unknown roles mapped to `None` and discarded. Malformed tool entries dropped with only a warning. Corrupt history silently mutates replayed conversation.
 - **Files:** `src/session.rs` (message_from_entry)
 
 ### P1-6: History abstraction is unused and unsafe
-- `History` context source is heavily tested but not wired into `build_default_turn()`. Real history replay happens ad-hoc in `agent.rs`.
-- If `History` were used, it can split tool-call/tool-result pairs during trimming.
-- **Files:** `src/context.rs` (History), `src/turn.rs` (build_default_turn)
+- `History` context source is tested but not wired into `build_default_turn()`. If used, its trimming logic splits tool-call/tool-result pairs.
+- **Files:** `src/context.rs` (History), `src/turn.rs`
 
 ## Architectural risks (not bugs, but structural)
 
 ### Shell as self-management surface
-- The agent manages subscriptions/topics/identity via CLI through shell. That means context management goes through the same uncontained shell. Without taint tracking, prompt injection can instruct the agent to subscribe malicious files.
+- Context management goes through the same uncontained shell. With taint tracking built, injection risk is reduced but not eliminated — taint only forces approval, it doesn't block the command.
 
 ### Identity hierarchy has no enforcement
 - constitution.md and operator.md are described as immutable/operator-only. No guard rule blocks writes to these paths. `echo "new rules" > identity/constitution.md` works.
 
 ### No caller principal beyond operator/user key split
-- Server auth distinguishes operator vs user via separate API keys, but there is no per-caller identity. Once you have the user key, you have full access to all sessions.
+- Server auth distinguishes operator vs user, but there is no per-caller identity. One user key = full access to all sessions.
 
 ## Fixed
 
 ### ~~P0-1: Shell is not meaningfully contained~~ (a54f212)
 - Shell default flipped to approve-unless-whitelisted. `ShellSafety::with_policy()` reads `[shell]` config from `agents.toml` with explicit allow/deny patterns and configurable default severity.
-- **Note:** the guard pipeline is still heuristic, not a security boundary. Real sandboxing (seccomp/landlock) remains a later milestone (roadmap 3d).
+- **Note:** guard pipeline is still heuristic, not a security boundary. Real sandboxing (seccomp/landlock) remains later milestone (roadmap 3d).
 
 ### ~~P0-2: HTTP callers can inject arbitrary message roles~~ (b03843b)
-- `Principal` enum enforces role based on auth key. User-key callers always enqueue as `user`. Only operator-key callers may request alternate roles (defaulting to `user`).
+- `Principal` enum enforces role based on auth key.
 
 ### ~~P0-3: Approval denial does not terminate the turn~~ (33ef098)
-- `make_denial_verdict()` increments a denial counter; after `MAX_DENIALS_PER_TURN` (2), the loop returns `TurnVerdict::Denied`. All denial paths use `break 'agent_turn` to exit cleanly.
+- `MAX_DENIALS_PER_TURN` (2) + `break 'agent_turn`.
+
+### ~~P1-1: Global server serialization~~ (2026-03-22)
+- Per-session locking via `HashMap<String, Arc<Mutex<()>>>`. Store mutex released before agent execution. Concurrent sessions no longer block each other.
 
 ### ~~P1-3: Provider-controlled call_id is unsanitized~~ (8e743c3)
-- `call_id` is sanitized before being used in filesystem paths and shell command suggestions in `cap_tool_output()`.
-- **Files:** `src/agent.rs`
+- `call_id` sanitized before filesystem paths.

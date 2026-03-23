@@ -9,11 +9,12 @@
 | # | Item | Depends on | Scope |
 |---|------|-----------|-------|
 | ~~1a~~ | ~~P0 fixes (role injection, denial termination, shell default-approve)~~ | — | ~~3 PRs~~ ✓ |
-| 1b | Standing approvals (`[shell.standing_approvals]` in agents.toml) | 1a | 1 PR |
-| 1c | Taint tracking (`<meta principal="..."/>` on messages, guard integration) | 1b | 1 PR |
-| 1d | Budget enforcement (per-turn/session/day token ceilings) | 1a | 1 PR |
+| ~~1b~~ | ~~Standing approvals (`standing_approvals = [...]` under `[shell]` in agents.toml)~~ | ~~1a~~ | ~~PR #10~~ ✓ |
+| ~~1c~~ | ~~Taint tracking (Principal enum, GuardContext.tainted, standing approvals gated)~~ | ~~1b~~ | ~~PR #11~~ ✓ |
+| ~~1d~~ | ~~Budget enforcement (per-turn/session/day token ceilings via BudgetGuard)~~ | ~~1a~~ | ~~direct to main~~ ✓ |
+| 1e | P0 fixes round 2 (shell metachar bypass, auth.json exposure, taint over-fire) | 1a-1d | 1 PR |
 
-**Why this order:** Standing approvals without taint = exploitable. Taint without standing approvals = unusably slow. Both together = practical + safe autonomy.
+**Note:** 1b-1d are implemented but have known bugs — see [risks.md](current/risks.md). 1e addresses the critical findings from the 2026-03-23 review.
 
 ### 2. Context management (after security)
 
@@ -39,7 +40,7 @@
 - Guard pipeline (SecretRedactor, ShellSafety, ExfilDetector)
 - Turn architecture (ContextSource + Tool + Guard trait composition)
 - Approval system with severity levels + REPL prompt flow
-- Session persistence (daily JSONL, tool_call round-trip, replay-safe)
+- Session persistence (daily JSONL, tool_call round-trip — note: denied tool_calls lack matching tool_result, see risks.md P1-8)
 - Identity system v1 (constitution + identity + context, template vars)
 - Constitution v1 (4 laws, 1st person, research-backed)
 - OAuth device flow auth
@@ -54,7 +55,12 @@
 - Shell output cap + file-backed result storage (4KB threshold)
 - Persistent named sessions (`--session <name>`)
 - Server path sanitization (session_id validation)
-- Stale message recovery on startup
+- Stale message recovery on startup (server path only, not CLI)
 - **P0-1:** Shell default-approve with configurable policy — `[shell]` in agents.toml (#8)
 - **P0-2:** HTTP role enforcement via Principal enum (#6)
 - **P0-3:** Approval denial terminates turn — MAX_DENIALS_PER_TURN + break (#7)
+- **1b:** Standing approvals — `standing_approvals` list under `[shell]` in agents.toml (#10)
+- **1c:** Taint tracking — Principal propagation, GuardContext.tainted, standing approvals skipped when tainted (#11)
+- **1d:** Budget enforcement — BudgetGuard with per-turn/session/day ceilings, session-total accounting
+- Gate split refactor — agent.rs 2020→1434 lines, guard.rs → 7 gate/ submodules + cli.rs
+- Per-session server locking (replaced global worker_lock)

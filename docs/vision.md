@@ -16,15 +16,15 @@
 
 **MVP: Shell output is capped. Full results live in files.** Every shell execution saves full output to `sessions/{id}/results/{call_id}.txt`. Output below threshold is also inline in history. Output above threshold: only metadata in history. To read the content, the agent **subscribes**. This is the forcing mechanism.
 
-**MVP: Subscriptions are explicit context management.** A subscription injects file content into the context pipeline. The agent subscribes via CLI (`./autopoiesis sub add <path>`). Subscriptions are:
+**V1: Subscriptions are explicit context management.** A subscription injects file content into the context pipeline. The agent subscribes via CLI (`./autopoiesis sub add <path>`). Subscriptions are:
 - **Instant** — content appears on the very next turn
 - **Optional** — the agent decides what to load
 - **Positional** — placed in history by `max(activated, updated)` timestamp
 - **Reactive** — file changes → new timestamp → bubbles forward in timeline
 
-**MVP: Subscriptions are optionally grouped by topic.** Topics are the index layer, not the source of truth. When they matter, subscriptions are grouped around them; when they do not, subscriptions work standalone in `_default`.
+**V1: Subscriptions are optionally grouped by topic.** Topics are the index layer, not the source of truth. When they matter, subscriptions are grouped around them; when they do not, subscriptions work standalone in `_default`.
 
-**MVP: Subscriptions are always to files.** Never to HTTP endpoints, databases, or external sources directly. Shell is the universal adapter. Trigger → shell writes file → subscription sees mtime change → content loads. No HTTP in the subscription layer.
+**V1: Subscriptions are always to files.** Never to HTTP endpoints, databases, or external sources directly. Shell is the universal adapter. Trigger → shell writes file → subscription sees mtime change → content loads. No HTTP in the subscription layer.
 
 **V1: Subscription filtering.** Not every subscription loads the full file:
 - **Full** — entire content (default)
@@ -35,9 +35,9 @@
 
 **V1: Two budget layers.** The safety layer enforces hard ceilings: per-turn token limit, per-session limit, per-day cost cap. These are guard-enforced and non-negotiable — the agent cannot exceed them. The intelligence layer is the agent's own context management: CLI reports utilization on every subscription change, the agent decides what to load/unload, and history trimming drops oldest turns when approaching the ceiling. Hard limits prevent runaway; the agent optimizes within them. Trimming preserves assistant/tool round-trips — never splits a tool call from its result.
 
-**MVP: Topics are optional indexes.** A topic is a name + activation state + subscriptions + triggers + relations. All in SQLite, all managed through CLI. When topics aren't needed, subscriptions work standalone (implicitly in `_default` topic).
+**V1: Topics are optional indexes.** A topic is a name + activation state + subscriptions + triggers + relations. All in SQLite, all managed through CLI. When topics aren't needed, subscriptions work standalone (implicitly in `_default` topic).
 
-**MVP: CLI is the self-management interface.** The agent manages itself through its own binary via shell. Files for storage, CLI for validated control plane. Every management action is a shell call in history, auditable by guards. Note: this makes context management a privilege escalation surface until taint tracking is built — see [risks.md](current/risks.md).
+**V1: CLI is the self-management interface.** The agent manages itself through its own binary via shell. Files for storage, CLI for validated control plane. Every management action is a shell call in history, auditable by guards. Note: taint tracking is now built, but context management through shell remains a privilege escalation surface — taint forces approval but doesn't block the command. See [risks.md](current/risks.md).
 
 **MVP: P0 fixes + standing approvals (done/doing).** The four gate dimensions work together:
 - **V2: Permissions** — what the agent CAN touch (filesystem, network, resources)
@@ -64,9 +64,9 @@
 
 ## Topics at scale
 
-**MVP: Topics are the grouping layer.** A topic is a name + activation state + subscriptions + triggers + relations. All in SQLite, all managed through CLI.
+**V1: Topics are the grouping layer.** A topic is a name + activation state + subscriptions + triggers + relations. All in SQLite, all managed through CLI.
 
-**MVP: Subscriptions still work standalone.** When topics aren't needed, subscriptions work standalone (implicitly in `_default` topic).
+**V1: Subscriptions still work standalone.** When topics aren't needed, subscriptions work standalone (implicitly in `_default` topic).
 
 **V2: Topic export/import for cross-agent delegation.** `topic export/import` bundles metadata for cross-session transfer. Scout T3 adds subs → coder T3 loads topic → zero exploration.
 
@@ -77,12 +77,12 @@
 ## CLI surface
 
 ```bash
-# MVP: Subscriptions (standalone or topic-scoped)
+# V1: Subscriptions (standalone or topic-scoped)
 ./autopoiesis sub add <path> [--topic <name>] [--lines 10-50] [--regex "pub fn"]
 ./autopoiesis sub remove <path> [--topic <name>]
 ./autopoiesis sub list [--topic <name>]
 
-# MVP: Topics (optional grouping)
+# V1: Topics (optional grouping)
 ./autopoiesis topic create/delete/activate/deactivate/list <name>
 
 # V2: Topic export/import
