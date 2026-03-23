@@ -32,6 +32,8 @@
 | 3b | Trigger evaluation (cron + webhook → enqueue) | 2c | 1 PR |
 | 3c | Provider abstraction (Anthropic, local models) | — | 1 PR |
 | 3d | Permissions/sandboxing (seccomp/landlock/uid-drop) | 1a | large |
+| 3e | PTY shell (persistent interactive sessions, SSH, REPLs) | 3a | large |
+| 3f | Constitution evals in CI (automated scorecard from tests/constitution/) | — | 1 PR |
 
 ## Done
 

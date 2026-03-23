@@ -37,6 +37,9 @@
 
 ## Architectural risks (not bugs, but structural)
 
+### Guard pipeline is heuristic, not a security boundary
+- All shell guards (ShellSafety, ExfilDetector, compound command detection, protected paths) are regex/glob/substring checks. They are trivially bypassable via inline interpreters (`python -c`, `perl -e`), variable expansion, or command substitution. Real containment (seccomp/landlock/uid-drop) is roadmap 3d. Until then, guards are risk reduction, not a sandbox.
+
 ### Shell as self-management surface
 - Context management goes through the same uncontained shell. With taint tracking built, injection risk is reduced but not eliminated — taint only forces approval, it doesn't block the command.
 
