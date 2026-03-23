@@ -16,7 +16,7 @@
 
 **MVP: Shell output is capped. Full results live in files.** Every shell execution saves full output to `sessions/{id}/results/{call_id}.txt`. Output below threshold is also inline in history. Output above threshold: only metadata in history. To read the content, the agent **subscribes**. This is the forcing mechanism.
 
-**V1: Subscriptions are explicit context management.** A subscription injects file content into the context pipeline. The agent subscribes via CLI (`./autopoiesis sub add <path>`). Subscriptions are:
+**MVP: Subscriptions are explicit context management (data layer built, context wiring pending).** A subscription injects file content into the context pipeline. The agent subscribes via CLI (`./autopoiesis sub add <path>`). Data layer, CLI, filters, and content loading are implemented. Context assembly wiring is roadmap 2b. Subscriptions are:
 - **Instant** — content appears on the very next turn
 - **Optional** — the agent decides what to load
 - **Positional** — placed in history by `max(activated, updated)` timestamp

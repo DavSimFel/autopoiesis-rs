@@ -5,38 +5,42 @@
 
 ## Overview
 
-26 source files, ~10.6K lines, 171 tests (170 run, 1 ignored). One binary: CLI (REPL or one-shot) + HTTP/WS server. One tool: shell. Run `cargo test` for current count.
+27 source files, ~13.4K lines, 208 tests (201+5+2 run, 1 ignored). One binary: CLI (REPL or one-shot) + HTTP/WS server. One tool: shell. CLI also exposes `sub add/remove/list` for subscription management. Run `cargo test` for current count.
 
 ## Module map
 
 ```
 main.rs (213L)              CLI entrypoint, clap args, REPL loop, server launch
-agent.rs (1434L)            Agent loop, turn orchestration, output cap, approval flow
+agent.rs (1959L)            Agent loop, turn orchestration, output cap, approval flow
                             TokenSink + ApprovalHandler traits for I/O decoupling
+                            Denied tool calls persist text-only (no broken tool_call replay)
 server.rs (1558L)           axum HTTP + WS, Principal-based auth, queue-driven agent exec
 session.rs (1221L)          JSONL persistence, token tracking, context trimming, budget snapshots
-llm/openai.rs (982L)        OpenAI Responses API, SSE streaming, incremental parsing
+subscription.rs (592L)      Subscription data layer: filters, path normalization, content loading, token utilization
+llm/openai.rs (1016L)       OpenAI Responses API, SSE streaming, incremental parsing
 llm/mod.rs (215L)           LlmProvider trait, message types, tool call structs
-gate/mod.rs (324L)          Guard trait, Verdict/Severity enums, resolve_verdict(), guard_text_output/guard_message_output
-gate/shell_safety.rs (464L) Policy-driven shell allow/deny, standing approvals (taint-gated)
+gate/mod.rs (324L)          Guard trait, Verdict/Severity enums, guard_text_output/guard_message_output
+gate/shell_safety.rs (716L) Policy-driven shell allow/deny, standing approvals (taint-gated),
+                            compound command detection, protected credential path denial
 gate/secret_redactor.rs (278L)  Regex-based secret redaction in message content
 gate/streaming_redact.rs (346L) Byte-by-byte secret redaction during SSE streaming
-gate/exfil_detector.rs (192L)   Cross-call read+send pattern detection
+gate/exfil_detector.rs (279L)   Cross-call read+send pattern detection
 gate/budget.rs (199L)       Per-turn/session/day token ceiling enforcement
 gate/output_cap.rs (175L)   Shell output cap + file-backed result storage
-gate/secret_patterns.rs (55L)   Shared secret pattern catalog
+gate/secret_patterns.rs (778L)  Shared secret pattern catalog + protected path detection + env wrapper stripping
 context.rs (383L)           ContextSource trait — Identity (prompt files), History (replay, not wired)
-turn.rs (645L)              Turn composition: ContextSource + Tool + Guard builder
+turn.rs (719L)              Turn composition: ContextSource + Tool + Guard builder, taint via is_taint_source()
 tool.rs (322L)              Shell tool: async exec, RLIMIT, process-group kill
-store.rs (297L)             SQLite session registry + message queue
+store.rs (509L)             SQLite session registry + message queue + subscriptions table
 auth.rs (401L)              OAuth device flow, token storage/refresh
-config.rs (336L)            agents.toml loading, ShellPolicy, BudgetConfig
+config.rs (420L)            agents.toml loading, ShellPolicy, BudgetConfig, protected path config
 identity.rs (165L)          Loads identity/*.md, concatenates in order
-principal.rs (76L)          Principal enum (Operator/User/System/Agent), trust/source mapping
+principal.rs (92L)          Principal enum (Operator/User/System/Agent), trust/taint source mapping
 cli.rs (116L)               CLI display helpers, denial formatting
+main.rs (411L)              CLI entrypoint, clap args, REPL loop, server launch, sub add/remove/list
 template.rs (86L)           {{var}} placeholder resolution
 util.rs (95L)               utc_timestamp(), helpers
-lib.rs (18L)                Module re-exports
+lib.rs (19L)                Module re-exports
 ```
 
 ## Execution flow
@@ -91,6 +95,9 @@ All sources (CLI, HTTP, WS) enqueue to the same queue. CLI uses `agent::drain_qu
 
 ### Two execution paths, one Turn
 CLI and server both use `build_default_turn()` (takes `Config` with shell policy). The Turn composes Identity (context source), Shell (tool), and the guard pipeline. Differences are only in TokenSink (stdout vs WS) and ApprovalHandler (stdin vs WS/reject).
+
+### Subscriptions
+Agent subscribes to files via CLI (`sub add <path>`). SQLite `subscriptions` table with unique (topic, path) index. Filters: Full (default), Lines, Regex, Head, Tail, Jq. Content loaded from disk, filtered, and token-estimated via tiktoken. `sub add/remove` print total token utilization. Effective timestamp = `max(activated_at, file_mtime)`. Not yet wired into context assembly (roadmap 2b).
 
 ### Auth and principals
 Server authenticates via API key header. Two keys: operator key (full role control) and user key (always enqueues as `user`). `Principal` enum in `principal.rs`: Operator (trusted), User, System, Agent (all tainted). Taint propagates through `GuardContext` — standing approvals are skipped when tainted.

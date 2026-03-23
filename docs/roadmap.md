@@ -20,7 +20,7 @@
 
 | # | Item | Depends on | Scope |
 |---|------|-----------|-------|
-| 2a | Subscription system (SQLite table, `sub add/remove/list` CLI, filters) | 1a | 1-2 PRs |
+| ~~2a~~ | ~~Subscription system (SQLite table, `sub add/remove/list` CLI, filters)~~ | ~~1a~~ | ~~direct to main~~ ✓ |
 | 2b | Context assembly rework (materialize subs in history by timestamp) | 2a | 1 PR |
 | 2c | Topics (optional grouping on subscriptions, triggers, relations) | 2a | 1-2 PRs |
 
@@ -64,3 +64,8 @@
 - **1d:** Budget enforcement — BudgetGuard with per-turn/session/day ceilings, session-total accounting
 - Gate split refactor — agent.rs 2020→1434 lines, guard.rs → 7 gate/ submodules + cli.rs
 - Per-session server locking (replaced global worker_lock)
+- **P0-4:** Shell metacharacter bypass — compound commands force approval
+- **P0-5:** Credential file exposure — protected paths always denied
+- **P1-7:** Taint over-fire — only User/System taint, Agent doesn't
+- **P1-8:** Denied tool-call replay — text-only persistence on denial
+- **2a:** Subscription system — SQLite table, `sub add/remove/list` CLI, filters (Full/Lines/Regex/Head/Tail/Jq), content loading, token utilization

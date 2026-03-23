@@ -11,12 +11,12 @@ Legacy codebase: `/root/autopoiesis` (Python, still running in prod, no new deve
 
 ### autopoiesis-rs layout
 ```
-src/           — Rust source (~10.6K lines, 26 files)
-  gate/        — Guard pipeline (budget, secret redaction, shell safety, exfil detection, output cap)
+src/           — Rust source (~13.4K lines, 27 files)
+  gate/        — Guard pipeline (budget, secret redaction, shell safety, exfil detection, output cap, protected paths)
   llm/         — LLM provider trait + OpenAI Responses API
 identity/      — System prompt files (constitution, identity, context)
 agents.toml    — Model config, shell policy, budget limits
-sessions/      — JSONL history + SQLite queue (gitignored)
+sessions/      — JSONL history + SQLite queue + subscriptions (gitignored)
 tests/         — Integration tests
 docs/          — Architecture, roadmap, risks, vision
 AGENTS.md      — Coding agent instructions
@@ -26,8 +26,9 @@ AGENTS.md      — Coding agent instructions
 - `agent.rs` — Agent loop, turn orchestration, token sink
 - `server.rs` — axum HTTP + WebSocket server, per-session locking
 - `session.rs` — JSONL persistence, trimming, token tracking, budget snapshots
-- `gate/` — Guard pipeline: BudgetGuard, SecretRedactor, ShellSafety (standing approvals), ExfilDetector
-- `principal.rs` — Principal enum (Operator/User/System/Agent), trust mapping
+- `subscription.rs` — File subscriptions: filters, content loading, token utilization
+- `gate/` — Guard pipeline: BudgetGuard, SecretRedactor, ShellSafety (standing approvals, compound command detection, credential path denial), ExfilDetector
+- `principal.rs` — Principal enum (Operator/User/System/Agent), trust + taint source mapping
 - `tool.rs` — Shell execution with RLIMIT sandbox
 - `llm/openai.rs` — OpenAI Responses API, SSE streaming
 

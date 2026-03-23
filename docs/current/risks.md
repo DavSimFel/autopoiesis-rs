@@ -7,10 +7,6 @@
 
 ## P1 — High
 
-### P1-7: Taint permanently on after first assistant reply
-- Taint is computed from `!message.principal.is_trusted()` across all history. Since assistant replies are stored as `Principal::Agent`, any multi-turn session becomes permanently tainted after the first assistant response. This disables standing approvals for every later turn, making them effectively dead.
-- **Files:** `src/turn.rs` (check_inbound taint computation), `src/principal.rs`
-
 ### P1-9: Session.append not atomic (memory before disk)
 - `Session::append` mutates in-memory history and token counters before writing to disk. If `append_entry_to_file` fails, memory and JSONL are out of sync.
 - **Files:** `src/session.rs` (append method)
@@ -75,6 +71,9 @@
 
 ### ~~P1-3: Provider-controlled call_id is unsanitized~~ (8e743c3)
 - `call_id` sanitized before filesystem paths.
+
+### ~~P1-7: Taint permanently on after first assistant reply~~ (2026-03-23)
+- Fixed by adding `Principal::is_taint_source()` — only User and System taint. Agent-authored messages (assistant replies) no longer poison the session or disable standing approvals.
 
 ### ~~P1-8: Denied tool calls persisted without matching tool_result~~ (2026-03-23)
 - Fixed by delaying assistant `tool_call` persistence until all approval and deny checks complete, and by persisting only sanitized assistant text on denied mixed-content turns.

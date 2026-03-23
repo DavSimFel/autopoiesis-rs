@@ -24,13 +24,13 @@ cargo test --features integration  # live API tests (skip if no auth)
 ## Project structure
 
 ```
-src/                 26 Rust source files (~10.6K lines)
-  gate/              Guard pipeline (budget, secret redaction, shell safety, exfil detection)
+src/                 27 Rust source files (~13.4K lines)
+  gate/              Guard pipeline (budget, secret redaction, shell safety, exfil detection, protected paths)
   llm/               LLM provider trait + OpenAI backend
 identity/            Runtime prompt files (constitution, identity, context)
 agents.toml          Model config, shell policy, budget limits
-sessions/            JSONL history + SQLite queue (gitignored)
-tests/               Integration tests
+sessions/            JSONL history + SQLite queue + subscriptions (gitignored)
+tests/               Integration + shipped policy tests
 docs/current/        How the code works today + known risks
 docs/vision.md       Future-state design
 docs/roadmap.md      Build order and priorities
