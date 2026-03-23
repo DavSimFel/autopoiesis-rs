@@ -46,7 +46,7 @@
 - OAuth device flow auth
 - Token estimation (tiktoken-rs) + context trimming
 - SQLite message queue + session store (source-agnostic inbox)
-- Unified drain_queue() for CLI and server
+- Queue draining for CLI (`agent::drain_queue()`) and server (`server::drain_session_queue()`), both via `process_queued_message()`
 - axum HTTP server + WebSocket
 - API key auth middleware (header + WS query param)
 - Decouple agent loop from stdin/stdout (TokenSink + ApprovalHandler)
@@ -58,7 +58,7 @@
 - Stale message recovery on startup (server path only, not CLI)
 - **P0-1:** Shell default-approve with configurable policy — `[shell]` in agents.toml (#8)
 - **P0-2:** HTTP role enforcement via Principal enum (#6)
-- **P0-3:** Approval denial terminates turn — MAX_DENIALS_PER_TURN + break (#7)
+- **P0-3:** Approval denial terminates turn — first denial breaks the loop; MAX_DENIALS_PER_TURN (2) affects summary text (#7)
 - **1b:** Standing approvals — `standing_approvals` list under `[shell]` in agents.toml (#10)
 - **1c:** Taint tracking — Principal propagation, GuardContext.tainted, standing approvals skipped when tainted (#11)
 - **1d:** Budget enforcement — BudgetGuard with per-turn/session/day ceilings, session-total accounting

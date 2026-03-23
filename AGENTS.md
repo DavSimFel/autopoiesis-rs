@@ -24,15 +24,16 @@ cargo test --features integration  # live API tests (skip if no auth)
 ## Project structure
 
 ```
-src/                 17 Rust source files (~7.9K lines)
+src/                 26 Rust source files (~10.6K lines)
+  gate/              Guard pipeline (budget, secret redaction, shell safety, exfil detection)
+  llm/               LLM provider trait + OpenAI backend
 identity/            Runtime prompt files (constitution, identity, context)
-agents.toml          Model config
+agents.toml          Model config, shell policy, budget limits
 sessions/            JSONL history + SQLite queue (gitignored)
 tests/               Integration tests
 docs/current/        How the code works today + known risks
 docs/vision.md       Future-state design
 docs/roadmap.md      Build order and priorities
-docs/audits/         Immutable review logs
 research/            Non-authoritative explorations
 ```
 
@@ -40,7 +41,7 @@ research/            Non-authoritative explorations
 
 1. **One tool.** Shell is the universal tool. Don't add tools — teach the prompt.
 2. **Guard pipeline order.** Deny > Approve > Allow in `resolve_verdict()` (turn.rs). Note: this is local verdict precedence only — see [risks.md](docs/current/risks.md) for orchestration-layer gaps.
-3. **No `unsafe` outside RLIMIT.** Only the `pre_exec` closure in tool.rs.
+3. **No `unsafe` outside tool.rs.** `set_resource_limits()`, `signal_process_group()`, and the `pre_exec` closure — all in tool.rs.
 4. **Traits for composition.** ContextSource, Tool, Guard, LlmProvider, TokenSink, ApprovalHandler.
 5. **Two paths share one Turn.** CLI and server both use `build_default_turn()`. Don't diverge.
 

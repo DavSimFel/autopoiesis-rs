@@ -5,7 +5,7 @@
 
 ## Overview
 
-26 source files, ~10.6K lines, 170 tests. One binary: CLI (REPL or one-shot) + HTTP/WS server. One tool: shell. Run `cargo test` for current count.
+26 source files, ~10.6K lines, 171 tests (170 run, 1 ignored). One binary: CLI (REPL or one-shot) + HTTP/WS server. One tool: shell. Run `cargo test` for current count.
 
 ## Module map
 
@@ -68,14 +68,14 @@ Shell (`sh -lc`) is the only tool. All capabilities come from the prompt teachin
 ### Guard pipeline (gate/)
 Guards in order: BudgetGuard → SecretRedactor → ShellSafety → ExfilDetector.
 BudgetGuard is only wired when `[budget]` config exists.
-Verdict precedence: Deny > Approve > Allow. `resolve_verdict()` in gate/mod.rs.
+Verdict precedence: Deny > Approve > Allow. `resolve_verdict()` in turn.rs.
 Guards check inbound messages, tool calls, and outbound text.
 ShellSafety uses a configurable policy (`[shell]` in agents.toml) with allow/deny patterns, standing approvals (skipped when tainted), and a default action.
 `GuardContext` carries `tainted: bool` + `BudgetSnapshot`. Taint is set when any message in history has a non-operator principal.
 **Note:** these are heuristics, not a security boundary. See [risks.md](risks.md).
 
 ### Shell output cap
-Every shell result is saved to `sessions/{id}/results/{call_id}.txt`.
+Every shell result is saved to `sessions/{id}/results/call_<sanitized_call_id>.txt` (call_id is sanitized for filesystem safety).
 Below 4KB: also returned inline in history.
 Above 4KB: only metadata pointer in history. Agent must read the file explicitly.
 
@@ -86,7 +86,7 @@ Token tracking via tiktoken-rs (cl100k_base). Trimming drops oldest non-system m
 
 ### SQLite queue
 `sessions/queue.sqlite` — session registry + message queue.
-All sources (CLI, HTTP, WS) enqueue to the same queue. `drain_queue()` is the unified consumer for both CLI and server.
+All sources (CLI, HTTP, WS) enqueue to the same queue. CLI uses `agent::drain_queue()`, server uses `server::drain_session_queue()` — both ultimately call `agent::process_queued_message()`.
 **Note:** queue claiming is not atomic across processes. See [risks.md](risks.md#p1-2).
 
 ### Two execution paths, one Turn

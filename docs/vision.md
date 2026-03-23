@@ -8,7 +8,7 @@
 
 **MVP: One inbox, any source.** Cron, webhook, user, agent — all feed the same SQLite queue. The agent loop reads the next message, thinks, acts, responds. Transport is source-agnostic — the queue doesn't care how the message arrived.
 
-**V1: Authority is source-aware.** Every message carries a `principal` (operator/user/agent/system) and taint status. The agent doesn't know the transport; it DOES know the trust level.
+**MVP: Authority is source-aware (built).** Every message carries a `principal` (operator/user/agent/system) and taint status. The agent doesn't know the transport; it DOES know the trust level. Implemented via `Principal` enum + `GuardContext.tainted`.
 
 **MVP: Shell is the universal tool.** File I/O, web requests, process management, agent-to-agent calls, self-configuration — all through shell. The prompt teaches the agent what to do. The tool surface stays at one.
 
@@ -33,7 +33,7 @@
 - **Head/Tail** — first/last N lines
 - **JQ** — JSON query (`--jq ".status"`)
 
-**V1: Two budget layers.** The safety layer enforces hard ceilings: per-turn token limit, per-session limit, per-day cost cap. These are guard-enforced and non-negotiable — the agent cannot exceed them. The intelligence layer is the agent's own context management: CLI reports utilization on every subscription change, the agent decides what to load/unload, and history trimming drops oldest turns when approaching the ceiling. Hard limits prevent runaway; the agent optimizes within them. Trimming preserves assistant/tool round-trips — never splits a tool call from its result.
+**V1: Two budget layers.** The safety layer enforces ceilings: per-turn token limit, per-session limit, per-day cost cap. These are guard-enforced via `BudgetGuard` (built). **Note:** current implementation is preflight-only — it checks before each turn, but the active turn can exceed the ceiling. True hard ceilings require streaming abort or provider-side output caps (not yet built). The intelligence layer is the agent's own context management: CLI reports utilization on every subscription change, the agent decides what to load/unload, and history trimming drops oldest turns when approaching the ceiling. Budget prevents runaway; the agent optimizes within the limits. Trimming preserves assistant/tool round-trips — never splits a tool call from its result.
 
 **V1: Topics are optional indexes.** A topic is a name + activation state + subscriptions + triggers + relations. All in SQLite, all managed through CLI. When topics aren't needed, subscriptions work standalone (implicitly in `_default` topic).
 
@@ -56,11 +56,11 @@
 
 **V2: Persona dimensions + self-modification.** The longer-term identity model adds structured traits the agent can tune with evidence.
 
-**V1: Messages carry metadata.** `<meta ts="..." principal="operator|user|agent:id|system" />` on every user message. Makes Chain of Command enforceable per-message.
+**MVP: Messages carry metadata (partially built).** Timestamp is prepended to user text as `[YYYY-MM-DD HH:MM:SS UTC]`. Principal is stored as a structured field in JSONL/ChatMessage (not inline XML). **Not yet built:** inline `<meta />` tags for provider-visible principal attribution. Current approach: structured persistence + guard pipeline reads `message.principal`.
 
 **V1: Agent-to-agent = message.** T1 spawns T3 by posting a message to a new session. One agent can subscribe files for another session — that's delegation with context.
 
-**MVP: SQLite is the backbone.** Session state, message queue, subscription records — one database file. ACID and crash-recoverable. Note: the current queue claim operation is not atomic across processes — see [risks.md](current/risks.md#p1-2). True concurrent safety requires fixing the claim path.
+**MVP: SQLite + JSONL are the backbone (built).** Message queue and session registry live in SQLite (`sessions/queue.sqlite`). Session history lives in JSONL (`sessions/{name}/*.jsonl`). Subscription records don't exist yet. **Note:** queue claiming is not atomic across processes — see [risks.md](current/risks.md#p1-2). Session append is not atomic (memory before disk) — see [risks.md](current/risks.md#p1-9).
 
 ## Topics at scale
 

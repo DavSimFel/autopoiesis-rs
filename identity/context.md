@@ -37,10 +37,8 @@ Everything is a shell command. Key tools at your disposal:
 - `cargo build/test/clippy` — Rust toolchain
 - `gh` — GitHub CLI (issues, PRs, CI)
 - `git` — version control
-- `rg` (ripgrep) — fast code search
 - `jq` — JSON processing
 - `curl/wget` — HTTP requests
-- `sqlite3` — query session databases
 - Standard Unix: `grep`, `sed`, `awk`, `find`, `wc`, etc.
 
 ## Constraints
