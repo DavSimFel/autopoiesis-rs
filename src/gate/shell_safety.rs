@@ -262,6 +262,7 @@ mod tests {
                 .map(|pattern| pattern.to_string())
                 .collect(),
             default_severity: default_severity.to_string(),
+            max_output_bytes: crate::config::DEFAULT_SHELL_MAX_OUTPUT_BYTES,
         }
     }
 

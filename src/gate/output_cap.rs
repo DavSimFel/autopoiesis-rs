@@ -12,6 +12,7 @@ const HEX_WIDTH: usize = 2;
 const KB_DIVISOR: usize = 1024;
 const SED_PREVIEW_START_LINE: usize = 10;
 const SED_PREVIEW_END_LINE: usize = 20;
+const TRUNCATED_CAPTURE_NOTE: &str = "[shell output capture truncated at max_output_bytes; saved file contains only the bounded capture]";
 
 pub(crate) const DEFAULT_OUTPUT_CAP_BYTES: usize = DEFAULT_INLINE_CAP_BYTES;
 
@@ -38,6 +39,7 @@ pub(crate) fn cap_tool_output(
     output: String,
     threshold: usize,
 ) -> Result<String> {
+    let output_truncated = crate::tool::shell_output_was_truncated(&output);
     let results_dir = sessions_dir.join(RESULTS_DIR_NAME);
     fs::create_dir_all(&results_dir).with_context(|| {
         format!(
@@ -57,9 +59,15 @@ pub(crate) fn cap_tool_output(
     let line_count = output.lines().count();
     let size_kb = output.len().div_ceil(KB_DIVISOR);
     let path_display = result_path.display();
-    Ok(format!(
+    let mut pointer = String::new();
+    if output_truncated {
+        pointer.push_str(TRUNCATED_CAPTURE_NOTE);
+        pointer.push('\n');
+    }
+    pointer.push_str(&format!(
         "[output exceeded inline limit ({line_count} lines, {size_kb} KB) -> {path_display}]\nTo read: cat {path_display}\nTo read specific lines: sed -n '{SED_PREVIEW_START_LINE},{SED_PREVIEW_END_LINE}p' {path_display}"
-    ))
+    ));
+    Ok(pointer)
 }
 
 #[cfg(test)]
@@ -167,6 +175,38 @@ mod tests {
         assert!(capped.contains(&format!(
             "To read specific lines: sed -n '10,20p' {expected_path_str}"
         )));
+        assert!(!capped.contains(TRUNCATED_CAPTURE_NOTE));
+        assert!(expected_path.exists(), "result file should be created");
+        assert_eq!(fs::read_to_string(expected_path).unwrap(), output);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncated_shell_output_above_threshold_adds_capture_note_to_pointer() {
+        let dir = temp_sessions_dir("truncated_capped");
+        let call_id = "call-truncated";
+        let max_output_bytes = 5_000;
+        let output = format!(
+            "stdout:\n{}\nstderr:\n\nexit_code=0\n{}",
+            "x".repeat(5_000),
+            crate::tool::shell_output_truncation_note(max_output_bytes)
+        );
+
+        let capped =
+            cap_tool_output(&dir, call_id, output.clone(), DEFAULT_OUTPUT_CAP_BYTES).unwrap();
+
+        let expected_path = dir
+            .join(RESULTS_DIR_NAME)
+            .join(format!("{}.txt", safe_call_id_for_filename(call_id)));
+        let expected_path_str = expected_path.display().to_string();
+        let line_count = output.lines().count();
+        let size_kb = output.len().div_ceil(KB_DIVISOR);
+        assert!(capped.starts_with(TRUNCATED_CAPTURE_NOTE));
+        assert!(capped.contains(&format!(
+            "[output exceeded inline limit ({line_count} lines, {size_kb} KB) -> {expected_path_str}]"
+        )));
+        assert!(capped.contains(&format!("To read: cat {expected_path_str}")));
         assert!(expected_path.exists(), "result file should be created");
         assert_eq!(fs::read_to_string(expected_path).unwrap(), output);
 

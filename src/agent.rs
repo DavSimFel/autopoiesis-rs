@@ -809,6 +809,7 @@ mod tests {
                 .map(|pattern| pattern.to_string())
                 .collect(),
             default_severity: default_severity.to_string(),
+            max_output_bytes: crate::config::DEFAULT_SHELL_MAX_OUTPUT_BYTES,
         }
     }
 
@@ -1855,6 +1856,86 @@ mod tests {
         assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(session.history().len(), 3);
         assert!(!session.sessions_dir().join("results").exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn truncated_shell_output_remains_explicit_in_session_pointer_and_result_file() {
+        let dir = temp_sessions_dir("truncated_shell_output");
+        let call_id = "call-truncated";
+        let max_output_bytes = 5_000;
+        let command = "printf '%9000s' ''";
+        let provider = SequenceProvider::new(vec![
+            streamed_turn_with_tool_call(None, command, call_id),
+            StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    principal: Principal::Agent,
+                    content: vec![MessageContent::text("done")],
+                },
+                tool_calls: vec![],
+                meta: None,
+                stop_reason: StopReason::Stop,
+            },
+        ]);
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let turn = Turn::new()
+            .tool(Shell::with_max_output_bytes(max_output_bytes))
+            .guard(ShellSafety::with_policy(shell_policy(
+                "allow",
+                &[],
+                &[],
+                &[],
+                "medium",
+            )));
+        let mut make_provider = move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        let verdict = run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "run bounded output test".to_string(),
+            Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(verdict, TurnVerdict::Executed(ref calls) if calls.len() == 1));
+
+        let tool_message = session
+            .history()
+            .iter()
+            .find(|message| message.role == crate::llm::ChatRole::Tool)
+            .expect("tool result should be persisted");
+        let pointer = tool_message
+            .content
+            .iter()
+            .find_map(|block| match block {
+                MessageContent::ToolResult { result } => Some(result.content.as_str()),
+                _ => None,
+            })
+            .expect("tool result should have pointer text");
+        let result_path = session.sessions_dir().join("results").join(format!(
+            "{}.txt",
+            crate::gate::output_cap::safe_call_id_for_filename(call_id)
+        ));
+        let result_path_str = result_path.display().to_string();
+
+        assert!(pointer.contains("bounded capture"));
+        assert!(pointer.contains(&result_path_str));
+        assert!(pointer.contains("output exceeded inline limit"));
+
+        let persisted = std::fs::read_to_string(&result_path).unwrap();
+        assert!(persisted.contains(&crate::tool::shell_output_truncation_note(max_output_bytes)));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

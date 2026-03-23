@@ -37,6 +37,12 @@ pub struct BudgetConfig {
     pub max_tokens_per_day: Option<u64>,
 }
 
+pub(crate) const DEFAULT_SHELL_MAX_OUTPUT_BYTES: usize = 1_048_576;
+
+pub(crate) const fn default_shell_max_output_bytes() -> usize {
+    DEFAULT_SHELL_MAX_OUTPUT_BYTES
+}
+
 impl Config {
     /// Load configuration from a file, falling back to sensible defaults.
     pub fn load(config_path: impl AsRef<Path>) -> Result<Self> {
@@ -131,13 +137,14 @@ mod tests {
         assert!(policy.deny_patterns.is_empty());
         assert!(policy.standing_approvals.is_empty());
         assert_eq!(policy.default_severity, "medium");
+        assert_eq!(policy.max_output_bytes, DEFAULT_SHELL_MAX_OUTPUT_BYTES);
     }
 
     #[test]
     fn loads_valid_agents_toml_with_all_fields() {
         let path = temp_toml_path(
             "all_fields",
-            "[agent]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning_effort='low'\nsession_name='fix-auth'\n[auth]\noperator_key='operator-secret'\n[shell]\ndefault='allow'\nallow_patterns=['git *','cargo *']\ndeny_patterns=['rm -rf /*']\nstanding_approvals=['git push *','cargo publish *']\ndefault_severity='high'\n",
+            "[agent]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning_effort='low'\nsession_name='fix-auth'\n[auth]\noperator_key='operator-secret'\n[shell]\ndefault='allow'\nallow_patterns=['git *','cargo *']\ndeny_patterns=['rm -rf /*']\nstanding_approvals=['git push *','cargo publish *']\ndefault_severity='high'\nmax_output_bytes=2048\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -161,6 +168,7 @@ mod tests {
             vec!["git push *".to_string(), "cargo publish *".to_string()]
         );
         assert_eq!(config.shell_policy.default_severity, "high");
+        assert_eq!(config.shell_policy.max_output_bytes, 2048);
         assert_eq!(config.budget, None);
     }
 
@@ -366,6 +374,28 @@ mod tests {
         let config = Config::load(&path).expect("expected config to load");
         assert_eq!(config.budget, None);
     }
+
+    #[test]
+    fn shell_max_output_bytes_defaults_to_one_megabyte() {
+        let path = temp_toml_path("shell_default_output_bytes", "[agent]\nmodel='gpt-shell'\n");
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(
+            config.shell_policy.max_output_bytes,
+            DEFAULT_SHELL_MAX_OUTPUT_BYTES
+        );
+    }
+
+    #[test]
+    fn shell_max_output_bytes_override_is_honored() {
+        let path = temp_toml_path(
+            "shell_output_bytes_override",
+            "[agent]\nmodel='gpt-shell'\n[shell]\nmax_output_bytes=8192\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(config.shell_policy.max_output_bytes, 8192);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -405,6 +435,9 @@ pub struct ShellPolicy {
     pub standing_approvals: Vec<String>,
     /// Severity for commands that don't match any pattern.
     pub default_severity: String,
+    /// Maximum combined stdout/stderr bytes captured from a shell command.
+    #[serde(default = "default_shell_max_output_bytes")]
+    pub max_output_bytes: usize,
 }
 
 impl Default for ShellPolicy {
@@ -415,6 +448,7 @@ impl Default for ShellPolicy {
             deny_patterns: Vec::new(),
             standing_approvals: Vec::new(),
             default_severity: "medium".to_string(),
+            max_output_bytes: default_shell_max_output_bytes(),
         }
     }
 }
