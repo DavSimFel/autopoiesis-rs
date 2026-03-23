@@ -1,7 +1,7 @@
 use crate::config::BudgetConfig;
 use crate::gate::{BudgetSnapshot, Guard, GuardContext, GuardEvent, Verdict};
 
-const BUDGET_GUARD_ID: &str = "budget";
+pub const BUDGET_GUARD_ID: &str = "budget";
 
 /// Guard that enforces preflight token ceilings from the live session snapshot.
 pub struct BudgetGuard {

@@ -197,31 +197,46 @@ where
             messages.push(user_message.clone());
         }
 
-        let budget_context = session
-            .budget_snapshot()
-            .context("failed to read live budget snapshot")?;
-        let verdict = turn.check_inbound(
-            &mut messages,
+        let budget_context = if turn.needs_budget_context() {
             Some(GuardContext {
-                budget: budget_context,
+                budget: session
+                    .budget_snapshot()
+                    .context("failed to read live budget snapshot")?,
                 ..Default::default()
-            }),
-        );
-        if !persisted_user_message {
-            let user_message = messages
-                .iter()
-                .rev()
-                .find(|message| message.role == crate::llm::ChatRole::User)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("missing user message after inbound checks"))?;
-            session.append(user_message, None)?;
-            persisted_user_message = true;
-        }
+            })
+        } else {
+            None
+        };
+        let verdict = turn.check_inbound(&mut messages, budget_context);
 
         match verdict {
-            Verdict::Allow => {}
-            Verdict::Modify => {}
+            Verdict::Allow | Verdict::Modify => {
+                if !persisted_user_message {
+                    let user_message = messages
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == crate::llm::ChatRole::User)
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("missing user message after inbound checks")
+                        })?;
+                    session.append(user_message, None)?;
+                    persisted_user_message = true;
+                }
+            }
             Verdict::Deny { reason, gate_id } => {
+                if !persisted_user_message {
+                    let mut user_message = messages
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == crate::llm::ChatRole::User)
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("missing user message after inbound checks")
+                        })?;
+                    crate::gate::guard_message_output(turn, &mut user_message);
+                    session.append(user_message, None)?;
+                }
                 append_inbound_deny(session, &gate_id)?;
                 break 'agent_turn Some(make_denial_verdict(&mut denial_count, gate_id, reason));
             }
@@ -241,12 +256,36 @@ where
                     .unwrap_or("<inbound message>");
                 let approved = approval_handler.request_approval(&severity, &reason, command);
                 if !approved {
+                    if !persisted_user_message {
+                        let mut user_message = messages
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == crate::llm::ChatRole::User)
+                            .cloned()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("missing user message after inbound checks")
+                            })?;
+                        crate::gate::guard_message_output(turn, &mut user_message);
+                        session.append(user_message, None)?;
+                    }
                     append_inbound_approval_denied(session, &gate_id)?;
                     break 'agent_turn Some(make_denial_verdict(
                         &mut denial_count,
                         gate_id,
                         reason,
                     ));
+                }
+                if !persisted_user_message {
+                    let user_message = messages
+                        .iter()
+                        .rev()
+                        .find(|message| message.role == crate::llm::ChatRole::User)
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("missing user message after inbound checks")
+                        })?;
+                    session.append(user_message, None)?;
+                    persisted_user_message = true;
                 }
             }
         }
@@ -957,11 +996,11 @@ mod tests {
         }]);
         let mut session = crate::session::Session::new(&dir).unwrap();
 
-        struct NeedsApproval;
+        struct RedactingApproval;
 
-        impl Guard for NeedsApproval {
+        impl Guard for RedactingApproval {
             fn name(&self) -> &str {
-                "needs-approval"
+                "redacting-approval"
             }
 
             fn check(
@@ -980,7 +1019,7 @@ mod tests {
             }
         }
 
-        let turn = Turn::new().guard(NeedsApproval);
+        let turn = Turn::new().guard(RedactingApproval);
         let mut make_provider = {
             let provider = provider.clone();
             move || {
@@ -1148,7 +1187,9 @@ mod tests {
             }
         }
 
-        let turn = Turn::new().guard(NeedsApproval);
+        let turn = Turn::new()
+            .guard(NeedsApproval)
+            .guard(crate::gate::SecretRedactor::default_catalog());
         let mut make_provider = {
             let provider = provider.clone();
             move || {
@@ -1162,7 +1203,7 @@ mod tests {
         let verdict = run_agent_loop(
             &mut make_provider,
             &mut session,
-            "reject marker inbound".to_string(),
+            "sk-1234567890abcdef1234567890abcdef1234567890abcdef".to_string(),
             Principal::Operator,
             &turn,
             &mut token_sink,
@@ -1179,6 +1220,18 @@ mod tests {
 
         let stored = session.history();
         assert_eq!(stored.len(), 2);
+        let persisted_user = &stored[0];
+        assert_eq!(persisted_user.role, crate::llm::ChatRole::User);
+        let redacted_text = persisted_user
+            .content
+            .iter()
+            .find_map(|block| match block {
+                MessageContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("expected redacted user text");
+        assert!(redacted_text.contains("[REDACTED]"));
+        assert!(!redacted_text.contains("sk-"));
         assert_eq!(stored[1].role, crate::llm::ChatRole::Assistant);
         assert_eq!(stored[1].principal, Principal::System);
         let note = match &stored[1].content[0] {
@@ -1186,7 +1239,7 @@ mod tests {
             _ => panic!("expected text audit note"),
         };
         assert_eq!(note, "Message rejected after approval by needs-approval");
-        assert!(!note.contains("reject marker inbound"));
+        assert!(!note.contains("sk-"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
