@@ -301,6 +301,15 @@ async fn main() -> Result<()> {
             history.load_today()?;
 
             let mut queue = store::Store::new("sessions/queue.sqlite")?;
+            match queue.recover_stale_messages(config.queue.stale_processing_timeout_secs) {
+                Ok(recovered) if recovered > 0 => {
+                    eprintln!("recovered {recovered} stale messages from previous crash");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("warning: failed to recover stale messages: {error}");
+                }
+            }
             queue.create_session(&session_id, Some(r#"{"source":"cli"}"#))?;
 
             let provider_config = config.clone();

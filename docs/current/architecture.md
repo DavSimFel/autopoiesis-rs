@@ -91,7 +91,7 @@ Token tracking via tiktoken-rs (cl100k_base). Trimming drops oldest non-system m
 ### SQLite queue
 `sessions/queue.sqlite` — session registry + message queue.
 All sources (CLI, HTTP, WS) enqueue to the same queue. CLI uses `agent::drain_queue()`, server uses `server::drain_session_queue()` — both ultimately call `agent::process_queued_message()`.
-**Note:** queue claiming is not atomic across processes. See [risks.md](risks.md#p1-2).
+Queue claims are atomic across SQLite processes via `UPDATE ... RETURNING`. Startup recovery only requeues `processing` rows whose `claimed_at` is older than the configured stale threshold.
 
 ### Two execution paths, one Turn
 CLI and server both use `build_default_turn()` (takes `Config` with shell policy). The Turn composes Identity (context source), Shell (tool), and the guard pipeline. Differences are only in TokenSink (stdout vs WS) and ApprovalHandler (stdin vs WS/reject).

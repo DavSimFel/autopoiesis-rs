@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
@@ -44,6 +44,8 @@ impl Store {
         }
 
         let conn = Connection::open(path).context("failed to open sqlite store")?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .context("failed to configure sqlite busy timeout")?;
         conn.execute_batch(
             r#"
             PRAGMA foreign_keys = ON;
@@ -59,6 +61,7 @@ impl Store {
                 content TEXT NOT NULL,
                 source TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
+                claimed_at INTEGER,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
             );
@@ -79,6 +82,13 @@ impl Store {
             "#,
         )
         .context("failed to initialize sqlite schema")?;
+        ensure_messages_claimed_at_column(&conn)?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_status_claimed_at
+             ON messages(status, claimed_at, id)",
+            [],
+        )
+        .context("failed to initialize claimed_at index")?;
 
         Ok(Self { conn })
     }
@@ -125,50 +135,37 @@ impl Store {
     }
 
     pub fn dequeue_next_message(&mut self, session_id: &str) -> Result<Option<QueuedMessage>> {
-        let tx = self
+        let claimed_at = unix_timestamp();
+        let mut statement = self
             .conn
-            .transaction()
-            .context("failed to start dequeue transaction")?;
-        let result = {
-            let mut statement = tx
-                .prepare(
-                    "SELECT id, session_id, role, content, source, status, created_at
+            .prepare(
+                "UPDATE messages
+                 SET status = 'processing', claimed_at = ?2
+                 WHERE id = (
+                     SELECT id
                      FROM messages
                      WHERE session_id = ?1 AND status = 'pending'
                      ORDER BY created_at ASC, id ASC
-                     LIMIT 1",
-                )
-                .context("failed to prepare dequeue query")?;
+                     LIMIT 1
+                 )
+                 AND status = 'pending'
+                 RETURNING id, session_id, role, content, source, status, created_at",
+            )
+            .context("failed to prepare dequeue query")?;
 
-            statement.query_row(params![session_id], |row| {
-                Ok(QueuedMessage {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    role: row.get(2)?,
-                    content: row.get(3)?,
-                    source: row.get(4)?,
-                    status: row.get(5)?,
-                    created_at: row.get(6)?,
-                })
+        match statement.query_row(params![session_id, claimed_at], |row| {
+            Ok(QueuedMessage {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                source: row.get(4)?,
+                status: row.get(5)?,
+                created_at: row.get(6)?,
             })
-        };
-
-        match result {
-            Ok(message) => {
-                tx.execute(
-                    "UPDATE messages SET status = 'processing' WHERE id = ?1",
-                    params![message.id],
-                )
-                .context("failed to claim message")?;
-                tx.commit()
-                    .context("failed to commit dequeue transaction")?;
-                Ok(Some(message))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                tx.rollback()
-                    .context("failed to rollback dequeue transaction")?;
-                Ok(None)
-            }
+        }) {
+            Ok(message) => Ok(Some(message)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(error).context("failed to dequeue message"),
         }
     }
@@ -194,13 +191,18 @@ impl Store {
     }
 
     /// Recover messages stuck in 'processing' state (e.g., after a crash).
-    /// Resets them to 'pending' so they can be retried.
-    pub fn recover_stale_messages(&mut self) -> Result<u64> {
+    /// Resets them to 'pending' so they can be retried once they are stale.
+    pub fn recover_stale_messages(&mut self, stale_after_secs: u64) -> Result<u64> {
+        let stale_after_secs = stale_after_secs.min(i64::MAX as u64) as i64;
+        let stale_before = unix_timestamp().saturating_sub(stale_after_secs);
         let count = self
             .conn
             .execute(
-                "UPDATE messages SET status = 'pending' WHERE status = 'processing'",
-                [],
+                "UPDATE messages
+                 SET status = 'pending', claimed_at = NULL
+                 WHERE status = 'processing'
+                   AND (claimed_at IS NULL OR claimed_at <= ?1)",
+                params![stale_before],
             )
             .context("failed to recover stale messages")?;
         Ok(count as u64)
@@ -360,6 +362,48 @@ impl Store {
     }
 }
 
+fn unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn ensure_messages_claimed_at_column(conn: &Connection) -> Result<()> {
+    if has_column(conn, "messages", "claimed_at")? {
+        return Ok(());
+    }
+
+    if let Err(error) = conn.execute("ALTER TABLE messages ADD COLUMN claimed_at INTEGER", [])
+        && !has_column(conn, "messages", "claimed_at")?
+    {
+        return Err(error).context("failed to migrate messages.claimed_at column");
+    }
+
+    Ok(())
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("failed to inspect sqlite schema for {table}"))?;
+    let mut rows = statement
+        .query([])
+        .with_context(|| format!("failed to query sqlite schema for {table}"))?;
+
+    while let Some(row) = rows
+        .next()
+        .with_context(|| format!("failed to read sqlite schema for {table}"))?
+    {
+        let name: String = row.get(1).context("failed to read sqlite column name")?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 pub fn format_system_time(time: SystemTime) -> String {
     let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let seconds = duration.as_secs() as i64;
@@ -446,16 +490,17 @@ mod tests {
         assert_eq!(first_msg.id, first_id);
         assert_eq!(first_msg.role, "user");
         assert_eq!(first_msg.content, "first");
-        assert_eq!(first_msg.status, "pending");
-        let status: String = store
+        assert_eq!(first_msg.status, "processing");
+        let (status, claimed_at): (String, Option<i64>) = store
             .conn
             .query_row(
-                "SELECT status FROM messages WHERE id = ?1",
+                "SELECT status, claimed_at FROM messages WHERE id = ?1",
                 [first_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(status, "processing");
+        assert!(claimed_at.is_some());
 
         store.mark_processed(first_id).unwrap();
         let status: String = store
@@ -503,6 +548,167 @@ mod tests {
 
         let sessions = store.list_sessions().unwrap();
         assert_eq!(sessions, vec!["shared"]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dequeue_claim_is_atomic_across_concurrent_workers() {
+        use std::sync::{Arc, Barrier};
+
+        let path = temp_db_path("atomic_claim");
+        let mut store = Store::new(&path).unwrap();
+        store.create_session("worker", None).unwrap();
+        let message_id = store
+            .enqueue_message("worker", "user", "first", "cli")
+            .unwrap();
+        drop(store);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut store = Store::new(&path).unwrap();
+                barrier.wait();
+                store
+                    .dequeue_next_message("worker")
+                    .unwrap()
+                    .map(|row| row.id)
+            }));
+        }
+
+        let mut claimed = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .flatten()
+            .collect::<Vec<_>>();
+        claimed.sort_unstable();
+        assert_eq!(claimed, vec![message_id]);
+
+        let store = Store::new(&path).unwrap();
+        let (status, claimed_at): (String, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT status, claimed_at FROM messages WHERE id = ?1",
+                [message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "processing");
+        assert!(claimed_at.is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recover_stale_messages_respects_age_threshold() {
+        let path = temp_db_path("recover_stale");
+        let mut store = Store::new(&path).unwrap();
+        store.create_session("worker", None).unwrap();
+        let message_id = store
+            .enqueue_message("worker", "user", "first", "cli")
+            .unwrap();
+        store.dequeue_next_message("worker").unwrap().unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET claimed_at = ?1 WHERE id = ?2",
+                params![unix_timestamp() - 301, message_id],
+            )
+            .unwrap();
+
+        let recovered = store.recover_stale_messages(300).unwrap();
+        assert_eq!(recovered, 1);
+
+        let (status, claimed_at): (String, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT status, claimed_at FROM messages WHERE id = ?1",
+                [message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(claimed_at, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recover_stale_messages_leaves_fresh_claims_processing() {
+        let path = temp_db_path("recover_fresh");
+        let mut store = Store::new(&path).unwrap();
+        store.create_session("worker", None).unwrap();
+        let message_id = store
+            .enqueue_message("worker", "user", "first", "cli")
+            .unwrap();
+        store.dequeue_next_message("worker").unwrap().unwrap();
+
+        let recovered = store.recover_stale_messages(300).unwrap();
+        assert_eq!(recovered, 0);
+
+        let (status, claimed_at): (String, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT status, claimed_at FROM messages WHERE id = ?1",
+                [message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "processing");
+        assert!(claimed_at.is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn store_new_migrates_missing_claimed_at_column() {
+        let path = temp_db_path("migrate_claimed_at");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                metadata TEXT NOT NULL
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = Store::new(&path).unwrap();
+        let has_claimed_at = has_column(&store.conn, "messages", "claimed_at").unwrap();
+        assert!(has_claimed_at);
+
+        store.create_session("worker", None).unwrap();
+        let message_id = store
+            .enqueue_message("worker", "user", "first", "cli")
+            .unwrap();
+        let claimed = store.dequeue_next_message("worker").unwrap().unwrap();
+        assert_eq!(claimed.id, message_id);
+
+        let claimed_at: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT claimed_at FROM messages WHERE id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(claimed_at.is_some());
 
         let _ = std::fs::remove_file(&path);
     }

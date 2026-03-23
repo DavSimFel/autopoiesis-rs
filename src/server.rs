@@ -223,7 +223,7 @@ pub async fn run(port: u16) -> Result<()> {
 
     let mut store =
         store::Store::new("sessions/queue.sqlite").context("failed to open session store")?;
-    match store.recover_stale_messages() {
+    match store.recover_stale_messages(config.queue.stale_processing_timeout_secs) {
         Ok(recovered) if recovered > 0 => {
             eprintln!("recovered {recovered} stale messages from previous crash");
         }
@@ -755,6 +755,7 @@ mod tests {
                     operator_key: Some("operator-key".to_string()),
                     shell_policy: config::ShellPolicy::default(),
                     budget: None,
+                    queue: config::QueueConfig::default(),
                 },
                 http_client: Client::new(),
             },

@@ -24,6 +24,8 @@ pub struct Config {
     pub shell_policy: ShellPolicy,
     /// Optional budget ceilings loaded from the optional `[budget]` table.
     pub budget: Option<BudgetConfig>,
+    /// Queue recovery settings loaded from the optional `[queue]` table.
+    pub queue: QueueConfig,
 }
 
 /// Optional budget ceilings loaded from `[budget]` in `agents.toml`.
@@ -37,8 +39,18 @@ pub struct BudgetConfig {
     pub max_tokens_per_day: Option<u64>,
 }
 
+/// Queue recovery defaults loaded from `[queue]` in `agents.toml`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct QueueConfig {
+    /// Requeue `processing` rows only after this many seconds since claim.
+    #[serde(default = "default_stale_processing_timeout_secs")]
+    pub stale_processing_timeout_secs: u64,
+}
+
 pub(crate) const DEFAULT_SHELL_MAX_OUTPUT_BYTES: usize = 1_048_576;
 pub(crate) const DEFAULT_SHELL_MAX_TIMEOUT_MS: u64 = 120_000;
+pub(crate) const DEFAULT_STALE_PROCESSING_TIMEOUT_SECS: u64 = 300;
 
 pub(crate) const fn default_shell_max_output_bytes() -> usize {
     DEFAULT_SHELL_MAX_OUTPUT_BYTES
@@ -46,6 +58,10 @@ pub(crate) const fn default_shell_max_output_bytes() -> usize {
 
 pub(crate) const fn default_shell_max_timeout_ms() -> u64 {
     DEFAULT_SHELL_MAX_TIMEOUT_MS
+}
+
+pub(crate) const fn default_stale_processing_timeout_secs() -> u64 {
+    DEFAULT_STALE_PROCESSING_TIMEOUT_SECS
 }
 
 impl Config {
@@ -61,6 +77,7 @@ impl Config {
             operator_key: None,
             shell_policy: ShellPolicy::default(),
             budget: None,
+            queue: QueueConfig::default(),
         };
 
         let contents = match std::fs::read_to_string(config_path.as_ref()) {
@@ -104,6 +121,7 @@ impl Config {
 
         config.shell_policy = file_config.shell;
         config.budget = file_config.budget;
+        config.queue = file_config.queue;
 
         if let Ok(operator_key) = std::env::var("AUTOPOIESIS_OPERATOR_KEY") {
             config.operator_key = Some(operator_key);
@@ -146,6 +164,13 @@ mod tests {
         assert_eq!(policy.max_timeout_ms, DEFAULT_SHELL_MAX_TIMEOUT_MS);
     }
 
+    fn assert_default_queue_config(queue: &QueueConfig) {
+        assert_eq!(
+            queue.stale_processing_timeout_secs,
+            DEFAULT_STALE_PROCESSING_TIMEOUT_SECS
+        );
+    }
+
     #[test]
     fn loads_valid_agents_toml_with_all_fields() {
         let path = temp_toml_path(
@@ -177,6 +202,7 @@ mod tests {
         assert_eq!(config.shell_policy.max_output_bytes, 2048);
         assert_eq!(config.shell_policy.max_timeout_ms, 4096);
         assert_eq!(config.budget, None);
+        assert_default_queue_config(&config.queue);
     }
 
     #[test]
@@ -273,6 +299,7 @@ mod tests {
         );
         assert_default_shell_policy(&config.shell_policy);
         assert_eq!(config.budget, None);
+        assert_default_queue_config(&config.queue);
     }
 
     #[test]
@@ -288,6 +315,7 @@ mod tests {
         assert_eq!(config.operator_key, None);
         assert_default_shell_policy(&config.shell_policy);
         assert_eq!(config.budget, None);
+        assert_default_queue_config(&config.queue);
     }
 
     #[test]
@@ -309,6 +337,7 @@ mod tests {
         assert_eq!(config.operator_key, None);
         assert_default_shell_policy(&config.shell_policy);
         assert_eq!(config.budget, None);
+        assert_default_queue_config(&config.queue);
     }
 
     #[test]
@@ -354,6 +383,7 @@ mod tests {
                 max_tokens_per_day: Some(300),
             })
         );
+        assert_default_queue_config(&config.queue);
     }
 
     #[test]
@@ -372,6 +402,7 @@ mod tests {
                 max_tokens_per_day: None,
             })
         );
+        assert_default_queue_config(&config.queue);
     }
 
     #[test]
@@ -380,6 +411,7 @@ mod tests {
 
         let config = Config::load(&path).expect("expected config to load");
         assert_eq!(config.budget, None);
+        assert_default_queue_config(&config.queue);
     }
 
     #[test]
@@ -391,6 +423,7 @@ mod tests {
             config.shell_policy.max_output_bytes,
             DEFAULT_SHELL_MAX_OUTPUT_BYTES
         );
+        assert_default_queue_config(&config.queue);
     }
 
     #[test]
@@ -402,6 +435,7 @@ mod tests {
 
         let config = Config::load(&path).expect("expected config to load");
         assert_eq!(config.shell_policy.max_output_bytes, 8192);
+        assert_default_queue_config(&config.queue);
     }
 
     #[test]
@@ -413,6 +447,7 @@ mod tests {
             config.shell_policy.max_timeout_ms,
             DEFAULT_SHELL_MAX_TIMEOUT_MS
         );
+        assert_default_queue_config(&config.queue);
     }
 
     #[test]
@@ -424,6 +459,26 @@ mod tests {
 
         let config = Config::load(&path).expect("expected config to load");
         assert_eq!(config.shell_policy.max_timeout_ms, 1500);
+        assert_default_queue_config(&config.queue);
+    }
+
+    #[test]
+    fn queue_stale_processing_timeout_defaults_to_five_minutes() {
+        let path = temp_toml_path("queue_default_timeout", "[agent]\nmodel='gpt-queue'\n");
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_default_queue_config(&config.queue);
+    }
+
+    #[test]
+    fn queue_stale_processing_timeout_override_is_honored() {
+        let path = temp_toml_path(
+            "queue_timeout_override",
+            "[agent]\nmodel='gpt-queue'\n[queue]\nstale_processing_timeout_secs=42\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(config.queue.stale_processing_timeout_secs, 42);
     }
 }
 
@@ -434,6 +489,8 @@ struct AgentFileConfig {
     #[serde(default)]
     shell: ShellPolicy,
     budget: Option<BudgetConfig>,
+    #[serde(default)]
+    queue: QueueConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -482,6 +539,14 @@ impl Default for ShellPolicy {
             default_severity: "medium".to_string(),
             max_output_bytes: default_shell_max_output_bytes(),
             max_timeout_ms: default_shell_max_timeout_ms(),
+        }
+    }
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            stale_processing_timeout_secs: default_stale_processing_timeout_secs(),
         }
     }
 }

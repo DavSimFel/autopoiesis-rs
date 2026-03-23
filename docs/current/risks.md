@@ -19,10 +19,6 @@
 - Approval prompt displays the first text block in assembled context (usually system prompt/identity), not the actual user content being approved.
 - **Files:** `src/agent.rs` (approval handler call)
 
-### P1-2: Queue claiming is not atomic
-- `dequeue_next_message()` does SELECT then UPDATE without an atomic claim predicate. Two processes sharing the same SQLite DB can claim the same row.
-- **Files:** `src/store.rs` (dequeue_next_message)
-
 ### P1-4: SSE parser drops trailing events
 - If the stream ends without a trailing newline, final non-text events are parsed then ignored.
 - **Files:** `src/llm/openai.rs` (trailing-buffer handling)
@@ -71,6 +67,11 @@
 
 ### ~~P1-1: Global server serialization~~ (2026-03-22)
 - Per-session locking via `HashMap<String, Arc<Mutex<()>>>`. Store mutex released before agent execution. Concurrent sessions no longer block each other.
+
+### ~~P1-2: Queue claiming is not atomic~~ (2026-03-23)
+- `dequeue_next_message()` now claims rows with a single `UPDATE ... RETURNING` statement and records `claimed_at`.
+- Startup recovery only requeues `processing` rows whose claims are older than the configured stale threshold (default 300s); fresh in-flight work is left alone.
+- **Files:** `src/store.rs`, `src/main.rs`, `src/server.rs`, `src/config.rs`
 
 ### ~~P1-3: Provider-controlled call_id is unsanitized~~ (8e743c3)
 - `call_id` sanitized before filesystem paths.

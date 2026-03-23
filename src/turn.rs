@@ -717,6 +717,7 @@ mod tests {
             operator_key: None,
             shell_policy: ShellPolicy::default(),
             budget,
+            queue: crate::config::QueueConfig::default(),
         }
     }
 }
