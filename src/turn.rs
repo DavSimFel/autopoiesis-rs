@@ -57,6 +57,14 @@ impl Turn {
         }
     }
 
+    pub fn has_guard(&self, name: &str) -> bool {
+        self.guards.iter().any(|guard| guard.name() == name)
+    }
+
+    pub fn needs_budget_context(&self) -> bool {
+        self.has_guard(crate::gate::budget::BUDGET_GUARD_ID)
+    }
+
     pub fn check_inbound(
         &self,
         messages: &mut Vec<ChatMessage>,
@@ -68,15 +76,24 @@ impl Turn {
             .iter()
             .any(|message| !message.principal.is_trusted());
         self.tainted.store(tainted, Ordering::Relaxed);
-        let modified = messages.len() != baseline.len();
         let mut context = context.unwrap_or_default();
         context.tainted = tainted;
-        resolve_verdict(
-            &self.guards,
-            GuardEvent::Inbound(messages),
-            modified,
-            context,
-        )
+        let verdict = resolve_verdict(&self.guards, GuardEvent::Inbound(messages), false, context);
+        let modified = baseline.len() != messages.len()
+            || baseline.iter().zip(messages.iter()).any(|(before, after)| {
+                before.role != after.role
+                    || before.principal != after.principal
+                    || serde_json::to_string(&before.content).ok()
+                        != serde_json::to_string(&after.content).ok()
+            });
+        if modified {
+            match verdict {
+                Verdict::Allow => Verdict::Modify,
+                _ => verdict,
+            }
+        } else {
+            verdict
+        }
     }
 
     pub fn check_tool_call(&self, call: &ToolCall) -> Verdict {
@@ -434,6 +451,150 @@ mod tests {
             }
             other => panic!("expected budget deny, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_default_turn_budget_deny_leaves_inbound_text_unmodified() {
+        let turn = build_default_turn(&test_config(Some(BudgetConfig {
+            max_tokens_per_turn: Some(100),
+            max_tokens_per_session: None,
+            max_tokens_per_day: None,
+        })));
+
+        let mut messages = vec![ChatMessage::user(
+            "sk-1234567890abcdef1234567890abcdef1234567890abcdef",
+        )];
+        let result = turn.check_inbound(&mut messages, Some(make_budget_context(101, 0, 0)));
+
+        assert!(matches!(result, GuardResult::Deny { .. }));
+        let has_secret = messages.iter().flat_map(|message| message.content.iter()).any(
+            |block| matches!(block, crate::llm::MessageContent::Text { text } if text.contains("sk-")),
+        );
+        assert!(has_secret);
+    }
+
+    #[test]
+    fn check_inbound_allowed_turn_does_not_redact_user_message() {
+        let turn = Turn::new().guard(crate::gate::BudgetGuard::new(BudgetConfig {
+            max_tokens_per_turn: Some(100),
+            max_tokens_per_session: None,
+            max_tokens_per_day: None,
+        }));
+
+        let mut messages = vec![ChatMessage::user(
+            "sk-1234567890abcdef1234567890abcdef1234567890abcdef",
+        )];
+        let result = turn.check_inbound(&mut messages, Some(make_budget_context(0, 0, 0)));
+
+        assert!(!matches!(result, GuardResult::Deny { .. }));
+        let has_secret = messages.iter().flat_map(|message| message.content.iter()).any(
+            |block| matches!(block, crate::llm::MessageContent::Text { text } if text.contains("sk-")),
+        );
+        assert!(has_secret);
+    }
+
+    #[test]
+    fn check_inbound_returns_modify_when_guard_rewrites_inbound_content() {
+        struct RewriteGuard;
+
+        impl Guard for RewriteGuard {
+            fn name(&self) -> &str {
+                "rewrite"
+            }
+
+            fn check(
+                &self,
+                event: &mut GuardEvent,
+                _context: &crate::gate::GuardContext,
+            ) -> Verdict {
+                match event {
+                    GuardEvent::Inbound(messages) => {
+                        if let Some(crate::llm::MessageContent::Text { text }) = messages
+                            .first_mut()
+                            .and_then(|message| message.content.first_mut())
+                        {
+                            *text = "[REDACTED]".to_string();
+                        }
+                        Verdict::Allow
+                    }
+                    _ => Verdict::Allow,
+                }
+            }
+        }
+
+        let turn = Turn::new().guard(RewriteGuard);
+        let mut messages = vec![ChatMessage::user("sk-1234567890abcdef1234567890abcdef")];
+
+        let result = turn.check_inbound(&mut messages, None);
+
+        assert!(matches!(result, GuardResult::Modify));
+        let redacted = messages.iter().flat_map(|message| message.content.iter()).any(
+            |block| matches!(block, crate::llm::MessageContent::Text { text } if text == "[REDACTED]"),
+        );
+        assert!(redacted);
+    }
+
+    #[test]
+    fn check_inbound_returns_modify_when_inbound_guard_rewrites_messages() {
+        struct RedactingInbound;
+
+        impl Guard for RedactingInbound {
+            fn name(&self) -> &str {
+                "redacting-inbound"
+            }
+
+            fn check(&self, event: &mut GuardEvent, _context: &GuardContext) -> Verdict {
+                match event {
+                    GuardEvent::Inbound(messages) => {
+                        if let Some(message) = messages.first_mut() {
+                            for block in &mut message.content {
+                                if let crate::llm::MessageContent::Text { text } = block {
+                                    *text = "[REDACTED]".to_string();
+                                }
+                            }
+                        }
+                        Verdict::Allow
+                    }
+                    _ => Verdict::Allow,
+                }
+            }
+        }
+
+        let turn = Turn::new().guard(RedactingInbound);
+        let mut messages = vec![ChatMessage::user("secret token")];
+        let result = turn.check_inbound(&mut messages, None);
+
+        assert!(matches!(result, GuardResult::Modify));
+        let redacted_text = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|block| match block {
+                crate::llm::MessageContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("expected redacted text");
+        assert!(redacted_text.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn build_default_turn_places_budget_guard_first_when_enabled() {
+        let turn = build_default_turn(&test_config(Some(BudgetConfig {
+            max_tokens_per_turn: Some(100),
+            max_tokens_per_session: None,
+            max_tokens_per_day: None,
+        })));
+
+        let guard_names: Vec<_> = turn.guards.iter().map(|guard| guard.name()).collect();
+
+        assert_eq!(
+            guard_names,
+            vec![
+                "budget",
+                "secret-redactor",
+                "shell-policy",
+                "exfiltration-detector"
+            ]
+        );
     }
 
     #[test]

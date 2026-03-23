@@ -51,6 +51,8 @@ pub struct Session {
     max_context_tokens: u64,
     /// Running token count from provider metadata.
     total_tokens: u64,
+    /// Cumulative session token count including trimmed history.
+    session_total_tokens: u64,
     /// Path to the sessions directory.
     sessions_dir: PathBuf,
     /// Token totals stored per message, aligned to `messages`.
@@ -64,6 +66,7 @@ impl Session {
             messages: Vec::new(),
             max_context_tokens: 100_000,
             total_tokens: 0,
+            session_total_tokens: 0,
             sessions_dir: sessions_dir.into(),
             message_tokens: Vec::new(),
         };
@@ -269,6 +272,7 @@ impl Session {
         self.messages.push(message);
         self.message_tokens.push(token_delta);
         self.total_tokens += token_delta;
+        self.session_total_tokens += token_delta;
 
         Self::append_entry_to_file(&self.today_path(), &entry)?;
 
@@ -299,6 +303,7 @@ impl Session {
         self.messages.clear();
         self.message_tokens.clear();
         self.total_tokens = 0;
+        self.session_total_tokens = 0;
 
         for path in self.session_paths()? {
             let file = File::open(&path)
@@ -320,6 +325,7 @@ impl Session {
                     self.messages.push(message);
                     self.message_tokens.push(token_delta);
                     self.total_tokens += token_delta;
+                    self.session_total_tokens += token_delta;
                 }
             }
         }
@@ -448,11 +454,9 @@ impl Session {
             .zip(self.message_tokens.iter())
             .rev()
             .find_map(|(message, token_delta)| {
-                if message.role == ChatRole::Assistant {
-                    Some(*token_delta)
-                } else {
-                    None
-                }
+                (message.role == ChatRole::Assistant
+                    && message.principal == crate::principal::Principal::Agent)
+                    .then_some(*token_delta)
             })
             .unwrap_or(0)
     }
@@ -486,7 +490,7 @@ impl Session {
     pub fn budget_snapshot(&self) -> Result<BudgetSnapshot> {
         Ok(BudgetSnapshot {
             turn_tokens: self.latest_turn_tokens(),
-            session_tokens: self.total_tokens(),
+            session_tokens: self.session_total_tokens,
             day_tokens: self.today_token_total()?,
         })
     }
@@ -517,6 +521,13 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn assistant_message(content: &str) -> ChatMessage {
+        let mut message =
+            ChatMessage::with_role_with_principal(ChatRole::Assistant, Some(Principal::Agent));
+        message.content.push(MessageContent::text(content));
+        message
     }
 
     fn write_entries(path: &Path, entries: &[SessionEntry]) {
@@ -848,6 +859,90 @@ mod tests {
         assert_eq!(snapshot.turn_tokens, 25);
         assert_eq!(snapshot.session_tokens, 85);
         assert_eq!(snapshot.day_tokens, 25);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn budget_snapshot_keeps_session_total_after_trim_again() {
+        let dir = temp_sessions_dir("budget_snapshot_trim");
+        let mut session = Session::new(&dir).unwrap();
+        session.set_max_context_tokens(1);
+
+        session
+            .append(
+                assistant_message("first"),
+                Some(TurnMeta {
+                    input_tokens: Some(40),
+                    output_tokens: Some(10),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        session
+            .append(
+                assistant_message("second"),
+                Some(TurnMeta {
+                    input_tokens: Some(30),
+                    output_tokens: Some(5),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+
+        let snapshot = session.budget_snapshot().unwrap();
+        assert_eq!(snapshot.session_tokens, 85);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn budget_snapshot_ignores_trailing_assistant_audit_note() {
+        let dir = temp_sessions_dir("budget_snapshot_audit");
+        let mut session = Session::new(&dir).unwrap();
+
+        session
+            .append(
+                assistant_message("real turn"),
+                Some(TurnMeta {
+                    input_tokens: Some(12),
+                    output_tokens: Some(8),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let mut audit_note =
+            ChatMessage::with_role_with_principal(ChatRole::Assistant, Some(Principal::System));
+        audit_note.content.push(MessageContent::text("audit note"));
+        session.append(audit_note, None).unwrap();
+
+        let snapshot = session.budget_snapshot().unwrap();
+        assert_eq!(snapshot.turn_tokens, 20);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn budget_snapshot_uses_latest_assistant_turn_even_without_metadata() {
+        let dir = temp_sessions_dir("budget_snapshot_missing_meta");
+        let mut session = Session::new(&dir).unwrap();
+
+        session
+            .append(
+                assistant_message("real turn"),
+                Some(TurnMeta {
+                    input_tokens: Some(12),
+                    output_tokens: Some(8),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        session
+            .append(assistant_message("missing meta turn"), None)
+            .unwrap();
+
+        let snapshot = session.budget_snapshot().unwrap();
+        assert_eq!(snapshot.turn_tokens, 0);
 
         fs::remove_dir_all(&dir).unwrap();
     }
