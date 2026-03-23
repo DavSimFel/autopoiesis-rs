@@ -30,9 +30,9 @@ pub struct SessionEntry {
     /// Provider metadata (only on assistant messages).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<TurnMeta>,
-    /// Message trust level.
-    #[serde(default)]
-    pub principal: Principal,
+    /// Message trust level. Legacy entries may omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<Principal>,
     /// Tool call ID (only on tool messages).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
@@ -121,7 +121,7 @@ impl Session {
             content,
             ts: utc_timestamp(),
             meta: meta.cloned(),
-            principal: message.principal,
+            principal: Some(message.principal),
             call_id,
             tool_name,
             tool_calls: if tool_calls.is_empty() {
@@ -155,52 +155,71 @@ impl Session {
         Ok(())
     }
 
-    fn message_from_entry(entry: SessionEntry) -> (Option<ChatMessage>, u64) {
-        let token_delta = Self::token_total(entry.meta.as_ref());
+    fn replay_principal(role: &str, principal: Option<Principal>) -> Principal {
+        principal.unwrap_or(match role {
+            "user" => Principal::User,
+            "system" | "tool" => Principal::System,
+            "assistant" => Principal::Agent,
+            _ => Principal::System,
+        })
+    }
 
-        let message = match entry.role.as_str() {
+    fn message_from_entry(entry: SessionEntry) -> (Option<ChatMessage>, u64) {
+        let SessionEntry {
+            role,
+            content: entry_content,
+            ts: _,
+            meta,
+            principal,
+            call_id,
+            tool_name,
+            tool_calls,
+        } = entry;
+
+        let token_delta = Self::token_total(meta.as_ref());
+        let principal = Self::replay_principal(role.as_str(), principal);
+
+        let message = match role.as_str() {
             "system" => Some(ChatMessage::system_with_principal(
-                entry.content,
-                Some(entry.principal),
+                entry_content,
+                Some(principal),
             )),
             "user" => Some(ChatMessage::user_with_principal(
-                entry.content,
-                Some(entry.principal),
+                entry_content,
+                Some(principal),
             )),
             "assistant" => {
                 let mut content = Vec::new();
-                if !entry.content.is_empty() {
-                    content.push(MessageContent::text(entry.content));
+                if !entry_content.is_empty() {
+                    content.push(MessageContent::text(entry_content));
                 }
-                if let Some(calls) = entry.tool_calls {
+                if let Some(calls) = tool_calls {
                     for call in calls {
                         content.push(MessageContent::ToolCall { call });
                     }
                 }
                 Some({
-                    let mut message = ChatMessage::with_role_with_principal(
-                        ChatRole::Assistant,
-                        Some(entry.principal),
-                    );
+                    let mut message =
+                        ChatMessage::with_role_with_principal(ChatRole::Assistant, Some(principal));
                     message.content = content;
                     message
                 })
             }
-            "tool" => match (&entry.call_id, &entry.tool_name) {
-                (None, None) if entry.content.is_empty() => None,
+            "tool" => match (&call_id, &tool_name) {
+                (None, None) if entry_content.is_empty() => None,
                 (None, _) | (_, None) => {
                     eprintln!(
                         "warning: dropping tool entry with missing call_id or tool_name \
                              (call_id={:?}, tool_name={:?})",
-                        entry.call_id, entry.tool_name
+                        call_id, tool_name
                     );
                     None
                 }
                 (Some(call_id), Some(tool_name)) => Some(ChatMessage::tool_result_with_principal(
                     call_id.clone(),
                     tool_name.clone(),
-                    entry.content,
-                    Some(entry.principal),
+                    entry_content,
+                    Some(principal),
                 )),
             },
             _ => None,
@@ -558,6 +577,7 @@ mod tests {
         assert_eq!(entry.role, "user");
         assert!(entry.content.contains("hello"));
         assert!(!entry.ts.is_empty());
+        assert_eq!(entry.principal, Some(Principal::Operator));
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -591,6 +611,7 @@ mod tests {
         let entry: SessionEntry = serde_json::from_str(last_line).unwrap();
 
         assert_eq!(entry.role, "assistant");
+        assert_eq!(entry.principal, Some(Principal::Agent));
         let m = entry.meta.expect("assistant message should have meta");
         assert_eq!(m.model, Some("gpt-5.3".to_string()));
         assert_eq!(m.input_tokens, Some(50));
@@ -661,7 +682,7 @@ mod tests {
                 content: "yesterday".to_string(),
                 ts: "2026-03-18T00:00:00Z".to_string(),
                 meta: None,
-                principal: Principal::User,
+                principal: Some(Principal::User),
                 call_id: None,
                 tool_name: None,
                 tool_calls: None,
@@ -674,7 +695,7 @@ mod tests {
                 content: "today".to_string(),
                 ts: "2026-03-19T00:00:00Z".to_string(),
                 meta: None,
-                principal: Principal::Agent,
+                principal: Some(Principal::Agent),
                 call_id: None,
                 tool_name: None,
                 tool_calls: None,
@@ -709,6 +730,60 @@ mod tests {
         assert_eq!(session.history().len(), 2);
         assert!(matches!(session.history()[0].role, ChatRole::System));
         assert!(matches!(session.history()[1].role, ChatRole::User));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_entries_without_principal_deserialize_as_none() {
+        let entry: SessionEntry = serde_json::from_str(
+            r#"{"role":"user","content":"legacy","ts":"2026-03-19T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(entry.principal, None);
+    }
+
+    #[test]
+    fn load_today_maps_legacy_entries_to_conservative_principals() {
+        let dir = temp_sessions_dir("load_legacy_principals");
+        let path = dir.join("2026-03-19.jsonl");
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"role":"user","content":"legacy user","ts":"2026-03-19T00:00:00Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"role":"system","content":"legacy system","ts":"2026-03-19T00:00:01Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"role":"assistant","content":"legacy assistant","ts":"2026-03-19T00:00:02Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"role":"tool","content":"stdout:\nok","ts":"2026-03-19T00:00:03Z","call_id":"call-1","tool_name":"execute"}}"#
+        )
+        .unwrap();
+
+        let mut session = Session::new(&dir).unwrap();
+        session.load_today().unwrap();
+
+        let history = session.history();
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[0].principal, Principal::User);
+        assert_eq!(history[1].principal, Principal::System);
+        assert_eq!(history[2].principal, Principal::Agent);
+        assert_eq!(history[3].principal, Principal::System);
+
+        let turn = crate::turn::Turn::new();
+        let mut messages = history.to_vec();
+        let _ = turn.check_inbound(&mut messages, None);
+        assert!(turn.is_tainted());
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -816,7 +891,7 @@ mod tests {
                     output_tokens: Some(10),
                     ..Default::default()
                 }),
-                principal: Principal::Agent,
+                principal: Some(Principal::Agent),
                 call_id: None,
                 tool_name: None,
                 tool_calls: None,
@@ -830,7 +905,7 @@ mod tests {
                     content: "prompt".to_string(),
                     ts: "2026-03-19T00:00:00Z".to_string(),
                     meta: None,
-                    principal: Principal::User,
+                    principal: Some(Principal::User),
                     call_id: None,
                     tool_name: None,
                     tool_calls: None,
@@ -844,7 +919,7 @@ mod tests {
                         output_tokens: Some(5),
                         ..Default::default()
                     }),
-                    principal: Principal::Agent,
+                    principal: Some(Principal::Agent),
                     call_id: None,
                     tool_name: None,
                     tool_calls: None,
