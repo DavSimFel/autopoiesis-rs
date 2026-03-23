@@ -200,7 +200,10 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
         .ok()
         .and_then(|path| path.to_str().map(ToString::to_string))
         .unwrap_or_default();
-    let tool = crate::tool::Shell::with_max_output_bytes(config.shell_policy.max_output_bytes);
+    let tool = crate::tool::Shell::with_limits(
+        config.shell_policy.max_output_bytes,
+        config.shell_policy.max_timeout_ms,
+    );
     let tools = [tool.definition()];
     let tools_list = tools
         .iter()

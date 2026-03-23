@@ -263,6 +263,7 @@ mod tests {
                 .collect(),
             default_severity: default_severity.to_string(),
             max_output_bytes: crate::config::DEFAULT_SHELL_MAX_OUTPUT_BYTES,
+            max_timeout_ms: crate::config::DEFAULT_SHELL_MAX_TIMEOUT_MS,
         }
     }
 

@@ -78,6 +78,7 @@ pub(crate) const SHELL_OUTPUT_TRUNCATED_PREFIX: &str = "output_truncated=";
 #[derive(Debug, Clone, Copy)]
 pub struct Shell {
     max_output_bytes: usize,
+    max_timeout_ms: u64,
 }
 
 #[derive(Debug)]
@@ -101,15 +102,32 @@ struct CaptureBudget {
 
 impl Shell {
     pub fn new() -> Self {
-        Self::with_max_output_bytes(crate::config::DEFAULT_SHELL_MAX_OUTPUT_BYTES)
+        Self::with_limits(
+            crate::config::DEFAULT_SHELL_MAX_OUTPUT_BYTES,
+            crate::config::DEFAULT_SHELL_MAX_TIMEOUT_MS,
+        )
     }
 
     pub fn with_max_output_bytes(max_output_bytes: usize) -> Self {
-        Self { max_output_bytes }
+        Self::with_limits(
+            max_output_bytes,
+            crate::config::DEFAULT_SHELL_MAX_TIMEOUT_MS,
+        )
+    }
+
+    pub fn with_limits(max_output_bytes: usize, max_timeout_ms: u64) -> Self {
+        Self {
+            max_output_bytes,
+            max_timeout_ms,
+        }
     }
 
     fn parse_execute_args(raw: &str) -> Result<Value> {
         serde_json::from_str(raw).context("failed to decode tool call arguments")
+    }
+
+    fn clamp_timeout_ms(timeout_ms: u64, max_timeout_ms: u64) -> u64 {
+        timeout_ms.min(max_timeout_ms)
     }
 }
 
@@ -166,6 +184,7 @@ impl Tool for Shell {
     fn execute(&self, arguments: &str) -> ToolFuture<'_> {
         let arguments = arguments.to_string();
         let max_output_bytes = self.max_output_bytes;
+        let max_timeout_ms = self.max_timeout_ms;
         Box::pin(async move {
             let args = Self::parse_execute_args(&arguments)?;
             let command = args
@@ -176,10 +195,12 @@ impl Tool for Shell {
             if command.trim().is_empty() {
                 return Err(anyhow!("tool call requires a non-empty 'command' argument"));
             }
-            let timeout_ms = args
-                .get("timeout_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(DEFAULT_TIMEOUT_SECONDS * 1000);
+            let timeout_ms = Self::clamp_timeout_ms(
+                args.get("timeout_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(DEFAULT_TIMEOUT_SECONDS * 1000),
+                max_timeout_ms,
+            );
 
             // Keep command execution async and bounded by timeout.
             let output = Self::run_with_timeout(&command, timeout_ms, max_output_bytes)
@@ -340,7 +361,10 @@ impl Shell {
                 set_resource_limits()
             });
         }
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         let mut command = TokioCommand::from(command);
         let started_at = Instant::now();
@@ -473,6 +497,33 @@ mod tests {
             .await
             .expect_err("empty command should fail");
         assert!(error.to_string().contains("non-empty 'command' argument"));
+    }
+
+    #[test]
+    fn timeout_ms_above_ceiling_gets_clamped() {
+        assert_eq!(Shell::clamp_timeout_ms(250_000, 120_000), 120_000);
+        assert_eq!(Shell::clamp_timeout_ms(60_000, 120_000), 60_000);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_clamps_timeout_ms_above_ceiling() {
+        let tool = Shell::with_limits(1_024, 50);
+        let start = Instant::now();
+        let error = tool
+            .execute("{\"command\":\"sleep 1\",\"timeout_ms\":1000}")
+            .await
+            .expect_err("timeout above the ceiling should be clamped");
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("timed out after 50ms"))
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(TERMINATION_GRACE_MS + 500),
+            "clamped timeout should be enforced close to the configured ceiling"
+        );
     }
 
     #[cfg(unix)]

@@ -38,9 +38,14 @@ pub struct BudgetConfig {
 }
 
 pub(crate) const DEFAULT_SHELL_MAX_OUTPUT_BYTES: usize = 1_048_576;
+pub(crate) const DEFAULT_SHELL_MAX_TIMEOUT_MS: u64 = 120_000;
 
 pub(crate) const fn default_shell_max_output_bytes() -> usize {
     DEFAULT_SHELL_MAX_OUTPUT_BYTES
+}
+
+pub(crate) const fn default_shell_max_timeout_ms() -> u64 {
+    DEFAULT_SHELL_MAX_TIMEOUT_MS
 }
 
 impl Config {
@@ -138,13 +143,14 @@ mod tests {
         assert!(policy.standing_approvals.is_empty());
         assert_eq!(policy.default_severity, "medium");
         assert_eq!(policy.max_output_bytes, DEFAULT_SHELL_MAX_OUTPUT_BYTES);
+        assert_eq!(policy.max_timeout_ms, DEFAULT_SHELL_MAX_TIMEOUT_MS);
     }
 
     #[test]
     fn loads_valid_agents_toml_with_all_fields() {
         let path = temp_toml_path(
             "all_fields",
-            "[agent]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning_effort='low'\nsession_name='fix-auth'\n[auth]\noperator_key='operator-secret'\n[shell]\ndefault='allow'\nallow_patterns=['git *','cargo *']\ndeny_patterns=['rm -rf /*']\nstanding_approvals=['git push *','cargo publish *']\ndefault_severity='high'\nmax_output_bytes=2048\n",
+            "[agent]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning_effort='low'\nsession_name='fix-auth'\n[auth]\noperator_key='operator-secret'\n[shell]\ndefault='allow'\nallow_patterns=['git *','cargo *']\ndeny_patterns=['rm -rf /*']\nstanding_approvals=['git push *','cargo publish *']\ndefault_severity='high'\nmax_output_bytes=2048\nmax_timeout_ms=4096\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -169,6 +175,7 @@ mod tests {
         );
         assert_eq!(config.shell_policy.default_severity, "high");
         assert_eq!(config.shell_policy.max_output_bytes, 2048);
+        assert_eq!(config.shell_policy.max_timeout_ms, 4096);
         assert_eq!(config.budget, None);
     }
 
@@ -396,6 +403,28 @@ mod tests {
         let config = Config::load(&path).expect("expected config to load");
         assert_eq!(config.shell_policy.max_output_bytes, 8192);
     }
+
+    #[test]
+    fn shell_max_timeout_ms_defaults_to_two_minutes() {
+        let path = temp_toml_path("shell_default_timeout_ms", "[agent]\nmodel='gpt-shell'\n");
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(
+            config.shell_policy.max_timeout_ms,
+            DEFAULT_SHELL_MAX_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn shell_max_timeout_ms_override_is_honored() {
+        let path = temp_toml_path(
+            "shell_timeout_ms_override",
+            "[agent]\nmodel='gpt-shell'\n[shell]\nmax_timeout_ms=1500\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(config.shell_policy.max_timeout_ms, 1500);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -438,6 +467,9 @@ pub struct ShellPolicy {
     /// Maximum combined stdout/stderr bytes captured from a shell command.
     #[serde(default = "default_shell_max_output_bytes")]
     pub max_output_bytes: usize,
+    /// Maximum shell command runtime allowed, even if the model requests more.
+    #[serde(default = "default_shell_max_timeout_ms")]
+    pub max_timeout_ms: u64,
 }
 
 impl Default for ShellPolicy {
@@ -449,6 +481,7 @@ impl Default for ShellPolicy {
             standing_approvals: Vec::new(),
             default_severity: "medium".to_string(),
             max_output_bytes: default_shell_max_output_bytes(),
+            max_timeout_ms: default_shell_max_timeout_ms(),
         }
     }
 }
