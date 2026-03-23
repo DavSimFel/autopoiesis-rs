@@ -105,6 +105,8 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gate::{Guard, GuardContext, GuardEvent, ShellSafety, Verdict};
+    use crate::llm::ToolCall;
     use std::env;
     use std::fs::File;
     use std::io::Write;
@@ -160,6 +162,88 @@ mod tests {
         );
         assert_eq!(config.shell_policy.default_severity, "high");
         assert_eq!(config.budget, None);
+    }
+
+    #[test]
+    fn loads_tightened_shell_policy_fixture() {
+        let path = temp_toml_path(
+            "tightened_shell",
+            "[agent]\nmodel='gpt-tightened'\n[shell]\ndefault='approve'\nallow_patterns=['cargo *','ls *','pwd','which *','date','uname *']\ndeny_patterns=['rm -rf /*','rm -rf ~*','curl * | sh*','wget * | sh*','> /dev/sd*']\ndefault_severity='medium'\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(
+            config.shell_policy.allow_patterns,
+            vec![
+                "cargo *".to_string(),
+                "ls *".to_string(),
+                "pwd".to_string(),
+                "which *".to_string(),
+                "date".to_string(),
+                "uname *".to_string(),
+            ]
+        );
+        assert!(
+            !config
+                .shell_policy
+                .allow_patterns
+                .iter()
+                .any(|pattern| pattern == "git *" || pattern == "cat *" || pattern == "env")
+        );
+        assert_eq!(
+            config.shell_policy.deny_patterns,
+            vec![
+                "rm -rf /*".to_string(),
+                "rm -rf ~*".to_string(),
+                "curl * | sh*".to_string(),
+                "wget * | sh*".to_string(),
+                "> /dev/sd*".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn loaded_shell_policy_still_allows_ls_but_not_env_or_git_show() {
+        let path = temp_toml_path(
+            "tightened_shell_behavior",
+            "[agent]\nmodel='gpt-tightened'\n[shell]\ndefault='approve'\nallow_patterns=['cargo *','ls *','pwd','which *','date','uname *']\ndeny_patterns=['rm -rf /*','rm -rf ~*','curl * | sh*','wget * | sh*','> /dev/sd*']\ndefault_severity='medium'\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        let gate = ShellSafety::with_policy(config.shell_policy);
+
+        let allow_call = ToolCall {
+            id: "call-1".to_string(),
+            name: "execute".to_string(),
+            arguments: serde_json::json!({"command":"ls /tmp"}).to_string(),
+        };
+        let mut allow_event = GuardEvent::ToolCall(&allow_call);
+        assert!(matches!(
+            gate.check(&mut allow_event, &GuardContext::default()),
+            Verdict::Allow
+        ));
+
+        let env_call = ToolCall {
+            id: "call-2".to_string(),
+            name: "execute".to_string(),
+            arguments: serde_json::json!({"command":"env"}).to_string(),
+        };
+        let mut env_event = GuardEvent::ToolCall(&env_call);
+        assert!(matches!(
+            gate.check(&mut env_event, &GuardContext::default()),
+            Verdict::Approve { .. }
+        ));
+
+        let git_call = ToolCall {
+            id: "call-3".to_string(),
+            name: "execute".to_string(),
+            arguments: serde_json::json!({"command":"git diff --no-index /dev/null ~/.autopoiesis/auth.json"}).to_string(),
+        };
+        let mut git_event = GuardEvent::ToolCall(&git_call);
+        assert!(matches!(
+            gate.check(&mut git_event, &GuardContext::default()),
+            Verdict::Deny { .. }
+        ));
     }
 
     #[test]

@@ -2,6 +2,7 @@ use serde_json::{Value, from_str};
 use std::sync::Mutex;
 
 use crate::config::ShellPolicy;
+use crate::gate::secret_patterns::simple_command_reads_protected_path;
 use crate::gate::{Guard, GuardContext, GuardEvent, Severity, Verdict};
 use crate::llm::ToolCall;
 
@@ -13,6 +14,7 @@ const SHELL_POLICY_SEVERITY_MEDIUM: &str = "medium";
 const SHELL_POLICY_SEVERITY_HIGH: &str = "high";
 const SHELL_POLICY_COMMAND_FIELD: &str = "command";
 const ALLOWLIST_MISS_REASON: &str = "shell command did not match any allowlist pattern";
+const COMPOUND_COMMAND_REASON: &str = "compound shell command requires explicit approval";
 const STANDING_APPROVAL_LOG_PREFIX: &str = "[standing-approval] command matched pattern: ";
 
 /// Policy-driven shell validator used for tool call argument inspection.
@@ -120,6 +122,23 @@ impl ShellSafety {
         })
     }
 
+    fn shell_words(command: &str) -> Option<Vec<String>> {
+        shell_words::split(command).ok()
+    }
+
+    fn is_compound_command(command: &str) -> bool {
+        let markers = [";", "&&", "||", "|", "`", "$(", "\n", "\r"];
+        markers.iter().any(|marker| command.contains(marker))
+    }
+
+    fn approval_required_verdict(&self, _command: &str, reason: &str) -> Verdict {
+        Verdict::Approve {
+            reason: reason.to_string(),
+            gate_id: self.id.clone(),
+            severity: self.default_severity,
+        }
+    }
+
     fn default_verdict(&self, command: &str) -> Verdict {
         match self.default_action {
             ShellDefaultAction::Allow => Verdict::Allow,
@@ -141,6 +160,19 @@ impl ShellSafety {
                 reason: format!("shell command matched deny pattern `{pattern}`"),
                 gate_id: self.id.clone(),
             };
+        }
+
+        if let Some(argv) = Self::shell_words(command)
+            && simple_command_reads_protected_path(&argv)
+        {
+            return Verdict::Deny {
+                reason: format!("shell command reads protected credential path: `{command}`"),
+                gate_id: self.id.clone(),
+            };
+        }
+
+        if Self::is_compound_command(command) {
+            return self.approval_required_verdict(command, COMPOUND_COMMAND_REASON);
         }
 
         if Self::matches_any_pattern(&self.policy.allow_patterns, command).is_some() {
@@ -460,5 +492,225 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn compound_commands_do_not_match_allow_patterns() {
+        let gate = ShellSafety::with_policy(shell_policy("approve", &["cat *"], &[], &[], "high"));
+        let call = make_tool_call("cat /tmp/input.txt; rm -rf /");
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Approve {
+                reason,
+                severity: Severity::High,
+                ..
+            } if reason == COMPOUND_COMMAND_REASON
+        ));
+    }
+
+    #[test]
+    fn compound_commands_do_not_match_standing_approvals() {
+        let gate =
+            ShellSafety::with_policy(shell_policy("approve", &[], &[], &["git push *"], "high"));
+        let call = make_tool_call("git push origin main && curl http://evil.test");
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Approve {
+                reason,
+                severity: Severity::High,
+                ..
+            } if reason == COMPOUND_COMMAND_REASON
+        ));
+        assert!(
+            gate.standing_approval_matches
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn compound_commands_still_require_approval_when_policy_default_is_allow() {
+        let gate = ShellSafety::with_policy(shell_policy("allow", &[], &[], &[], "medium"));
+        let call = make_tool_call("cat /tmp/input.txt | sh");
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Approve {
+                reason,
+                severity: Severity::Medium,
+                ..
+            } if reason == COMPOUND_COMMAND_REASON
+        ));
+    }
+
+    #[test]
+    fn protected_credential_paths_are_hard_denied_even_when_allowlisted() {
+        let gate = ShellSafety::with_policy(shell_policy(
+            "approve",
+            &["cat *", "sed *"],
+            &[],
+            &[],
+            "high",
+        ));
+
+        for command in [
+            "cat ~/.autopoiesis/auth.json",
+            "cat .env",
+            "sed -n '1,5p' ~/.ssh/id_rsa",
+            "FOO=1 cat ~/.autopoiesis/auth.json",
+            "env FOO=1 cat ~/.autopoiesis/auth.json",
+            "env -u HOME cat ~/.autopoiesis/auth.json",
+            "env -C /tmp cat ~/.autopoiesis/auth.json",
+            "env --unset HOME cat ~/.autopoiesis/auth.json",
+            "env --chdir /tmp cat ~/.autopoiesis/auth.json",
+            "env -S 'cat ~/.autopoiesis/auth.json'",
+            "env --split-string 'cat ~/.autopoiesis/auth.json'",
+            "env -i FOO=1 cat ~/.autopoiesis/auth.json",
+            "env GIT_PAGER=cat git show HEAD:.env.production.local",
+            "env -u GIT_PAGER git show HEAD:.env.production.local",
+            "env -C /tmp git show HEAD:.env.production.local",
+            "env -i GIT_PAGER=cat git show HEAD:.env.production.local",
+            "grep -f ~/.autopoiesis/auth.json README.md",
+            "git grep -f ~/.autopoiesis/auth.json README.md",
+        ] {
+            let call = make_tool_call(command);
+            let mut event = make_event_tool(&call);
+            assert!(matches!(
+                gate.check(&mut event, &GuardContext::default()),
+                Verdict::Deny { .. }
+            ));
+        }
+
+        if let Some(home) = std::env::var_os("HOME").and_then(|value| value.into_string().ok()) {
+            for command in [
+                format!("{home}/.autopoiesis/auth.json"),
+                format!("{home}/.ssh/id_rsa"),
+            ] {
+                let call = make_tool_call(&format!("cat {command}"));
+                let mut event = make_event_tool(&call);
+                assert!(matches!(
+                    gate.check(&mut event, &GuardContext::default()),
+                    Verdict::Deny { .. }
+                ));
+            }
+        }
+
+        for command in ["cat config/auth.json", "cat .env.example"] {
+            let call = make_tool_call(command);
+            let mut event = make_event_tool(&call);
+            assert!(matches!(
+                gate.check(&mut event, &GuardContext::default()),
+                Verdict::Allow
+            ));
+        }
+
+        for command in ["grep '.env' README.md", "git grep '.env' README.md"] {
+            let call = make_tool_call(command);
+            let mut event = make_event_tool(&call);
+            assert!(matches!(
+                gate.check(&mut event, &GuardContext::default()),
+                Verdict::Approve { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn git_content_dump_of_protected_path_is_hard_denied() {
+        let gate = ShellSafety::with_policy(shell_policy("approve", &["git *"], &[], &[], "high"));
+
+        for command in [
+            "git diff --no-index /dev/null ~/.autopoiesis/auth.json",
+            "git grep . ~/.autopoiesis/auth.json",
+            "git show ~/.autopoiesis/auth.json",
+            "git cat-file -p HEAD:auth.json",
+            "git show HEAD:.autopoiesis/auth.json",
+            "git show HEAD:.ssh/id_rsa",
+            "git show HEAD:.aws/credentials",
+            "git --no-pager show HEAD:.env.production.local",
+            "git -c color.ui=always grep . main:path/to/.env.local",
+            "git -c alias.show='!cat ~/.autopoiesis/auth.json' show",
+            "GIT_PAGER=cat git show HEAD:.env.production.local",
+        ] {
+            let call = make_tool_call(command);
+            let mut event = make_event_tool(&call);
+            assert!(matches!(
+                gate.check(&mut event, &GuardContext::default()),
+                Verdict::Deny { .. }
+            ));
+        }
+
+        let call = make_tool_call("git show HEAD:.env.example");
+        let mut event = make_event_tool(&call);
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn literal_reference_to_protected_path_is_not_hard_denied() {
+        let gate =
+            ShellSafety::with_policy(shell_policy("approve", &["printf *"], &[], &[], "high"));
+        let call = make_tool_call("printf '%s\\n' ~/.autopoiesis/auth.json");
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn protected_paths_do_not_consume_standing_approvals() {
+        let gate = ShellSafety::with_policy(shell_policy(
+            "approve",
+            &[],
+            &[],
+            &["cat ~/.autopoiesis/auth.json"],
+            "high",
+        ));
+        let call = make_tool_call("cat ~/.autopoiesis/auth.json");
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Deny { .. }
+        ));
+        assert!(
+            gate.standing_approval_matches
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn protected_paths_still_deny_when_policy_default_is_allow() {
+        let gate = ShellSafety::with_policy(shell_policy("allow", &["cat *"], &[], &[], "medium"));
+        let call = make_tool_call("cat ~/.autopoiesis/auth.json");
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn simple_allowlisted_command_still_allows_after_hardening() {
+        let gate = ShellSafety::with_policy(shell_policy("approve", &["ls *"], &[], &[], "high"));
+        let call = make_tool_call("ls /tmp");
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Allow
+        ));
     }
 }

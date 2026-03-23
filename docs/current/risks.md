@@ -5,23 +5,11 @@
 
 ## P0 — Critical
 
-### P0-4: Shell allowlist bypass via metacharacters
-- Allow/deny/standing-approval matching is raw whole-command globbing. Patterns like `cat *`, `git *` match shell metacharacter chains. `cat foo; rm -rf /` matches `cat *`. Any "safe" prefix can smuggle arbitrary follow-on commands.
-- **Files:** `src/gate/shell_safety.rs` (pattern matching), `agents.toml` (shipped patterns)
-
-### P0-5: Auth.json exposed via allowlisted commands
-- `~/.autopoiesis/auth.json` contains OAuth credentials (access_token, refresh_token, id_token). The secret redactor only knows `sk-`, `ghp_`, `AKIA` patterns. With `cat *` in the allowlist, `cat ~/.autopoiesis/auth.json` is auto-approved and raw tokens are persisted in session history.
-- **Files:** `src/auth.rs`, `src/gate/secret_patterns.rs`, `agents.toml`
-
 ## P1 — High
 
 ### P1-7: Taint permanently on after first assistant reply
 - Taint is computed from `!message.principal.is_trusted()` across all history. Since assistant replies are stored as `Principal::Agent`, any multi-turn session becomes permanently tainted after the first assistant response. This disables standing approvals for every later turn, making them effectively dead.
 - **Files:** `src/turn.rs` (check_inbound taint computation), `src/principal.rs`
-
-### P1-8: Denied tool calls persisted without matching tool_result
-- Assistant `tool_call`s are persisted before approval completes. When denied, session keeps the tool_call without any tool_result. Replaying this to the provider breaks the round-trip invariant.
-- **Files:** `src/agent.rs` (tool call persistence), `src/session.rs`
 
 ### P1-9: Session.append not atomic (memory before disk)
 - `Session::append` mutates in-memory history and token counters before writing to disk. If `append_entry_to_file` fails, memory and JSONL are out of sync.
@@ -68,6 +56,14 @@
 - Shell default flipped to approve-unless-whitelisted. `ShellSafety::with_policy()` reads `[shell]` config from `agents.toml` with explicit allow/deny patterns and configurable default severity.
 - **Note:** guard pipeline is still heuristic, not a security boundary. Real sandboxing (seccomp/landlock) remains later milestone (roadmap 3d).
 
+### ~~P0-4: Shell allowlist bypass via metacharacters~~ (2026-03-23)
+- Fixed by checking compound commands before allowlist/standing approvals and requiring explicit approval for metacharacter chains such as `;`, `&&`, `||`, `|`, backticks, `$(`, and line breaks.
+- **Residual:** quoted metacharacters still fail closed to approval; that is intentional and may require manual confirmation in some cases.
+
+### ~~P0-5: Auth.json exposed via allowlisted commands~~ (2026-03-23)
+- Fixed by hard-denying direct reads of protected credential paths, deduplicating the shared path catalog, and removing the shipped broad auto-allow entries that made reads trivial.
+- **Residual:** copied credential blobs remain a separate hardening area outside this patch set.
+
 ### ~~P0-2: HTTP callers can inject arbitrary message roles~~ (b03843b)
 - `Principal` enum enforces role based on auth key.
 
@@ -79,3 +75,6 @@
 
 ### ~~P1-3: Provider-controlled call_id is unsanitized~~ (8e743c3)
 - `call_id` sanitized before filesystem paths.
+
+### ~~P1-8: Denied tool calls persisted without matching tool_result~~ (2026-03-23)
+- Fixed by delaying assistant `tool_call` persistence until all approval and deny checks complete, and by persisting only sanitized assistant text on denied mixed-content turns.
