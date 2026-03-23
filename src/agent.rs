@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, from_str};
 
 use crate::gate::{GuardContext, Severity, Verdict};
-use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall};
+use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall, TurnMeta};
 use crate::principal::Principal;
 use crate::session::Session;
 use crate::store::{QueuedMessage, Store};
@@ -68,6 +68,26 @@ fn append_audit_note(session: &mut Session, note: String) -> Result<()> {
     );
     message.content.push(MessageContent::text(note));
     session.append(message, None)
+}
+
+fn persist_denied_assistant_text(
+    session: &mut Session,
+    turn: &Turn,
+    mut assistant_message: ChatMessage,
+    meta: Option<TurnMeta>,
+) -> Result<()> {
+    crate::gate::guard_message_output(turn, &mut assistant_message);
+    assistant_message
+        .content
+        .retain(|block| matches!(block, MessageContent::Text { .. }));
+
+    if assistant_message.content.is_empty() {
+        assistant_message.content.push(MessageContent::Text {
+            text: String::new(),
+        });
+    }
+
+    session.append(assistant_message, meta)
 }
 
 fn append_approval_denied(session: &mut Session, gate_id: &str) -> Result<()> {
@@ -313,13 +333,17 @@ where
         match turn_reply.stop_reason {
             StopReason::ToolCalls => {
                 let tool_calls = turn_reply.tool_calls.clone();
-                session.append(turn_reply.assistant_message, turn_meta)?;
-
                 for call in &tool_calls {
                     match turn.check_tool_call(call) {
                         Verdict::Allow => {}
                         Verdict::Modify => {}
                         Verdict::Deny { reason, gate_id } => {
+                            persist_denied_assistant_text(
+                                session,
+                                turn,
+                                turn_reply.assistant_message,
+                                turn_meta,
+                            )?;
                             append_hard_deny(session, &gate_id)?;
                             break 'agent_turn Some(make_denial_verdict(
                                 &mut denial_count,
@@ -337,6 +361,12 @@ where
                             let approved =
                                 approval_handler.request_approval(&severity, &reason, &command);
                             if !approved {
+                                persist_denied_assistant_text(
+                                    session,
+                                    turn,
+                                    turn_reply.assistant_message,
+                                    turn_meta,
+                                )?;
                                 append_approval_denied(session, &gate_id)?;
                                 break 'agent_turn Some(make_denial_verdict(
                                     &mut denial_count,
@@ -353,6 +383,12 @@ where
                     Verdict::Allow => {}
                     Verdict::Modify => {}
                     Verdict::Deny { reason, gate_id } => {
+                        persist_denied_assistant_text(
+                            session,
+                            turn,
+                            turn_reply.assistant_message,
+                            turn_meta,
+                        )?;
                         append_hard_deny(session, &gate_id)?;
                         break 'agent_turn Some(make_denial_verdict(
                             &mut denial_count,
@@ -370,6 +406,12 @@ where
                             .and_then(command_from_tool_call)
                             .unwrap_or_else(|| "<command unavailable>".to_string());
                         if !approval_handler.request_approval(&severity, &reason, &command) {
+                            persist_denied_assistant_text(
+                                session,
+                                turn,
+                                turn_reply.assistant_message,
+                                turn_meta,
+                            )?;
                             append_approval_denied(session, &gate_id)?;
                             break 'agent_turn Some(make_denial_verdict(
                                 &mut denial_count,
@@ -380,6 +422,9 @@ where
                         had_user_approval = true;
                     }
                 }
+
+                crate::gate::guard_message_output(turn, &mut turn_reply.assistant_message);
+                session.append(turn_reply.assistant_message, turn_meta)?;
 
                 for call in &tool_calls {
                     let result = match turn.execute_tool(&call.name, &call.arguments).await {
@@ -514,7 +559,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::context::History;
-    use crate::gate::{Guard, GuardEvent, SecretRedactor};
+    use crate::gate::{Guard, GuardEvent, SecretRedactor, ShellSafety};
     use crate::llm::{FunctionTool, StreamedTurn};
     use crate::principal::Principal;
     use crate::store::Store;
@@ -661,6 +706,56 @@ mod tests {
         }
     }
 
+    struct RecordingTool {
+        executions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        output: String,
+    }
+
+    impl RecordingTool {
+        fn new(
+            output: impl Into<String>,
+        ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+            let executions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    executions: executions.clone(),
+                    output: output.into(),
+                },
+                executions,
+            )
+        }
+    }
+
+    impl Tool for RecordingTool {
+        fn name(&self) -> &str {
+            "execute"
+        }
+
+        fn definition(&self) -> FunctionTool {
+            FunctionTool {
+                name: "execute".to_string(),
+                description: "Record execution attempts".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                        },
+                    },
+                    "required": ["command"],
+                    "additionalProperties": false,
+                }),
+            }
+        }
+
+        fn execute(&self, _arguments: &str) -> ToolFuture<'_> {
+            self.executions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let output = self.output.clone();
+            Box::pin(async move { Ok(output) })
+        }
+    }
+
     fn temp_sessions_dir(prefix: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "aprs_agent_test_{prefix}_{}",
@@ -690,6 +785,60 @@ mod tests {
             MessageContent::Text { text } => Some(text.as_str()),
             _ => None,
         })
+    }
+
+    fn shell_policy(
+        default: &str,
+        allow_patterns: &[&str],
+        deny_patterns: &[&str],
+        standing_approvals: &[&str],
+        default_severity: &str,
+    ) -> crate::config::ShellPolicy {
+        crate::config::ShellPolicy {
+            default: default.to_string(),
+            allow_patterns: allow_patterns
+                .iter()
+                .map(|pattern| pattern.to_string())
+                .collect(),
+            deny_patterns: deny_patterns
+                .iter()
+                .map(|pattern| pattern.to_string())
+                .collect(),
+            standing_approvals: standing_approvals
+                .iter()
+                .map(|pattern| pattern.to_string())
+                .collect(),
+            default_severity: default_severity.to_string(),
+        }
+    }
+
+    fn streamed_turn_with_tool_call(
+        text: Option<&str>,
+        command: &str,
+        call_id: &str,
+    ) -> StreamedTurn {
+        let mut content = Vec::new();
+        if let Some(text) = text {
+            content.push(MessageContent::text(text));
+        }
+
+        let call = ToolCall {
+            id: call_id.to_string(),
+            name: "execute".to_string(),
+            arguments: serde_json::json!({ "command": command }).to_string(),
+        };
+        content.push(MessageContent::ToolCall { call: call.clone() });
+
+        StreamedTurn {
+            assistant_message: ChatMessage {
+                role: crate::llm::ChatRole::Assistant,
+                principal: Principal::Agent,
+                content,
+            },
+            tool_calls: vec![call],
+            meta: None,
+            stop_reason: StopReason::ToolCalls,
+        }
     }
 
     #[tokio::test]
@@ -1050,6 +1199,13 @@ mod tests {
 
         let stored = session.history();
         assert_eq!(stored.len(), 3);
+        assert_eq!(stored[1].role, crate::llm::ChatRole::Assistant);
+        assert_eq!(stored[1].principal, Principal::Agent);
+        let text = match &stored[1].content[0] {
+            MessageContent::Text { text } => text,
+            _ => panic!("expected text audit note"),
+        };
+        assert!(text.is_empty());
         assert_eq!(stored[2].role, crate::llm::ChatRole::Assistant);
         assert_eq!(stored[2].principal, Principal::System);
         let note = match &stored[2].content[0] {
@@ -1322,6 +1478,13 @@ mod tests {
 
         let stored = session.history();
         assert_eq!(stored.len(), 3);
+        assert_eq!(stored[1].role, crate::llm::ChatRole::Assistant);
+        assert_eq!(stored[1].principal, Principal::Agent);
+        let text = match &stored[1].content[0] {
+            MessageContent::Text { text } => text,
+            _ => panic!("expected text audit note"),
+        };
+        assert!(text.is_empty());
         assert_eq!(stored[2].role, crate::llm::ChatRole::Assistant);
         assert_eq!(stored[2].principal, Principal::System);
         let note = match &stored[2].content[0] {
@@ -1330,6 +1493,368 @@ mod tests {
         };
         assert_eq!(note, "Tool execution hard-denied by hard-deny");
         assert!(!note.contains("hard deny marker"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn denied_tool_calls_are_not_persisted_without_tool_results() {
+        let dir = temp_sessions_dir("denied_tool_calls");
+        let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
+            None, "ls /tmp", "call-1",
+        )]);
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let (tool, executions) = RecordingTool::new("marker-output");
+        let turn = Turn::new().tool(tool).guard(ShellSafety::new());
+        let mut make_provider = {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| false;
+
+        let verdict = run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "deny tool call".to_string(),
+            Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            verdict,
+            TurnVerdict::Denied { reason, gate_id }
+                if reason == "shell command `ls /tmp` did not match any allowlist pattern"
+                    && gate_id == "shell-policy"
+        ));
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let stored = session.history();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[0].role, crate::llm::ChatRole::User);
+        assert_eq!(stored[1].role, crate::llm::ChatRole::Assistant);
+        assert_eq!(stored[1].principal, Principal::Agent);
+        let text = match &stored[1].content[0] {
+            MessageContent::Text { text } => text,
+            _ => panic!("expected text audit note"),
+        };
+        assert!(text.is_empty());
+        assert_eq!(stored[2].role, crate::llm::ChatRole::Assistant);
+        assert_eq!(stored[2].principal, Principal::System);
+        assert!(
+            stored[2]
+                .content
+                .iter()
+                .all(|block| !matches!(block, MessageContent::ToolCall { .. }))
+        );
+        assert!(
+            !std::fs::read_to_string(session.today_path())
+                .unwrap()
+                .contains("marker-output")
+        );
+        assert!(!session.sessions_dir().join("results").exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn denied_tool_calls_reload_with_placeholder_and_audit_note() {
+        let dir = temp_sessions_dir("denied_tool_calls_reload");
+        let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
+            None, "ls /tmp", "call-1",
+        )]);
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let (tool, _executions) = RecordingTool::new("marker-output");
+        let turn = Turn::new().tool(tool).guard(ShellSafety::new());
+        let mut make_provider = {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| false;
+
+        let verdict = run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "deny tool call".to_string(),
+            Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(verdict, TurnVerdict::Denied { .. }));
+
+        let mut reloaded = crate::session::Session::new(&dir).unwrap();
+        reloaded.load_today().unwrap();
+        let stored = reloaded.history();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[1].role, crate::llm::ChatRole::Assistant);
+        assert_eq!(stored[1].principal, Principal::Agent);
+        assert_eq!(stored[2].role, crate::llm::ChatRole::Assistant);
+        assert_eq!(stored[2].principal, Principal::System);
+        assert!(
+            stored[2]
+                .content
+                .iter()
+                .all(|block| !matches!(block, MessageContent::ToolCall { .. }))
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn denied_mixed_content_assistant_message_keeps_text_but_drops_tool_calls() {
+        let dir = temp_sessions_dir("denied_mixed_content");
+        let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
+            Some("safe assistant text"),
+            "ls /tmp",
+            "call-1",
+        )]);
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let turn = Turn::new().guard(ShellSafety::new());
+        let mut make_provider = {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| false;
+
+        let verdict = run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "deny mixed content".to_string(),
+            Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            verdict,
+            TurnVerdict::Denied { reason, gate_id }
+                if reason == "shell command `ls /tmp` did not match any allowlist pattern"
+                    && gate_id == "shell-policy"
+        ));
+
+        let stored = session.history();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[1].role, crate::llm::ChatRole::Assistant);
+        assert_eq!(stored[1].principal, Principal::Agent);
+        let text = message_text(&stored[1]).expect("expected persisted assistant text");
+        assert_eq!(text, "safe assistant text");
+        assert!(
+            stored[1]
+                .content
+                .iter()
+                .all(|block| !matches!(block, MessageContent::ToolCall { .. }))
+        );
+        assert_eq!(stored[2].role, crate::llm::ChatRole::Assistant);
+        assert_eq!(stored[2].principal, Principal::System);
+        let note = message_text(&stored[2]).expect("expected audit note");
+        assert_eq!(
+            note,
+            "Tool execution rejected after approval by shell-policy"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn protected_path_denial_writes_no_raw_tool_output_to_jsonl_or_results_dir() {
+        let dir = temp_sessions_dir("protected_path_no_output");
+        let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
+            None,
+            "cat ~/.autopoiesis/auth.json",
+            "call-1",
+        )]);
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let (tool, executions) = RecordingTool::new("marker-output-raw");
+        let turn = Turn::new()
+            .tool(tool)
+            .guard(ShellSafety::with_policy(shell_policy(
+                "approve",
+                &["cat *"],
+                &[],
+                &[],
+                "medium",
+            )));
+        let mut make_provider = {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        let verdict = run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "read protected path".to_string(),
+            Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            verdict,
+            TurnVerdict::Denied { reason, gate_id }
+                if reason.contains("reads protected credential path")
+                    && gate_id == "shell-policy"
+        ));
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let session_file = std::fs::read_to_string(session.today_path()).unwrap();
+        assert!(!session_file.contains("marker-output-raw"));
+        assert!(!session.sessions_dir().join("results").exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn protected_path_denial_persists_only_safe_audit_material() {
+        let dir = temp_sessions_dir("protected_path_audit");
+        let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
+            Some("safe protected-path assistant text"),
+            "cat ~/.autopoiesis/auth.json",
+            "call-1",
+        )]);
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let turn = Turn::new().guard(ShellSafety::with_policy(shell_policy(
+            "approve",
+            &["cat *"],
+            &[],
+            &[],
+            "medium",
+        )));
+        let mut make_provider = {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        let verdict = run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "read protected material".to_string(),
+            Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            verdict,
+            TurnVerdict::Denied { reason, gate_id }
+                if reason.contains("reads protected credential path")
+                    && gate_id == "shell-policy"
+        ));
+
+        let stored = session.history();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[1].role, crate::llm::ChatRole::Assistant);
+        assert_eq!(stored[1].principal, Principal::Agent);
+        let text = message_text(&stored[1]).expect("expected persisted assistant text");
+        assert_eq!(text, "safe protected-path assistant text");
+        assert!(
+            stored[1]
+                .content
+                .iter()
+                .all(|block| !matches!(block, MessageContent::ToolCall { .. }))
+        );
+        assert_eq!(stored[2].role, crate::llm::ChatRole::Assistant);
+        assert_eq!(stored[2].principal, Principal::System);
+        let note = message_text(&stored[2]).expect("expected audit note");
+        assert_eq!(note, "Tool execution hard-denied by shell-policy");
+        assert!(!note.contains("auth.json"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn metacharacter_smuggling_under_allowlisted_prefix_requires_approval() {
+        let dir = temp_sessions_dir("metacharacter_smuggling");
+        let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
+            None,
+            "cat /tmp/input.txt; echo smuggled",
+            "call-1",
+        )]);
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        let (tool, executions) = RecordingTool::new("marker-output-smuggled");
+        let turn = Turn::new()
+            .tool(tool)
+            .guard(ShellSafety::with_policy(shell_policy(
+                "approve",
+                &["cat *"],
+                &[],
+                &[],
+                "medium",
+            )));
+        let mut make_provider = {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let approval_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let approval_count_seen = approval_count.clone();
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = move |_severity: &Severity, _reason: &str, _command: &str| {
+            approval_count_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        };
+
+        let verdict = run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "smuggle metacharacter".to_string(),
+            Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            verdict,
+            TurnVerdict::Denied { reason, gate_id }
+                if reason == "compound shell command requires explicit approval"
+                    && gate_id == "shell-policy"
+        ));
+        assert_eq!(approval_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(session.history().len(), 3);
+        assert!(!session.sessions_dir().join("results").exists());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

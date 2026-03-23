@@ -4,6 +4,6 @@ reasoning_effort = "xhigh"
 
 [shell]
 default = "approve"
-allow_patterns = ["cargo *", "git *", "cat *", "ls *", "grep *", "head *", "tail *", "sed *", "awk *", "wc *", "find *", "echo *", "pwd", "which *", "env", "date", "uname *"]
+allow_patterns = ["cargo *", "ls *", "pwd", "which *", "date", "uname *"]
 deny_patterns = ["rm -rf /*", "rm -rf ~*", "curl * | sh*", "wget * | sh*", "> /dev/sd*"]
 default_severity = "medium"

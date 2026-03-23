@@ -979,4 +979,38 @@ mod tests {
         assert_eq!(input[2]["call_id"], "call-1");
         assert_eq!(input[2]["output"], "{\"stdout\":\"ok\"}");
     }
+
+    #[test]
+    fn build_input_handles_denied_tool_call_placeholder_roundtrip() {
+        let messages = vec![
+            ChatMessage::user("deny tool call"),
+            ChatMessage {
+                role: ChatRole::Assistant,
+                principal: Principal::Agent,
+                content: vec![MessageContent::Text {
+                    text: String::new(),
+                }],
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                principal: Principal::System,
+                content: vec![MessageContent::text(
+                    "Tool execution rejected after approval by shell-policy",
+                )],
+            },
+        ];
+
+        let (instructions, input) = OpenAIProvider::build_input(&messages);
+        assert_eq!(instructions, None);
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "deny tool call");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[1]["content"], "");
+        assert_eq!(input[2]["role"], "assistant");
+        assert_eq!(
+            input[2]["content"],
+            "Tool execution rejected after approval by shell-policy"
+        );
+    }
 }
