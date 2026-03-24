@@ -76,7 +76,7 @@ Verdict precedence: Deny > Approve > Allow. `resolve_verdict()` in turn.rs.
 Guards check inbound messages, tool calls, and outbound text.
 ShellSafety uses a configurable policy (`[shell]` in agents.toml) with allow/deny patterns, standing approvals (skipped when tainted), and a default action.
 `GuardContext` carries `tainted: bool` + `BudgetSnapshot`. Taint is set when any message in history has a `User` or `System` principal (via `Principal::is_taint_source()`). Agent-authored messages do not taint.
-**Note:** these are heuristics, not a security boundary. See [risks.md](risks.md).
+**Note:** these are heuristics, not a security boundary. See [../risks.md](../risks.md).
 
 ### Shell output cap
 Every shell result is saved to `sessions/{id}/results/call_<sanitized_call_id>.txt` (call_id is sanitized for filesystem safety).
