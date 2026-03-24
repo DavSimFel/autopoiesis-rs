@@ -1,3 +1,4 @@
+// Utility helpers — timestamps and miscellaneous functions.
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Return a UTC timestamp in `YYYY-MM-DDTHH:MM:SSZ` format.

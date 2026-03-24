@@ -5,7 +5,7 @@
 
 ## Overview
 
-27 source files, ~14.3K lines, 230 tests (229 run, 1 ignored). One binary: CLI (REPL or one-shot) + HTTP/WS server. One tool: shell. CLI also exposes `sub add/remove/list` for subscription management. Run `cargo test` for current count.
+27 source files, ~14.3K lines, 231 tests (230 run, 1 ignored).
 
 ## Module map
 
@@ -38,7 +38,7 @@ identity.rs (165L)          Loads identity/*.md, concatenates in order
 principal.rs (92L)          Principal enum (Operator/User/System/Agent), trust/taint source mapping
 cli.rs (116L)               CLI display helpers, denial formatting
 template.rs (86L)           {{var}} placeholder resolution
-util.rs (95L)               utc_timestamp(), helpers
+util.rs (96L)               utc_timestamp(), helpers
 lib.rs (19L)                Module re-exports
 ```
 
