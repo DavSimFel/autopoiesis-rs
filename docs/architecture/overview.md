@@ -33,8 +33,8 @@ turn.rs (723L)              Turn composition: ContextSource + Tool + Guard build
 tool.rs (665L)              Shell tool: async exec, RLIMIT, process-group kill, bounded output drain
 store.rs (715L)             SQLite session registry + message queue + subscriptions table
 auth.rs (401L)              OAuth device flow, token storage/refresh
-config.rs (552L)            agents.toml loading, ShellPolicy, BudgetConfig, protected path config
-identity.rs (165L)          Loads identity/*.md, concatenates in order
+config.rs                    agents.toml loading, ShellPolicy, BudgetConfig, resolved identity file lists
+identity.rs                  Loads explicit identity file lists and template helpers
 principal.rs (92L)          Principal enum (Operator/User/System/Agent), trust/taint source mapping
 cli.rs (116L)               CLI display helpers, denial formatting
 template.rs (86L)           {{var}} placeholder resolution
@@ -101,12 +101,12 @@ Agent subscribes to files via CLI (`sub add <path>`). SQLite `subscriptions` tab
 ### Auth and principals
 Server authenticates via API key header. Two keys: operator key (full role control) and user key (always enqueues as `user`). `Principal` enum in `principal.rs`: Operator (trusted), User, System, Agent (all tainted). Taint propagates through `GuardContext` — standing approvals are skipped when tainted.
 
-### Identity system (v1 — current)
-Three files concatenated into the system prompt:
-1. `identity/constitution.md` — laws of thought (intended immutable, not yet enforced)
-2. `identity/identity.md` — name, voice, working style, coding conventions
-3. `identity/context.md` — model/cwd/tools template vars, workspace layout
+### Identity system (v2 — current)
+Runtime identity is assembled from explicit file lists:
+1. `identity-templates/constitution.md` — global laws of thought
+2. `identity-templates/agents/silas/agent.md` — T1 voice, worldview, defaults, edges
+3. `identity-templates/context.md` — model/cwd/tools template vars, workspace layout
 
-Template variables resolved at runtime: `{{model}}`, `{{cwd}}`, `{{tools}}`.
+T1 loads constitution + agent + context. T2/T3 load constitution + context only. Selected domain packs append to the identity file list when configured. Template variables resolved at runtime: `{{model}}`, `{{cwd}}`, `{{tools}}`.
 
-> **v2 is designed but not built.** See [../specs/identity-v2.md](../specs/identity-v2.md) for the 3-layer stack (constitution + agent.md + context.md) with per-tier loading and `identity-templates/`.
+See [../specs/identity-v2.md](../specs/identity-v2.md) for the current stack and config shape.

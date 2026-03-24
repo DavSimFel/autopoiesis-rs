@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use crate::identity;
 use crate::llm::{ChatMessage, ChatRole, MessageContent};
@@ -12,16 +13,20 @@ pub trait ContextSource: Send + Sync {
 
 /// Identity context loaded from markdown files.
 pub struct Identity {
-    identity_dir: String,
+    identity_files: Vec<PathBuf>,
     vars: HashMap<String, String>,
     fallback_prompt: String,
     strict: bool,
 }
 
 impl Identity {
-    pub fn new(identity_dir: &str, vars: HashMap<String, String>, fallback: &str) -> Self {
+    pub fn new(
+        identity_files: Vec<PathBuf>,
+        vars: HashMap<String, String>,
+        fallback: &str,
+    ) -> Self {
         Self {
-            identity_dir: identity_dir.to_string(),
+            identity_files,
             vars,
             fallback_prompt: fallback.to_string(),
             strict: false,
@@ -34,18 +39,18 @@ impl Identity {
     }
 
     fn load_prompt(&self) -> String {
-        match identity::load_system_prompt(&self.identity_dir, &self.vars) {
+        match identity::load_system_prompt_from_files(&self.identity_files, &self.vars) {
             Ok(prompt) => prompt,
             Err(error) if self.strict => {
                 panic!(
-                    "failed to load identity prompt from {}: {error}",
-                    self.identity_dir
+                    "failed to load identity prompt from {:?}: {error}",
+                    self.identity_files
                 )
             }
             Err(error) => {
                 warn!(
-                    "warning: failed to load identity prompt from {}: {error}; using fallback prompt",
-                    self.identity_dir
+                    "warning: failed to load identity prompt from {:?}: {error}; using fallback prompt",
+                    self.identity_files
                 );
                 self.fallback_prompt.clone()
             }
@@ -200,7 +205,11 @@ mod tests {
 
     fn make_identity_files(dir: &TempIdentityDir, files: &[(&str, &str)]) {
         for (name, contents) in files {
-            fs::write(dir.path().join(name), contents).expect("failed to write identity file");
+            let path = dir.path().join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("failed to create identity file parent");
+            }
+            fs::write(path, contents).expect("failed to write identity file");
         }
     }
 
@@ -211,7 +220,7 @@ mod tests {
             &dir,
             &[
                 ("constitution.md", "constitution"),
-                ("identity.md", "identity"),
+                ("agents/silas/agent.md", "identity"),
                 ("context.md", "context"),
             ],
         );
@@ -219,7 +228,7 @@ mod tests {
         let mut vars = HashMap::new();
         vars.insert("model".to_string(), "gpt-5.4".to_string());
         let source = Identity::new(
-            dir.path().to_str().expect("temp path should be utf-8"),
+            identity::t1_identity_files(dir.path(), "silas"),
             vars,
             "fallback",
         );
@@ -237,7 +246,11 @@ mod tests {
     fn identity_uses_fallback_on_missing_dir() {
         let mut vars = HashMap::new();
         vars.insert("model".to_string(), "gpt-5.4".to_string());
-        let source = Identity::new("/does/not/exist", vars, "fallback prompt");
+        let source = Identity::new(
+            identity::t1_identity_files("/does/not/exist", "silas"),
+            vars,
+            "fallback prompt",
+        );
         let mut messages = vec![ChatMessage::system("old prompt")];
         source.assemble(&mut messages);
 
@@ -251,7 +264,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "failed to load identity prompt")]
     fn identity_strict_mode_panics_on_missing_dir() {
-        let source = Identity::new("/does/not/exist", HashMap::new(), "fallback prompt").strict();
+        let source = Identity::new(
+            identity::t1_identity_files("/does/not/exist", "silas"),
+            HashMap::new(),
+            "fallback prompt",
+        )
+        .strict();
         let mut messages = vec![ChatMessage::system("old prompt")];
         source.assemble(&mut messages);
     }
@@ -263,7 +281,7 @@ mod tests {
             &dir,
             &[
                 ("constitution.md", "model: {{model}}"),
-                ("identity.md", "cwd: {{cwd}}"),
+                ("agents/silas/agent.md", "cwd: {{cwd}}"),
                 ("context.md", "tool: {{tool}}"),
             ],
         );
@@ -273,7 +291,7 @@ mod tests {
         vars.insert("cwd".to_string(), "/tmp/proj".to_string());
         vars.insert("tool".to_string(), "execute".to_string());
         let source = Identity::new(
-            dir.path().to_str().expect("temp path should be utf-8"),
+            identity::t1_identity_files(dir.path(), "silas"),
             vars,
             "fallback",
         );

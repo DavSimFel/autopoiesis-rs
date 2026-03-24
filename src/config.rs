@@ -1,9 +1,12 @@
 //! Configuration loading for runtime defaults and optional `agents.toml` overrides.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
+
+use crate::identity;
 
 /// Runtime configuration loaded by the CLI when starting agent mode.
 #[derive(Debug, Clone)]
@@ -26,6 +29,16 @@ pub struct Config {
     pub budget: Option<BudgetConfig>,
     /// Queue recovery settings loaded from the optional `[queue]` table.
     pub queue: QueueConfig,
+    /// Resolved identity prompt files used to assemble the system prompt.
+    pub identity_files: Vec<PathBuf>,
+    /// Parsed `[agents]` catalog, if present.
+    pub agents: AgentsConfig,
+    /// Parsed `[models]` catalog and routes.
+    pub models: ModelsConfig,
+    /// Parsed `[domains]` packs.
+    pub domains: DomainsConfig,
+    /// Selected named brain, if v2 config is active.
+    pub active_agent: Option<String>,
 }
 
 /// Optional budget ceilings loaded from `[budget]` in `agents.toml`.
@@ -78,6 +91,11 @@ impl Config {
             shell_policy: ShellPolicy::default(),
             budget: None,
             queue: QueueConfig::default(),
+            identity_files: identity::t1_identity_files("identity-templates", "silas"),
+            agents: AgentsConfig::default(),
+            models: ModelsConfig::default(),
+            domains: DomainsConfig::default(),
+            active_agent: None,
         };
 
         let contents = match std::fs::read_to_string(config_path.as_ref()) {
@@ -88,27 +106,95 @@ impl Config {
             }
         };
 
-        let file_config: AgentFileConfig = toml::from_str(&contents)
+        let file_config: RuntimeFileConfig = toml::from_str(&contents)
             .map_err(|error| anyhow!("failed to parse agents.toml: {error}"))?;
 
-        if let Some(model) = file_config.agent.model {
-            config.model = model;
+        if file_config.agents.is_none() {
+            return Err(anyhow!(
+                "agents.toml must define at least one [agents.*] table"
+            ));
         }
 
-        if let Some(prompt) = file_config.agent.system_prompt {
-            config.system_prompt = prompt;
-        }
+        config.models = file_config.models;
+        config.domains = file_config.domains;
 
-        if let Some(base_url) = file_config.agent.base_url {
-            config.base_url = base_url;
-        }
+        if let Some(agents) = file_config.agents {
+            let (active_name, active_agent) = select_active_agent(&agents)?;
+            config.active_agent = Some(active_name.clone());
+            config.agents = agents;
 
-        if let Some(reasoning_effort) = file_config.agent.reasoning_effort {
-            config.reasoning_effort = Some(reasoning_effort);
-        }
+            let use_t2_files = matches!(active_agent.tier.as_deref(), Some("t2") | Some("t3"));
+            let selected_tier = if use_t2_files {
+                &active_agent.t2
+            } else {
+                &active_agent.t1
+            };
+            let selected_identity = active_agent
+                .identity
+                .clone()
+                .unwrap_or_else(|| active_name.clone());
+            validate_agent_identity(&selected_identity)?;
 
-        if let Some(session_name) = file_config.agent.session_name {
-            config.session_name = Some(session_name);
+            config.identity_files = if use_t2_files {
+                identity::t2_identity_files("identity-templates")
+            } else {
+                identity::t1_identity_files("identity-templates", &selected_identity)
+            };
+            if !config.domains.entries.is_empty() && config.domains.selected.is_empty() {
+                return Err(anyhow!(
+                    "domains config must select at least one context pack"
+                ));
+            }
+            for domain_name in &config.domains.selected {
+                let Some(domain) = config.domains.entries.get(domain_name) else {
+                    return Err(anyhow!(
+                        "selected domain pack is missing from [domains]: {domain_name}"
+                    ));
+                };
+                let Some(path) = domain.context_extend.as_ref() else {
+                    return Err(anyhow!(
+                        "selected domain pack is missing context_extend: {domain_name}"
+                    ));
+                };
+                validate_domain_context_extend(path)?;
+                config.identity_files.push(PathBuf::from(path));
+            }
+            if let Some(model) = selected_tier
+                .model
+                .clone()
+                .or_else(|| active_agent.model.clone())
+            {
+                config.model = model;
+            }
+            if let Some(reasoning_effort) = selected_tier
+                .reasoning
+                .clone()
+                .or_else(|| selected_tier.reasoning_effort.clone())
+                .or_else(|| active_agent.reasoning_effort.clone())
+            {
+                config.reasoning_effort = Some(reasoning_effort);
+            }
+            if let Some(base_url) = selected_tier
+                .base_url
+                .clone()
+                .or_else(|| active_agent.base_url.clone())
+            {
+                config.base_url = base_url;
+            }
+            if let Some(prompt) = selected_tier
+                .system_prompt
+                .clone()
+                .or_else(|| active_agent.system_prompt.clone())
+            {
+                config.system_prompt = prompt;
+            }
+            if let Some(session_name) = selected_tier
+                .session_name
+                .clone()
+                .or_else(|| active_agent.session_name.clone())
+            {
+                config.session_name = Some(session_name);
+            }
         }
 
         if let Some(operator_key) = file_config
@@ -175,7 +261,7 @@ mod tests {
     fn loads_valid_agents_toml_with_all_fields() {
         let path = temp_toml_path(
             "all_fields",
-            "[agent]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning_effort='low'\nsession_name='fix-auth'\n[auth]\noperator_key='operator-secret'\n[shell]\ndefault='allow'\nallow_patterns=['git *','cargo *']\ndeny_patterns=['rm -rf /*']\nstanding_approvals=['git push *','cargo publish *']\ndefault_severity='high'\nmax_output_bytes=2048\nmax_timeout_ms=4096\n",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning='low'\nsession_name='fix-auth'\n[models]\ndefault='gpt5_mini'\n[models.catalog.gpt5_mini]\nprovider='openai'\nmodel='gpt-5.1'\n[models.routes.default]\nrequires=[]\nprefer=['gpt5_mini']\n[domains]\nselected=['demo']\n[domains.demo]\ncontext_extend='identity-templates/domains/demo.md'\n[auth]\noperator_key='operator-secret'\n[shell]\ndefault='allow'\nallow_patterns=['git *','cargo *']\ndeny_patterns=['rm -rf /*']\nstanding_approvals=['git push *','cargo publish *']\ndefault_severity='high'\nmax_output_bytes=2048\nmax_timeout_ms=4096\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -206,10 +292,108 @@ mod tests {
     }
 
     #[test]
+    fn loads_new_agents_silas_config_with_models_and_domains() {
+        let path = temp_toml_path(
+            "agents_v2",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nbase_url='https://example.test/api'\nsystem_prompt='legacy defaults'\nsession_name='legacy-session'\nmodel='gpt-5.4-mini'\nreasoning='medium'\n[agents.silas.t2]\nmodel='o3'\nreasoning='xhigh'\n[models]\ndefault='gpt5_mini'\n[models.catalog.gpt5_mini]\nprovider='openai'\nmodel='gpt-5.4-mini'\ncaps=['fast','cheap','reasoning']\ncontext_window=128000\ncost_tier='cheap'\ncost_unit=1\nenabled=true\n[models.routes.code_review]\nrequires=['code']\nprefer=['gpt5_mini']\n[domains]\nselected=['fitness']\n[domains.fitness]\ncontext_extend='identity-templates/domains/fitness.md'\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(config.active_agent, Some("silas".to_string()));
+        assert_eq!(
+            config.identity_files,
+            vec![
+                PathBuf::from("identity-templates/constitution.md"),
+                PathBuf::from("identity-templates/agents/silas/agent.md"),
+                PathBuf::from("identity-templates/context.md"),
+                PathBuf::from("identity-templates/domains/fitness.md"),
+            ]
+        );
+        assert_eq!(config.model, "gpt-5.4-mini");
+        assert_eq!(config.reasoning_effort, Some("medium".to_string()));
+        assert_eq!(config.base_url, "https://example.test/api");
+        assert_eq!(config.system_prompt, "legacy defaults");
+        assert_eq!(config.session_name, Some("legacy-session".to_string()));
+        assert_eq!(config.models.default, Some("gpt5_mini".to_string()));
+        let catalog = config
+            .models
+            .catalog
+            .get("gpt5_mini")
+            .expect("expected catalog entry");
+        assert_eq!(catalog.provider, "openai");
+        assert_eq!(catalog.model, "gpt-5.4-mini");
+        assert_eq!(
+            config
+                .models
+                .routes
+                .get("code_review")
+                .expect("expected route")
+                .prefer,
+            vec!["gpt5_mini".to_string()]
+        );
+        assert_eq!(
+            config
+                .domains
+                .entries
+                .get("fitness")
+                .and_then(|domain| domain.context_extend.as_deref()),
+            Some("identity-templates/domains/fitness.md")
+        );
+        assert_default_queue_config(&config.queue);
+    }
+
+    #[test]
+    fn rejects_agent_identity_path_traversal() {
+        let path = temp_toml_path(
+            "identity_traversal",
+            "[agents.silas]\nidentity='../tmp/prompt'\n[agents.silas.t1]\nmodel='gpt-5.4-mini'\n",
+        );
+
+        let err = Config::load(&path).expect_err("expected invalid identity to fail");
+        assert!(
+            err.to_string()
+                .contains("agent identity must be a single path segment")
+        );
+    }
+
+    #[test]
+    fn rejects_domains_without_explicit_selection() {
+        let path = temp_toml_path(
+            "domains_without_selection",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-5.4-mini'\n[domains.demo]\ncontext_extend='identity-templates/domains/demo.md'\n",
+        );
+
+        let err = Config::load(&path).expect_err("expected missing selection to fail");
+        assert!(
+            err.to_string()
+                .contains("domains config must select at least one context pack")
+        );
+    }
+
+    #[test]
+    fn t2_agent_uses_t2_identity_files() {
+        let path = temp_toml_path(
+            "mixed_mode",
+            "[agents.silas]\nidentity='silas'\ntier='t2'\n[agents.silas.t1]\nmodel='gpt-5.4-mini'\nreasoning='medium'\n[agents.silas.t2]\nmodel='o3'\nreasoning='xhigh'\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(
+            config.identity_files,
+            vec![
+                PathBuf::from("identity-templates/constitution.md"),
+                PathBuf::from("identity-templates/context.md"),
+            ]
+        );
+        assert_eq!(config.model, "o3");
+        assert_eq!(config.active_agent, Some("silas".to_string()));
+    }
+
+    #[test]
     fn loads_tightened_shell_policy_fixture() {
         let path = temp_toml_path(
             "tightened_shell",
-            "[agent]\nmodel='gpt-tightened'\n[shell]\ndefault='approve'\nallow_patterns=['cargo *','ls *','pwd','which *','date','uname *']\ndeny_patterns=['rm -rf /*','rm -rf ~*','curl * | sh*','wget * | sh*','> /dev/sd*']\ndefault_severity='medium'\n",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-tightened'\n[shell]\ndefault='approve'\nallow_patterns=['cargo *','ls *','pwd','which *','date','uname *']\ndeny_patterns=['rm -rf /*','rm -rf ~*','curl * | sh*','wget * | sh*','> /dev/sd*']\ndefault_severity='medium'\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -247,7 +431,7 @@ mod tests {
     fn loaded_shell_policy_still_allows_ls_but_not_env_or_git_show() {
         let path = temp_toml_path(
             "tightened_shell_behavior",
-            "[agent]\nmodel='gpt-tightened'\n[shell]\ndefault='approve'\nallow_patterns=['cargo *','ls *','pwd','which *','date','uname *']\ndeny_patterns=['rm -rf /*','rm -rf ~*','curl * | sh*','wget * | sh*','> /dev/sd*']\ndefault_severity='medium'\n",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-tightened'\n[shell]\ndefault='approve'\nallow_patterns=['cargo *','ls *','pwd','which *','date','uname *']\ndeny_patterns=['rm -rf /*','rm -rf ~*','curl * | sh*','wget * | sh*','> /dev/sd*']\ndefault_severity='medium'\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -289,7 +473,10 @@ mod tests {
 
     #[test]
     fn loads_minimal_agents_toml_with_just_model() {
-        let path = temp_toml_path("minimal", "[agent]\nmodel='gpt-minimal'\n");
+        let path = temp_toml_path(
+            "minimal",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-minimal'\n",
+        );
 
         let config = Config::load(&path).expect("expected config to load");
         assert_eq!(config.model, "gpt-minimal");
@@ -320,7 +507,10 @@ mod tests {
 
     #[test]
     fn uses_defaults_for_missing_optional_fields() {
-        let path = temp_toml_path("missing_optional", "[agent]\nmodel='gpt-only'\n");
+        let path = temp_toml_path(
+            "missing_optional",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-only'\n",
+        );
 
         let config = Config::load(&path).expect("expected config to load");
         assert_eq!(config.model, "gpt-only");
@@ -342,7 +532,10 @@ mod tests {
 
     #[test]
     fn loads_session_name_from_agents_toml() {
-        let path = temp_toml_path("session_name", "[agent]\nsession_name='default-work'\n");
+        let path = temp_toml_path(
+            "session_name",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nsession_name='default-work'\n",
+        );
 
         let config = Config::load(&path).expect("expected config to load");
         assert_eq!(config.session_name, Some("default-work".to_string()));
@@ -350,7 +543,34 @@ mod tests {
 
     #[test]
     fn malformed_toml_returns_error() {
-        let path = temp_toml_path("malformed", "[agent]\nmodel = ");
+        let path = temp_toml_path("malformed", "[agents.silas]\nmodel = ");
+
+        let result = Config::load(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_agents_toml_without_any_agent_tables() {
+        let path = temp_toml_path("no_agents", "");
+
+        let result = Config::load(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_agent_table_only() {
+        let path = temp_toml_path("legacy_agent_only", "[agent]\nmodel='gpt-legacy'\n");
+
+        let result = Config::load(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_mixed_legacy_and_new_agent_tables() {
+        let path = temp_toml_path(
+            "mixed_agent_tables",
+            "[agent]\nmodel='gpt-legacy'\n[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-new'\n",
+        );
 
         let result = Config::load(&path);
         assert!(result.is_err());
@@ -360,7 +580,7 @@ mod tests {
     fn loads_operator_key_from_auth_section() {
         let path = temp_toml_path(
             "operator_key",
-            "[agent]\nmodel='gpt-auth'\n[auth]\noperator_key='operator-from-file'\n",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-auth'\n[auth]\noperator_key='operator-from-file'\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -371,7 +591,7 @@ mod tests {
     fn loads_budget_config_with_all_fields() {
         let path = temp_toml_path(
             "budget_all",
-            "[agent]\nmodel='gpt-budget'\n[budget]\nmax_tokens_per_turn=100\nmax_tokens_per_session=200\nmax_tokens_per_day=300\n",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-budget'\n[budget]\nmax_tokens_per_turn=100\nmax_tokens_per_session=200\nmax_tokens_per_day=300\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -390,7 +610,7 @@ mod tests {
     fn loads_budget_config_with_partial_fields() {
         let path = temp_toml_path(
             "budget_partial",
-            "[agent]\nmodel='gpt-budget'\n[budget]\nmax_tokens_per_session=250\n",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-budget'\n[budget]\nmax_tokens_per_session=250\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -407,7 +627,10 @@ mod tests {
 
     #[test]
     fn missing_budget_table_keeps_budget_none() {
-        let path = temp_toml_path("budget_missing", "[agent]\nmodel='gpt-budget'\n");
+        let path = temp_toml_path(
+            "budget_missing",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-budget'\n",
+        );
 
         let config = Config::load(&path).expect("expected config to load");
         assert_eq!(config.budget, None);
@@ -416,7 +639,10 @@ mod tests {
 
     #[test]
     fn shell_max_output_bytes_defaults_to_one_megabyte() {
-        let path = temp_toml_path("shell_default_output_bytes", "[agent]\nmodel='gpt-shell'\n");
+        let path = temp_toml_path(
+            "shell_default_output_bytes",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-shell'\n",
+        );
 
         let config = Config::load(&path).expect("expected config to load");
         assert_eq!(
@@ -430,7 +656,7 @@ mod tests {
     fn shell_max_output_bytes_override_is_honored() {
         let path = temp_toml_path(
             "shell_output_bytes_override",
-            "[agent]\nmodel='gpt-shell'\n[shell]\nmax_output_bytes=8192\n",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-shell'\n[shell]\nmax_output_bytes=8192\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -440,7 +666,10 @@ mod tests {
 
     #[test]
     fn shell_max_timeout_ms_defaults_to_two_minutes() {
-        let path = temp_toml_path("shell_default_timeout_ms", "[agent]\nmodel='gpt-shell'\n");
+        let path = temp_toml_path(
+            "shell_default_timeout_ms",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-shell'\n",
+        );
 
         let config = Config::load(&path).expect("expected config to load");
         assert_eq!(
@@ -454,7 +683,7 @@ mod tests {
     fn shell_max_timeout_ms_override_is_honored() {
         let path = temp_toml_path(
             "shell_timeout_ms_override",
-            "[agent]\nmodel='gpt-shell'\n[shell]\nmax_timeout_ms=1500\n",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-shell'\n[shell]\nmax_timeout_ms=1500\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -464,7 +693,10 @@ mod tests {
 
     #[test]
     fn queue_stale_processing_timeout_defaults_to_five_minutes() {
-        let path = temp_toml_path("queue_default_timeout", "[agent]\nmodel='gpt-queue'\n");
+        let path = temp_toml_path(
+            "queue_default_timeout",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-queue'\n",
+        );
 
         let config = Config::load(&path).expect("expected config to load");
         assert_default_queue_config(&config.queue);
@@ -474,7 +706,7 @@ mod tests {
     fn queue_stale_processing_timeout_override_is_honored() {
         let path = temp_toml_path(
             "queue_timeout_override",
-            "[agent]\nmodel='gpt-queue'\n[queue]\nstale_processing_timeout_secs=42\n",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-queue'\n[queue]\nstale_processing_timeout_secs=42\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -483,8 +715,14 @@ mod tests {
 }
 
 #[derive(Debug, Deserialize)]
-struct AgentFileConfig {
-    agent: AgentFileSection,
+#[serde(deny_unknown_fields)]
+struct RuntimeFileConfig {
+    #[serde(default)]
+    agents: Option<AgentsConfig>,
+    #[serde(default)]
+    models: ModelsConfig,
+    #[serde(default)]
+    domains: DomainsConfig,
     auth: Option<AuthFileSection>,
     #[serde(default)]
     shell: ShellPolicy,
@@ -493,18 +731,185 @@ struct AgentFileConfig {
     queue: QueueConfig,
 }
 
-#[derive(Debug, Deserialize)]
-struct AgentFileSection {
-    model: Option<String>,
-    system_prompt: Option<String>,
-    base_url: Option<String>,
-    reasoning_effort: Option<String>,
-    session_name: Option<String>,
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct AgentsConfig {
+    #[serde(flatten, default)]
+    pub entries: HashMap<String, AgentDefinition>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct AgentDefinition {
+    pub identity: Option<String>,
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub session_name: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub t1: AgentTierConfig,
+    #[serde(default)]
+    pub t2: AgentTierConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct AgentTierConfig {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub session_name: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ModelsConfig {
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub catalog: HashMap<String, ModelDefinition>,
+    #[serde(default)]
+    pub routes: HashMap<String, ModelRoute>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct ModelDefinition {
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub caps: Vec<String>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub cost_tier: Option<String>,
+    #[serde(default)]
+    pub cost_unit: Option<u64>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct ModelRoute {
+    #[serde(default)]
+    pub requires: Vec<String>,
+    #[serde(default)]
+    pub prefer: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DomainsConfig {
+    #[serde(default)]
+    pub selected: Vec<String>,
+    #[serde(flatten, default)]
+    pub entries: HashMap<String, DomainConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DomainConfig {
+    pub context_extend: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AuthFileSection {
     operator_key: Option<String>,
+}
+
+/// v2 currently supports exactly one active agent entry. If multiple named
+/// agents are added, configuration should be extended with an explicit
+/// selector before startup tries to resolve them.
+fn select_active_agent(agents: &AgentsConfig) -> Result<(String, AgentDefinition)> {
+    let mut active = agents
+        .entries
+        .iter()
+        .filter(|(name, _)| name.as_str() != "default");
+
+    let Some((name, definition)) = active.next() else {
+        return Err(anyhow!("agents config does not define an active brain"));
+    };
+
+    if active.next().is_some() {
+        return Err(anyhow!("agents config defines multiple active brains"));
+    }
+
+    Ok((name.clone(), definition.clone()))
+}
+
+fn validate_agent_identity(identity: &str) -> Result<()> {
+    if identity.is_empty() {
+        return Err(anyhow!("agent identity must not be empty"));
+    }
+    if identity == "." || identity == ".." || identity.chars().any(std::path::is_separator) {
+        return Err(anyhow!("agent identity must be a single path segment"));
+    }
+
+    Ok(())
+}
+
+fn validate_domain_context_extend(path: &str) -> Result<()> {
+    let mut components = Path::new(path).components();
+    match components.next() {
+        Some(Component::Normal(root)) if root == "identity-templates" => {}
+        _ => {
+            return Err(anyhow!(
+                "domain context_extend must stay under identity-templates/"
+            ));
+        }
+    }
+
+    if components.any(|component| !matches!(component, Component::Normal(_))) {
+        return Err(anyhow!(
+            "domain context_extend must stay under identity-templates/"
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod domain_context_extend_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_toml_path(prefix: &str, contents: &str) -> String {
+        let mut path = std::env::temp_dir();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch");
+        path.push(format!(
+            "autopoiesis_{prefix}_{}_{}.toml",
+            std::process::id(),
+            now.as_nanos()
+        ));
+        fs::write(&path, contents).expect("failed to write temp toml");
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn rejects_domain_context_extend_outside_identity_templates() {
+        let path = temp_toml_path(
+            "bad_domain_context",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-5.4-mini'\n[domains]\nselected=['demo']\n[domains.demo]\ncontext_extend='../prompt.md'\n",
+        );
+
+        let err = Config::load(&path).expect_err("expected invalid domain path to fail");
+        assert!(
+            err.to_string()
+                .contains("domain context_extend must stay under identity-templates/")
+        );
+    }
 }
 
 /// Shell execution policy loaded from `[shell]` in `agents.toml`.

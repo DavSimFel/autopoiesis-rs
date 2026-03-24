@@ -9,5 +9,5 @@ Current state check confirms no `.rs` files remain under `src/`:
 
 - `find src -type f -name '*.rs'` returns nothing.
 
-`git status` now shows only those deletions plus pre-existing changes (`identity/constitution.md`, `sessions/queue.sqlite`, plus `identity/constitution.md.bak`, `tests/constitution/`).
+`git status` now shows only those deletions plus pre-existing changes (`identity-templates/constitution.md`, `sessions/queue.sqlite`, plus `identity-templates/constitution.md.bak`, `tests/constitution/`).
 > 

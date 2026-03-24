@@ -227,7 +227,14 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
     vars.insert("tools".to_string(), tools_list);
 
     let mut turn = Turn::new()
-        .context(crate::context::Identity::new("identity", vars, &config.system_prompt).strict())
+        .context(
+            crate::context::Identity::new(
+                config.identity_files.clone(),
+                vars,
+                &config.system_prompt,
+            )
+            .strict(),
+        )
         .tool(tool);
 
     if let Some(budget) = &config.budget
@@ -505,7 +512,11 @@ mod tests {
         ]);
 
         let turn = Turn::new()
-            .context(Identity::new("/tmp", identity_vars.clone(), "fallback"))
+            .context(Identity::new(
+                crate::identity::t1_identity_files("/tmp", "silas"),
+                identity_vars.clone(),
+                "fallback",
+            ))
             .context(history)
             .guard(SecretRedactor::default_catalog());
 
@@ -728,6 +739,11 @@ mod tests {
             shell_policy: ShellPolicy::default(),
             budget,
             queue: crate::config::QueueConfig::default(),
+            identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
+            agents: crate::config::AgentsConfig::default(),
+            models: crate::config::ModelsConfig::default(),
+            domains: crate::config::DomainsConfig::default(),
+            active_agent: None,
         }
     }
 }

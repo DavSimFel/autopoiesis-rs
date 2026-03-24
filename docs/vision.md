@@ -82,7 +82,7 @@ Three files. Constitution and context always load. agent.md loads for T1 only.
 
 Character is T1-only because T2 doesn't communicate with anyone and T3 is ephemeral. The model is the mode switch — a fast model with the same agent.md naturally produces concise conversation; a reasoning model naturally produces deep analysis. Same identity, different gear.
 
-Domain knowledge lives in domain packs (`domains/*.md`) loaded as context extensions. Same brain + different domain = same personality, different working knowledge.
+Domain knowledge lives in domain packs (`identity-templates/domains/*.md`) loaded as context extensions. Packs are declared under `[domains.*]` and explicitly selected via `[domains] selected=[...]`. Same brain + different domain = same personality, different working knowledge.
 
 Full spec: [specs/identity-v2.md](specs/identity-v2.md).
 

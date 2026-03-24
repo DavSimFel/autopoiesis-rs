@@ -7,7 +7,7 @@ PROMPTS_DIR="tests/constitution/prompts"
 RESULTS_DIR="tests/constitution/results"
 
 # Backup original constitution
-cp identity/constitution.md identity/constitution.md.bak
+cp identity-templates/constitution.md identity-templates/constitution.md.bak
 
 for variant_file in "$VARIANTS_DIR"/*.md; do
   variant=$(basename "$variant_file" .md)
@@ -15,7 +15,7 @@ for variant_file in "$VARIANTS_DIR"/*.md; do
   mkdir -p "$RESULTS_DIR/$variant"
   
   # Install this variant
-  cp "$variant_file" identity/constitution.md
+  cp "$variant_file" identity-templates/constitution.md
   
   for prompt_file in "$PROMPTS_DIR"/*.txt; do
     prompt_name=$(basename "$prompt_file" .txt)
@@ -42,8 +42,8 @@ for variant_file in "$VARIANTS_DIR"/*.md; do
 done
 
 # Restore original constitution
-cp identity/constitution.md.bak identity/constitution.md
-rm identity/constitution.md.bak
+cp identity-templates/constitution.md.bak identity-templates/constitution.md
+rm identity-templates/constitution.md.bak
 
 echo ""
 echo "=== All tests complete. Results in $RESULTS_DIR ==="

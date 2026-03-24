@@ -28,8 +28,7 @@ cargo test --features integration  # live API tests (skip if no auth)
 src/                 27 Rust source files (~14.3K lines)
   gate/              Guard pipeline (budget, secret redaction, shell safety, exfil detection, protected paths)
   llm/               LLM provider trait + OpenAI backend
-identity/            Runtime prompt files (constitution, identity, context)
-identity-templates/  Git-tracked operator-authored identity files (future: identity v2)
+identity-templates/  Git-tracked runtime prompt files (constitution, agent, context)
 agents.toml          Model config, shell policy, budget limits
 sessions/            JSONL history + SQLite queue + subscriptions (gitignored)
 tests/               Integration + shipped policy tests

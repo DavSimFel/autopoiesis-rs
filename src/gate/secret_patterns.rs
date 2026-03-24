@@ -51,7 +51,6 @@ const PROTECTED_GIT_PATHS: [&str; 7] = [
 ];
 
 const READ_ONLY_GIT_SUBCOMMANDS: [&str; 4] = ["diff", "show", "grep", "cat-file"];
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SecretBodyKind {
     OpenAiToken,
@@ -103,6 +102,763 @@ pub(crate) fn command_references_protected_path(command: &str) -> bool {
     protected_path_fragments()
         .iter()
         .any(|fragment| command.contains(fragment))
+}
+
+pub(crate) fn command_writes_identity_template_path(command: &str) -> bool {
+    let command = command.to_lowercase();
+    if command.contains("perl -") && identity_template_perl_script_contains_write_api(&command) {
+        return true;
+    }
+    if identity_template_raw_script_writes_path(&command) {
+        return true;
+    }
+    let Ok(tokens) = shell_words::split(&command) else {
+        return false;
+    };
+    if tokens.is_empty() {
+        return false;
+    }
+
+    let tokens = strip_env_wrapper(&tokens).to_vec();
+    if tokens.is_empty() {
+        return false;
+    }
+
+    identity_template_script_writes_path(&tokens, 0)
+}
+
+fn identity_template_script_writes_path(args: &[String], depth: usize) -> bool {
+    if depth > 4 {
+        return false;
+    }
+
+    let args = identity_template_strip_env_wrapper(args);
+    if args.is_empty() {
+        return false;
+    }
+
+    if args.len() == 1
+        && let Ok(inner_args) = shell_words::split(&args[0])
+        && inner_args.len() > 1
+        && identity_template_script_writes_path(&inner_args, depth + 1)
+    {
+        return true;
+    }
+
+    if identity_template_args_write_redirection(args) {
+        return true;
+    }
+
+    if let Some(script) = identity_template_shell_wrapper_script(args) {
+        if identity_template_raw_script_writes_path(script)
+            || identity_template_wrapper_script_writes(script)
+        {
+            return true;
+        }
+
+        if let Ok(inner_args) = shell_words::split(script)
+            && identity_template_script_writes_path(&inner_args, depth + 1)
+        {
+            return true;
+        }
+    }
+
+    identity_template_direct_write_command(args)
+}
+
+fn identity_template_strip_env_wrapper(args: &[String]) -> &[String] {
+    let Some(first) = args.first() else {
+        return args;
+    };
+
+    if first.as_str() != "env" {
+        return args;
+    }
+
+    let mut index = 1;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            return args.get(index + 1..).unwrap_or(&[]);
+        }
+
+        if arg.starts_with('-') || arg.contains('=') {
+            index += 1;
+            continue;
+        }
+
+        return &args[index..];
+    }
+
+    &[]
+}
+
+fn identity_template_shell_wrapper_script(args: &[String]) -> Option<&str> {
+    let shell = args.first()?.as_str();
+    let shell = match shell {
+        "busybox" => match args.get(1).map(String::as_str) {
+            Some("sh") => "sh",
+            _ => return None,
+        },
+        other => other,
+    };
+
+    if !matches!(shell, "bash" | "sh" | "zsh" | "dash" | "ksh") {
+        return None;
+    }
+
+    let mut index = if shell == "sh" && args.first().map(String::as_str) == Some("busybox") {
+        2
+    } else {
+        1
+    };
+
+    while let Some(arg) = args.get(index) {
+        match arg.as_str() {
+            "-c" | "-lc" | "-cl" => return args.get(index + 1).map(String::as_str),
+            _ if identity_template_shell_inline_script_flag(arg) => {
+                return args.get(index + 1).map(String::as_str);
+            }
+            "--rcfile" | "--init-file" | "-O" | "-o" => {
+                index += 2;
+            }
+            "--" => return None,
+            _ if arg.starts_with('-') => {
+                index += 1;
+            }
+            _ => break,
+        }
+    }
+
+    None
+}
+
+fn identity_template_args_write_redirection(args: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if identity_template_redirection_token_writes_target(arg, args.get(index + 1)) {
+            return true;
+        }
+
+        index += 1;
+    }
+
+    false
+}
+
+fn identity_template_redirection_token_writes_target(token: &str, next: Option<&String>) -> bool {
+    let mut stripped = token.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    if let Some(rest) = stripped.strip_prefix('&') {
+        stripped = rest;
+    }
+
+    let Some(rest) = stripped
+        .strip_prefix(">>")
+        .or_else(|| stripped.strip_prefix('>'))
+    else {
+        return false;
+    };
+
+    let target = if rest.is_empty() {
+        next.map(String::as_str)
+    } else if rest.starts_with(char::is_whitespace) {
+        return false;
+    } else {
+        Some(rest)
+    };
+    target.is_some_and(identity_template_mentions_target)
+}
+
+fn identity_template_direct_write_command(args: &[String]) -> bool {
+    let Some(command) = args.first().map(String::as_str) else {
+        return false;
+    };
+    let command = command_basename(command);
+
+    match command {
+        "touch" | "rm" | "rmdir" | "tee" | "chmod" | "chown" => args
+            .iter()
+            .skip(1)
+            .any(|arg| identity_template_mentions_target(arg)),
+        "cp" | "install" | "ln" => identity_template_destination_argument(args)
+            .is_some_and(identity_template_mentions_target),
+        "dd" => args.iter().any(|arg| {
+            arg.strip_prefix("of=")
+                .is_some_and(identity_template_mentions_target)
+        }),
+        "mv" => args
+            .iter()
+            .any(|arg| identity_template_mentions_target(arg)),
+        "sed" => {
+            args.iter().any(|arg| arg == "-i" || arg.starts_with("-i"))
+                && args
+                    .iter()
+                    .any(|arg| identity_template_mentions_target(arg))
+        }
+        "git" => {
+            matches!(
+                identity_template_git_subcommand(args),
+                Some("checkout" | "restore")
+            ) && args
+                .iter()
+                .any(|arg| identity_template_mentions_target(arg))
+        }
+        "perl" => {
+            let mut saw_code_flag = false;
+            for arg in args.iter().skip(1) {
+                if matches!(arg.as_str(), "-e" | "-i" | "-p" | "-pe" | "-pi") {
+                    saw_code_flag = true;
+                    continue;
+                }
+
+                if saw_code_flag && identity_template_perl_script_contains_write_api(arg) {
+                    return true;
+                }
+            }
+            false
+        }
+        "python" | "python3" | "python3.11" => {
+            let mut saw_code_flag = false;
+            for arg in args.iter().skip(1) {
+                if matches!(arg.as_str(), "-c") {
+                    saw_code_flag = true;
+                    continue;
+                }
+
+                if saw_code_flag && identity_template_script_contains_write_api(arg) {
+                    return true;
+                }
+            }
+            false
+        }
+        "ruby" => {
+            let mut saw_code_flag = false;
+            for arg in args.iter().skip(1) {
+                if matches!(arg.as_str(), "-e") {
+                    saw_code_flag = true;
+                    continue;
+                }
+
+                if saw_code_flag && identity_template_script_contains_write_api(arg) {
+                    return true;
+                }
+            }
+            false
+        }
+        "node" | "nodejs" => {
+            let mut saw_code_flag = false;
+            for arg in args.iter().skip(1) {
+                if matches!(arg.as_str(), "-e" | "-p" | "--eval" | "--print") {
+                    saw_code_flag = true;
+                    continue;
+                }
+
+                if saw_code_flag && identity_template_script_contains_write_api(arg) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn command_basename(command: &str) -> &str {
+    std::path::Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+}
+
+fn identity_template_mentions_target(value: &str) -> bool {
+    value.contains("identity-templates/") || value == "identity-templates"
+}
+
+fn identity_template_destination_argument(args: &[String]) -> Option<&str> {
+    let mut index = 1;
+
+    while let Some(arg) = args.get(index) {
+        match arg.as_str() {
+            "-t" | "--target-directory" => {
+                return args.get(index + 1).map(String::as_str);
+            }
+            _ if arg.starts_with("--target-directory=") => {
+                return arg.split_once('=').map(|(_, value)| value);
+            }
+            _ => index += 1,
+        }
+    }
+
+    args.last().map(String::as_str)
+}
+
+fn identity_template_git_subcommand(args: &[String]) -> Option<&str> {
+    let mut index = 1;
+
+    while let Some(arg) = args.get(index) {
+        match arg.as_str() {
+            "--" => return None,
+            "-C" | "-c" => {
+                index += 2;
+            }
+            _ if arg.starts_with("-C") && arg.len() > 2 => {
+                index += 1;
+            }
+            _ if arg.starts_with("-c") && arg.len() > 2 => {
+                index += 1;
+            }
+            _ if arg.starts_with("--git-dir=")
+                || arg.starts_with("--work-tree=")
+                || arg.starts_with("--namespace=")
+                || arg.starts_with("--super-prefix=") =>
+            {
+                index += 1;
+            }
+            _ if arg.starts_with('-') => {
+                index += 1;
+            }
+            other => return Some(other),
+        }
+    }
+
+    None
+}
+
+fn identity_template_raw_script_writes_path(script: &str) -> bool {
+    identity_template_unquoted_redirection_writes_target(script)
+}
+
+fn identity_template_script_contains_write_api(script: &str) -> bool {
+    if !identity_template_mentions_target(script) {
+        return false;
+    }
+
+    for segment in script.split([';', '\n']) {
+        if !identity_template_mentions_target(segment) {
+            continue;
+        }
+
+        let sanitized = strip_quoted_literals(segment);
+        if sanitized.contains("write_text(")
+            || sanitized.contains("write_bytes(")
+            || sanitized.contains("writefilesync(")
+            || sanitized.contains("appendfilesync(")
+            || sanitized.contains("writefile(")
+            || sanitized.contains("appendfile(")
+            || sanitized.contains(".touch(")
+            || sanitized.contains(".rename(")
+            || sanitized.contains(".unlink(")
+            || sanitized.contains("os.remove(")
+            || sanitized.contains("os.unlink(")
+            || sanitized.contains("path(") && sanitized.contains(".unlink(")
+            || sanitized.contains("path(") && sanitized.contains(".write_text(")
+            || sanitized.contains("path(") && sanitized.contains(".write_bytes(")
+            || identity_template_open_mode_write(segment)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn identity_template_perl_script_contains_write_api(script: &str) -> bool {
+    if !identity_template_mentions_target(script) {
+        return false;
+    }
+
+    let code = identity_template_perl_code_fragment(script).unwrap_or(script);
+    let code = strip_outer_shell_quotes(code);
+    let sanitized = strip_quoted_literals(code);
+    sanitized.contains("unlink")
+        || sanitized.contains("rename")
+        || identity_template_open_mode_write(code)
+}
+
+fn identity_template_perl_code_fragment(script: &str) -> Option<&str> {
+    for flag in ["-pe", "-pi", "-e", "-p", "-i"] {
+        let Some(index) = find_unquoted_substring(script, flag) else {
+            continue;
+        };
+
+        let fragment = script[index + flag.len()..].trim_start();
+        if !fragment.is_empty() {
+            return Some(fragment);
+        }
+    }
+
+    None
+}
+
+fn strip_outer_shell_quotes(value: &str) -> &str {
+    let value = value.trim();
+    if let Some(rest) = value
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        return rest;
+    }
+
+    if let Some(rest) = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        return rest;
+    }
+
+    value
+}
+
+fn identity_template_open_mode_write(script: &str) -> bool {
+    if !identity_template_mentions_target(script) {
+        return false;
+    }
+
+    let Some(open_index) = find_unquoted_substring(script, "open(") else {
+        return false;
+    };
+    let tail = &script[open_index + "open(".len()..];
+    let Some(close_index) = identity_template_matching_paren(tail) else {
+        return false;
+    };
+    let invocation = tail[..close_index].trim();
+    let statement_start = script
+        .get(..open_index)
+        .and_then(|prefix| prefix.rfind([';', '\n']))
+        .map_or(0, |index| index + 1);
+    let statement = &script[statement_start..];
+    if !identity_template_mentions_target(invocation)
+        && !identity_template_mentions_target(statement)
+    {
+        return false;
+    }
+    let mode_segment = if let Some(comma_index) = invocation.find(',') {
+        invocation[comma_index + 1..].trim_start()
+    } else {
+        invocation
+    };
+    let mode_segment = mode_segment
+        .strip_prefix("mode=")
+        .map_or(mode_segment, |rest| rest.trim_start());
+    let Some(quote) = mode_segment.chars().next() else {
+        return false;
+    };
+    if !matches!(quote, '\'' | '"') {
+        return false;
+    }
+
+    let Some(end_quote) = mode_segment[1..].find(quote) else {
+        return false;
+    };
+    let mode = &mode_segment[1..1 + end_quote];
+    identity_template_write_mode(mode)
+}
+
+fn identity_template_write_mode(mode: &str) -> bool {
+    let mode = mode.trim();
+    !mode.is_empty()
+        && mode
+            .chars()
+            .all(|ch| matches!(ch, 'w' | 'a' | 'x' | 'r' | 'b' | 't' | '+' | 'U'))
+        && mode.chars().any(|ch| matches!(ch, 'w' | 'a' | 'x' | '+'))
+}
+
+fn identity_template_matching_paren(script: &str) -> Option<usize> {
+    let bytes = script.as_bytes();
+    let mut index = 0;
+    let mut depth = 1;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+
+    while index < bytes.len() {
+        let ch = bytes[index] as char;
+        if single_quoted {
+            if ch == '\\' {
+                index += 1;
+            } else if ch == '\'' {
+                single_quoted = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if double_quoted {
+            if ch == '\\' {
+                index += 1;
+            } else if ch == '"' {
+                double_quoted = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        match ch {
+            '\'' => single_quoted = true,
+            '"' => double_quoted = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            '\\' => {
+                index += 1;
+            }
+            _ => {}
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+fn identity_template_shell_inline_script_flag(arg: &str) -> bool {
+    if arg == "-c" || arg == "-lc" || arg == "-cl" {
+        return true;
+    }
+
+    if !arg.starts_with('-') || arg.starts_with("--") {
+        return false;
+    }
+
+    let mut saw_c = false;
+    for ch in arg.chars().skip(1) {
+        match ch {
+            'c' => saw_c = true,
+            'i' | 'l' | 'e' | 'x' | 'u' | 'v' | 'p' | 's' | 'r' | 'o' | 'h' | 'f' | 'n' | 'k'
+            | 'a' | 'B' | 'H' | 'P' | 'T' => {}
+            _ => return false,
+        }
+    }
+
+    saw_c
+}
+
+fn identity_template_wrapper_script_writes(script: &str) -> bool {
+    let mentions_target = identity_template_mentions_target(script);
+    let sanitized = strip_quoted_literals(script);
+    mentions_target
+        && (sanitized.contains("touch identity-templates/")
+            || sanitized.contains("perl -i")
+            || sanitized.contains("perl -pi")
+            || identity_template_perl_shell_payload_writes(script)
+            || sanitized.contains("python -c")
+                && identity_template_script_contains_write_api(script)
+            || sanitized.contains("os.remove(")
+            || sanitized.contains("os.unlink(")
+            || sanitized.contains("write_text(")
+            || sanitized.contains("write_bytes(")
+            || sanitized.contains("sed -i")
+            || sanitized.contains("git checkout")
+            || sanitized.contains("git restore"))
+}
+
+fn identity_template_perl_shell_payload_writes(script: &str) -> bool {
+    let script = script.trim();
+    let Some((_, payload)) = script.split_once("perl ") else {
+        return false;
+    };
+
+    let payload = payload.trim_start();
+    let mut parts = payload.splitn(2, char::is_whitespace);
+    let flag = parts.next().unwrap_or("");
+    let payload = parts.next().unwrap_or("");
+
+    match flag {
+        "-e" | "-p" | "-pe" => {
+            let payload = payload.trim_start();
+            let payload = payload
+                .strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+                .or_else(|| {
+                    payload
+                        .strip_prefix('"')
+                        .and_then(|rest| rest.strip_suffix('"'))
+                })
+                .unwrap_or(payload);
+            identity_template_perl_script_contains_write_api(payload)
+        }
+        "-i" | "-pi" => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod env_wrapper_regression_tests {
+    use super::command_writes_identity_template_path;
+
+    #[test]
+    fn env_shell_split_payload_is_reparsed() {
+        assert!(command_writes_identity_template_path(
+            "env -S 'bash -c \"touch identity-templates/context.md\"'"
+        ));
+    }
+
+    #[test]
+    fn open_mode_detection_requires_target_in_invocation() {
+        assert!(!command_writes_identity_template_path(
+            "python -c \"open('README.md', 'w'); print('identity-templates/context.md')\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "python -c \"from pathlib import Path; Path('identity-templates/context.md').open('w').close()\""
+        ));
+    }
+}
+
+fn identity_template_unquoted_redirection_writes_target(script: &str) -> bool {
+    let bytes = script.as_bytes();
+    let mut index = 0;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+
+    while index < bytes.len() {
+        let ch = bytes[index] as char;
+        if single_quoted {
+            if ch == '\\' {
+                index += 1;
+            } else if ch == '\'' {
+                single_quoted = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if double_quoted {
+            if ch == '\\' {
+                index += 1;
+            } else if ch == '"' {
+                double_quoted = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        match ch {
+            '\'' => single_quoted = true,
+            '"' => double_quoted = true,
+            '\\' => {
+                index += 1;
+            }
+            '>' => {
+                let mut target_index = index + 1;
+                if target_index < bytes.len() && bytes[target_index] as char == '>' {
+                    target_index += 1;
+                }
+                while target_index < bytes.len() && bytes[target_index].is_ascii_whitespace() {
+                    target_index += 1;
+                }
+                if target_index < bytes.len() && bytes[target_index] as char != '&' {
+                    let mut end = target_index;
+                    while end < bytes.len() {
+                        let end_ch = bytes[end] as char;
+                        if end_ch.is_ascii_whitespace() || matches!(end_ch, '|' | '&' | ';' | ')') {
+                            break;
+                        }
+                        end += 1;
+                    }
+                    if target_index < end
+                        && identity_template_mentions_target(&script[target_index..end])
+                    {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        index += 1;
+    }
+
+    false
+}
+
+fn find_unquoted_substring(script: &str, needle: &str) -> Option<usize> {
+    let bytes = script.as_bytes();
+    let needle = needle.as_bytes();
+    let mut index = 0;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+
+    while index + needle.len() <= bytes.len() {
+        let ch = bytes[index] as char;
+        if single_quoted {
+            if ch == '\\' {
+                index += 1;
+            } else if ch == '\'' {
+                single_quoted = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if double_quoted {
+            if ch == '\\' {
+                index += 1;
+            } else if ch == '"' {
+                double_quoted = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        match ch {
+            '\'' => single_quoted = true,
+            '"' => double_quoted = true,
+            '\\' => {
+                index += 1;
+            }
+            _ if bytes[index..].starts_with(needle) => return Some(index),
+            _ => {}
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+fn strip_quoted_literals(script: &str) -> String {
+    let mut output = String::with_capacity(script.len());
+    let mut chars = script.chars().peekable();
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+
+    while let Some(ch) = chars.next() {
+        if single_quoted {
+            if ch == '\\' {
+                chars.next();
+            } else if ch == '\'' {
+                single_quoted = false;
+            }
+            output.push(' ');
+            continue;
+        }
+
+        if double_quoted {
+            if ch == '\\' {
+                chars.next();
+            } else if ch == '"' {
+                double_quoted = false;
+            }
+            output.push(' ');
+            continue;
+        }
+
+        match ch {
+            '\'' => {
+                single_quoted = true;
+                output.push(' ');
+            }
+            '"' => {
+                double_quoted = true;
+                output.push(' ');
+            }
+            _ => output.push(ch),
+        }
+    }
+
+    output
 }
 
 fn home_prefix() -> Option<String> {
@@ -774,5 +1530,183 @@ mod tests {
             "show".to_string(),
             "HEAD:README.md".to_string(),
         ]));
+    }
+
+    #[test]
+    fn identity_template_write_detection_requires_write_target() {
+        assert!(command_writes_identity_template_path(
+            "rm -rf identity-templates"
+        ));
+        assert!(command_writes_identity_template_path(
+            "/bin/touch identity-templates/context.md"
+        ));
+        assert!(command_writes_identity_template_path(
+            "/usr/bin/python -c \"from pathlib import Path; Path('identity-templates/context.md').touch()\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "mv identity-templates /tmp/x"
+        ));
+        assert!(command_writes_identity_template_path(
+            "dd if=/tmp/x of=identity-templates/context.md"
+        ));
+        assert!(command_writes_identity_template_path(
+            "env -i touch identity-templates/context.md"
+        ));
+        assert!(command_writes_identity_template_path(
+            "bash -c \"touch identity-templates/context.md\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "bash --rcfile /tmp/rc -c \"touch identity-templates/context.md\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "bash -O nullglob -c \"rm -rf identity-templates\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "sh -c \"rm -rf identity-templates\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "bash -c \"git restore -- identity-templates/context.md\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "bash -c \"mv identity-templates/context.md /tmp/x\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "bash -ec \"touch identity-templates/context.md\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "printf hi > identity-templates/constitution.md"
+        ));
+        assert!(command_writes_identity_template_path(
+            "printf hi >identity-templates/constitution.md"
+        ));
+        assert!(command_writes_identity_template_path(
+            "bash -c \"cat > identity-templates/context.md\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "python -c \"from pathlib import Path; Path('identity-templates/context.md').touch()\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "python -c \"from pathlib import Path; Path('identity-templates/context.md').write_text('x')\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "python -c \"open('identity-templates/context.md', 'w').close()\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "python -c \"from pathlib import Path; Path('identity-templates/context.md').open('w').close()\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "python -c \"open('identity-templates/context.md', 'x').close()\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "python -c \"from pathlib import Path; Path('identity-templates/context.md').open(mode='a').close()\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "python -c \"open('identity-templates/context.md', 'w+').close()\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "python -c \"open('identity-templates/context.md', 'wb').close()\""
+        ));
+        assert!(!command_writes_identity_template_path(
+            "python -c \"from pathlib import Path; Path('identity-templates/context.md').open('r').read()\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "perl -e \"unlink 'identity-templates/context.md'\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "bash -c \"perl -e 'unlink \\'identity-templates/context.md\\''\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "node -e \"require('fs').writeFileSync('identity-templates/context.md', 'x')\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "node --eval \"require('fs').writeFileSync('identity-templates/context.md', 'x')\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "tee identity-templates/context.md"
+        ));
+        assert!(command_writes_identity_template_path(
+            "cp /tmp/x identity-templates/agents/silas/agent.md"
+        ));
+        assert!(command_writes_identity_template_path(
+            "cp /tmp/x identity-templates"
+        ));
+        assert!(command_writes_identity_template_path(
+            "cp -t identity-templates /tmp/x"
+        ));
+        assert!(command_writes_identity_template_path(
+            "install --target-directory=identity-templates /tmp/x"
+        ));
+        assert!(command_writes_identity_template_path(
+            "ln --target-directory identity-templates /tmp/x"
+        ));
+        assert!(!command_writes_identity_template_path(
+            "cp identity-templates/context.md /tmp/x"
+        ));
+        assert!(!command_writes_identity_template_path(
+            "cat identity-templates/context.md"
+        ));
+        assert!(!command_writes_identity_template_path(
+            "python -c \"print('>identity-templates/context.md')\""
+        ));
+        assert!(!command_writes_identity_template_path(
+            "python -c \"print(\\\"open('identity-templates/context.md', 'w')\\\")\""
+        ));
+        assert!(!command_writes_identity_template_path(
+            "python -c \"import sys; sys.stdout.write('identity-templates/context.md')\""
+        ));
+        assert!(!command_writes_identity_template_path(
+            "bash -c \"printf '> identity-templates/context.md\\n'\""
+        ));
+        assert!(!command_writes_identity_template_path(
+            "bash --norc /tmp/script.sh"
+        ));
+        assert!(!command_writes_identity_template_path(
+            "bash --rcfile /tmp/rc /tmp/script.sh"
+        ));
+        assert!(!command_writes_identity_template_path(
+            "printf '> identity-templates/context.md\\n'"
+        ));
+        assert!(command_writes_identity_template_path(
+            "node -p \"require('fs').writeFileSync('identity-templates/context.md', 'x')\""
+        ));
+        assert!(command_writes_identity_template_path(
+            "git -C . restore -- identity-templates/context.md"
+        ));
+        assert!(!command_writes_identity_template_path(
+            "git -C . restore -- README.md"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod identity_template_guard_tests {
+    use super::command_writes_identity_template_path;
+
+    #[test]
+    fn denies_wrapped_perl_inplace_edit() {
+        assert!(command_writes_identity_template_path(
+            r#"bash -c "perl -pi -e 's/foo/bar/' identity-templates/context.md""#,
+        ));
+    }
+
+    #[test]
+    fn denies_wrapped_python_remove() {
+        assert!(command_writes_identity_template_path(
+            r#"sh -c "python -c 'import os; os.remove(\"identity-templates/context.md\")'""#,
+        ));
+    }
+
+    #[test]
+    fn allows_copying_identity_template_outside_the_tree() {
+        assert!(!command_writes_identity_template_path(
+            r#"bash -c "cp identity-templates/context.md /tmp/x""#,
+        ));
+    }
+
+    #[test]
+    fn allows_printf_that_mentions_identity_template_text() {
+        assert!(!command_writes_identity_template_path(
+            r#"bash -c "printf '> identity-templates/context.md\n'""#,
+        ));
     }
 }

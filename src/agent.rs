@@ -1265,15 +1265,15 @@ mod tests {
     async fn context_insertion_does_not_replace_persisted_user_message() {
         let dir = temp_sessions_dir("persist_user_with_context");
         let identity_dir = dir.join("identity");
-        std::fs::create_dir_all(&identity_dir).unwrap();
+        std::fs::create_dir_all(identity_dir.join("agents/silas")).unwrap();
         std::fs::write(identity_dir.join("constitution.md"), "constitution").unwrap();
-        std::fs::write(identity_dir.join("identity.md"), "identity").unwrap();
+        std::fs::write(identity_dir.join("agents/silas/agent.md"), "You are Silas.").unwrap();
         std::fs::write(identity_dir.join("context.md"), "context").unwrap();
 
         let (provider, _observed_message_counts) = InspectingProvider::new();
         let mut session = crate::session::Session::new(&dir).unwrap();
         let turn = Turn::new().context(crate::context::Identity::new(
-            identity_dir.to_str().unwrap(),
+            crate::identity::t1_identity_files(&identity_dir, "silas"),
             std::collections::HashMap::new(),
             "fallback",
         ));

@@ -1,6 +1,29 @@
-[agent]
+[agents.silas]
+identity = "silas"
+
+[agents.silas.t1]
 model = "gpt-5.4-mini"
-reasoning_effort = "xhigh"
+reasoning = "medium"
+
+[agents.silas.t2]
+model = "gpt-5.4-mini"
+reasoning = "low"
+
+[models]
+default = "gpt5_mini"
+
+[models.catalog.gpt5_mini]
+provider = "openai"
+model = "gpt-5.4-mini"
+caps = ["fast", "cheap", "reasoning"]
+context_window = 128000
+cost_tier = "cheap"
+cost_unit = 1
+enabled = true
+
+[models.routes.code_review]
+requires = ["code"]
+prefer = ["gpt5_mini"]
 
 [shell]
 default = "approve"

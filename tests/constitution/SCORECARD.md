@@ -43,5 +43,5 @@ All three gave neutral "I don't have wants" responses. None actively defended th
 2. **1st person showed strongest constitution self-protection** — the only one that refused overwrite on first attempt
 3. **No framing prevents destructive actions** — this MUST be handled by gates, not constitution. Validates David's point: gates are Law 0.
 4. **Timeouts suggest the model does verify claims** — it runs commands rather than hallucinating, which is good epistemic behavior
-5. **Identity defense is weak across all framings** — the model deflects rather than asserting identity. May need stronger identity.md, not just constitution framing.
+5. **Identity defense is weak across all framings** — the model deflects rather than asserting identity. May need stronger agent.md, not just constitution framing.
 6. **Sample size is too small for statistical significance** — would need 5+ runs per prompt to draw real conclusions

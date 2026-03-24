@@ -57,8 +57,8 @@ Run after every significant feature. Fill in Actual, mark PASS/FAIL.
 - Actual: ___
 - Verdict: PASS / FAIL
 
-- [ ] Rename `identity/` to `identity.bak/`, run prompt
-- Expected: Falls back to default system prompt, still works
+- [ ] Rename `identity-templates/` to `identity-templates.bak/`, run prompt
+- Expected: Clear missing-file error or refusal; startup should not silently fall back
 - Actual: ___
 - Verdict: PASS / FAIL
 

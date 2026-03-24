@@ -3,7 +3,9 @@ use std::sync::Mutex;
 use tracing::debug;
 
 use crate::config::ShellPolicy;
-use crate::gate::secret_patterns::simple_command_reads_protected_path;
+use crate::gate::secret_patterns::{
+    command_writes_identity_template_path, simple_command_reads_protected_path,
+};
 use crate::gate::{Guard, GuardContext, GuardEvent, Severity, Verdict};
 use crate::llm::ToolCall;
 
@@ -168,6 +170,15 @@ impl ShellSafety {
         {
             return Verdict::Deny {
                 reason: format!("shell command reads protected credential path: `{command}`"),
+                gate_id: self.id.clone(),
+            };
+        }
+
+        if command_writes_identity_template_path(command) {
+            return Verdict::Deny {
+                reason: format!(
+                    "shell command writes protected identity template path: `{command}`"
+                ),
                 gate_id: self.id.clone(),
             };
         }
@@ -718,6 +729,101 @@ mod tests {
         assert!(matches!(
             gate.check(&mut event, &GuardContext::default()),
             Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn identity_template_writes_are_hard_denied_even_when_allowlisted() {
+        let gate = ShellSafety::with_policy(shell_policy(
+            "approve",
+            &["cat *", "tee *", "cp *", "mv *", "rm *"],
+            &[],
+            &[],
+            "high",
+        ));
+
+        for command in [
+            "printf hi > identity-templates/constitution.md",
+            "printf hi >identity-templates/constitution.md",
+            "bash -c \"cat > identity-templates/context.md\"",
+            "bash -c \"touch identity-templates/context.md\"",
+            "sh -c \"rm -rf identity-templates\"",
+            "bash -c \"git restore -- identity-templates/context.md\"",
+            "python -c \"from pathlib import Path; Path('identity-templates/context.md').touch()\"",
+            "tee identity-templates/context.md",
+            "cp /tmp/x identity-templates/agents/silas/agent.md",
+            "mv identity-templates/agents/silas/agent.md /tmp/x",
+            "rm -rf identity-templates/agents/silas",
+        ] {
+            let call = make_tool_call(command);
+            let mut event = make_event_tool(&call);
+            assert!(matches!(
+                gate.check(&mut event, &GuardContext::default()),
+                Verdict::Deny { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn identity_template_common_write_mechanisms_are_hard_denied() {
+        let gate = ShellSafety::with_policy(shell_policy("approve", &[], &[], &[], "high"));
+
+        for command in [
+            "touch identity-templates/context.md",
+            "chmod 600 identity-templates/constitution.md",
+            "chown root identity-templates/agents/silas/agent.md",
+            "ln -sf /tmp/source identity-templates/context.md",
+            "cp /tmp/source identity-templates",
+            "git checkout -- identity-templates/context.md",
+            "git restore identity-templates/constitution.md",
+            "python -c \"open('identity-templates/context.md', 'w').write('x')\"",
+            "python -c \"from pathlib import Path; Path('identity-templates/context.md').write_text('x')\"",
+        ] {
+            let call = make_tool_call(command);
+            let mut event = make_event_tool(&call);
+            assert!(matches!(
+                gate.check(&mut event, &GuardContext::default()),
+                Verdict::Deny { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn identity_template_reads_are_not_hard_denied() {
+        let gate = ShellSafety::with_policy(shell_policy("approve", &["cat *"], &[], &[], "high"));
+        let call = make_tool_call("cat identity-templates/context.md");
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Allow | Verdict::Approve { .. }
+        ));
+
+        let call =
+            make_tool_call("python -c \"print(open('identity-templates/context.md').read())\"");
+        let mut event = make_event_tool(&call);
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Allow | Verdict::Approve { .. }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod identity_template_shell_safety_tests {
+    use super::command_writes_identity_template_path;
+
+    #[test]
+    fn denies_wrapped_perl_inplace_edit() {
+        assert!(command_writes_identity_template_path(
+            r#"bash -c "perl -pi -e 's/foo/bar/' identity-templates/context.md""#,
+        ));
+    }
+
+    #[test]
+    fn allows_read_only_copy_outside_the_tree() {
+        assert!(!command_writes_identity_template_path(
+            r#"bash -c "cp identity-templates/context.md /tmp/x""#,
         ));
     }
 }

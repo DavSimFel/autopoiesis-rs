@@ -219,10 +219,10 @@ prefer = ["gpt4o_mini", "gpt4_1"]
 
 # === Domain packs ===
 [domains.fitness]
-context_extend = "domains/fitness.md"
+context_extend = "identity-templates/domains/fitness.md"
 
 [domains.immobilien]
-context_extend = "domains/immobilien.md"
+context_extend = "identity-templates/domains/immobilien.md"
 ```
 
 ---
@@ -262,20 +262,16 @@ All identity-templates/ paths added to the `ProtectedPaths` catalog in `gate/sec
 ## What Changes in Code
 
 ### `src/identity.rs`
-Current: hardcoded `[constitution.md, identity.md, context.md]` load order.
-New: configurable file list based on tier. T1 loads `[constitution, agent, context]`. T2/T3 load `[constitution, context]`.
+Current: configurable file list based on tier. T1 loads `[constitution, agent, context]`. T2/T3 load `[constitution, context]`.
 
 ### `src/config.rs`
-Current: single `[agent]` table.
-New: `[agents.{name}]` with tier-specific subtables, `[models]` catalog/routes, `[domains]`.
+Current: `[agents.{name}]` with tier-specific subtables, `[models]` catalog/routes, `[domains]`.
 
 ### `src/context.rs`
-Current: `Identity` struct loads from one directory.
-New: `Identity` takes a file list, not a directory. Domain packs appended to context when specified.
+Current: `Identity` takes a file list, not a directory. T1 uses `[constitution, agent, context]`. T2/T3 use `[constitution, context]`. Selected domain packs are appended to the list when configured.
 
 ### `agents.toml`
-Current: flat `[agent]` + `[shell]`.
-New: structured per above. Backward-compatible: if `[agent]` exists and `[agents]` doesn't, treat as legacy single-agent mode.
+Current: `[agents.{name}]` with `.t1`/`.t2` subtables, `[models]`, and `[domains] selected=[...]` with per-pack `context_extend` entries. No legacy `[agent]` fallback.
 
 ---
 
@@ -293,7 +289,7 @@ New: structured per above. Backward-compatible: if `[agent]` exists and `[agents
 1. **Add identity-templates/ to ProtectedPaths** — guard enforcement for constitution + agent.md
 2. **Refactor identity.rs** — configurable file list instead of hardcoded triple
 3. **Write Silas agent.md** — first real T1 character file
-4. **Extend config.rs** — parse `[agents.{name}]` with tier subtables, backward compat
+4. **Extend config.rs** — parse `[agents.{name}]` with tier subtables, strict no-legacy mode
 5. **Add models catalog/routes to config** — `[models]` section parsing
 6. **Domain pack loading** — context extension mechanism
 7. **Persona stability tests** — fixed scenario battery in existing test infrastructure
@@ -304,10 +300,10 @@ New: structured per above. Backward-compatible: if `[agent]` exists and `[agents
 ## Acceptance Criteria
 
 - [ ] Constitution + agent.md modification denied by guard pipeline (test)
-- [ ] T1 loads constitution + agent.md + context; T2/T3 load constitution + context (test)
+- [ ] T1 loads constitution + agent.md + context; T2/T3 load constitution + context; selected domain packs are appended (test)
 - [ ] Same agent.md produces consistent persona across fresh sessions (eval)
 - [ ] Adversarial injection in history does not override persona (eval)
-- [ ] Legacy `[agent]` config still works when `[agents]` is absent (test)
+- [ ] Legacy `[agent]` config is rejected when `[agents]` is present or absent (test)
 - [ ] Model catalog resolves correct model for task kind (test)
 - [ ] Budget check prevents spawn when cost exceeds limit (test)
 - [ ] Domain pack extends context without affecting identity (test)

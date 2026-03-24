@@ -19,7 +19,6 @@
 | Item | Files | Scope |
 |------|-------|-------|
 | `[agents.silas]` with `.t1`/`.t2` subtables | config.rs, agents.toml | 2 sessions |
-| Backward compat: `[agent]` still works if `[agents]` absent | config.rs | |
 | `[models]` catalog + routes parsing | config.rs | |
 | `[domains]` config parsing | config.rs | |
 | Identity v2: configurable file list (not hardcoded triple) | identity.rs, context.rs | |
@@ -28,7 +27,7 @@
 | Write Silas agent.md | identity-templates/agents/silas/agent.md | |
 
 **Risk:** Changes every startup path. Bad config merge bricks CLI + server.
-**Test:** Legacy `[agent]` config still boots. New `[agents.silas]` config boots. Protected paths deny writes.
+**Test:** New `[agents.silas]` config boots. Protected paths deny writes.
 
 ## Phase 2 — Model routing + delegation
 
@@ -48,7 +47,7 @@
 |------|-------|-------|
 | T2 structured read API (provenance-tagged file reads) | new read_tool.rs | 3 sessions |
 | T2 has read API only, no shell | turn.rs (tool selection by tier) | |
-| Domain packs loaded into context assembly | context.rs, identity.rs | |
+| Domain packs loaded into context assembly via `[domains] selected=[...]` | context.rs, identity.rs | |
 | T2 session spawning (T1 → T2 with reasoning model) | agent.rs, store.rs | |
 | T3 session spawning (T2 → T3 with catalog model) | agent.rs, store.rs | |
 | T2→T1 handoff via message queue | store.rs, agent.rs | |
