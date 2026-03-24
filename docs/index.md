@@ -1,9 +1,9 @@
 # Docs Index
 
 > Reading order by audience:
-> - **David:** README → vision → roadmap
-> - **Silas:** index → relevant spec or architecture doc → risks
-> - **Codex:** AGENTS.md → relevant docs for the files being changed
+> - **Operator** (David): README → vision → roadmap
+> - **Agent / Reviewer** (Silas): index → relevant spec or architecture doc → risks
+> - **Coding agent** (Codex): AGENTS.md → relevant docs for the files being changed
 
 ## Live Documents
 
@@ -29,7 +29,7 @@
 
 | Document | Path | Referenced by |
 |----------|------|---------------|
-| **Security Model** | [research/security-model.md](research/security-model.md) | identity-v2, risks |
+| **Security Model** | [research/security-model.md](research/security-model.md) | Referenced by identity-v2 design process (debate files) |
 
 ## Archive
 

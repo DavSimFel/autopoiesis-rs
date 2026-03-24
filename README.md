@@ -58,10 +58,10 @@ model = "gpt-5.3-codex-spark"
 reasoning_effort = "medium"
 ```
 
-Identity files in `identity/`:
+Identity files in `identity/` (v1 — [v2 spec](docs/specs/identity-v2.md) designed, not yet built):
 - `constitution.md` — safety boundaries, amendment rules
 - `identity.md` — name, voice, behavior defaults
-- `context.md` — working memory, active focus
+- `context.md` — template vars, workspace layout
 
 Template variables (`{{model}}`, `{{cwd}}`, `{{tools}}`) are resolved at runtime.
 

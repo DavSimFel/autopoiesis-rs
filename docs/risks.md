@@ -40,7 +40,7 @@
 - Context management goes through the same uncontained shell. With taint tracking built, injection risk is reduced but not eliminated — taint only forces approval, it doesn't block the command.
 
 ### Identity hierarchy has no enforcement
-- constitution.md and operator.md are described as immutable/operator-only. No guard rule blocks writes to these paths. `echo "new rules" > identity/constitution.md` works.
+- constitution.md is described as immutable. No guard rule blocks writes to identity paths. `echo "new rules" > identity/constitution.md` works. Identity v2 spec ([specs/identity-v2.md](specs/identity-v2.md)) adds ProtectedPaths enforcement — not yet built.
 
 ### No caller principal beyond operator/user key split
 - Server auth distinguishes operator vs user, but there is no per-caller identity. One user key = full access to all sessions.
