@@ -25,7 +25,8 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::principal::Principal;
-use crate::{agent, auth, cli, config, llm, session, store, turn};
+use crate::{agent, auth, config, llm, session, store, turn};
+use tracing::{info, warn};
 
 const API_KEY_HEADER: &str = "x-api-key";
 
@@ -129,6 +130,7 @@ impl Drop for SessionLockLease {
     }
 }
 
+#[tracing::instrument(level = "debug", skip(state, turn, make_provider, token_sink, approval_handler), fields(session_id = %session_id))]
 async fn drain_session_queue<F, Fut, P, TS, AH>(
     state: ServerState,
     session_id: String,
@@ -186,9 +188,13 @@ where
                 match verdict {
                     agent::TurnVerdict::Executed(_) => {}
                     agent::TurnVerdict::Approved { .. } => {
-                        eprintln!("Command approved by user and executed.");
+                        info!(
+                            message_id = message.id,
+                            "command approved by user and executed"
+                        );
                     }
                     agent::TurnVerdict::Denied { reason, gate_id } => {
+                        warn!(message_id = message.id, %gate_id, "turn denied");
                         return Ok(Some(agent::TurnVerdict::Denied { reason, gate_id }));
                     }
                 }
@@ -198,10 +204,7 @@ where
                 store.mark_processed(message.id)?;
             }
             Ok(agent::QueueOutcome::UnsupportedRole(role)) => {
-                eprintln!(
-                    "unsupported queued role '{role}' for message {}",
-                    message.id
-                );
+                warn!(message_id = message.id, %role, "unsupported queued role");
                 let mut store = state.store.lock().await;
                 store.mark_processed(message.id)?;
             }
@@ -225,11 +228,11 @@ pub async fn run(port: u16) -> Result<()> {
         store::Store::new("sessions/queue.sqlite").context("failed to open session store")?;
     match store.recover_stale_messages(config.queue.stale_processing_timeout_secs) {
         Ok(recovered) if recovered > 0 => {
-            eprintln!("recovered {recovered} stale messages from previous crash");
+            info!(recovered, "recovered stale messages from previous crash");
         }
         Ok(_) => {}
         Err(error) => {
-            eprintln!("warning: failed to recover stale messages: {error}");
+            warn!(%error, "failed to recover stale messages");
         }
     }
     let state = ServerState {
@@ -246,6 +249,7 @@ pub async fn run(port: u16) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port)))
         .await
         .context("failed to bind server socket")?;
+    info!(%port, "server bound");
     axum::serve(listener, app)
         .await
         .context("server exited unexpectedly")
@@ -266,10 +270,12 @@ pub fn router(state: ServerState) -> Router {
         ))
 }
 
+#[tracing::instrument(level = "debug")]
 async fn health_check() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
+#[tracing::instrument(level = "info", skip(state, payload))]
 async fn create_session(
     State(state): State<ServerState>,
     Json(payload): Json<CreateSessionRequest>,
@@ -284,6 +290,7 @@ async fn create_session(
     }
 }
 
+#[tracing::instrument(level = "debug", skip(state))]
 async fn list_sessions(State(state): State<ServerState>) -> impl IntoResponse {
     let store = state.store.lock().await;
     match store.list_sessions() {
@@ -292,6 +299,7 @@ async fn list_sessions(State(state): State<ServerState>) -> impl IntoResponse {
     }
 }
 
+#[tracing::instrument(level = "info", skip(state, payload), fields(session_id = %session_id))]
 async fn enqueue_message(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
@@ -319,6 +327,7 @@ async fn enqueue_message(
     }
 }
 
+#[tracing::instrument(level = "info", skip(state, ws), fields(session_id = %session_id, principal = ?principal))]
 async fn ws_session(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
@@ -332,6 +341,7 @@ async fn ws_session(
         .into_response()
 }
 
+#[tracing::instrument(level = "debug", skip(state, socket), fields(session_id = %session_id, principal = ?principal))]
 async fn websocket_session(
     state: ServerState,
     session_id: String,
@@ -377,7 +387,7 @@ async fn websocket_session(
     {
         let mut store = state.store.lock().await;
         if let Err(error) = store.create_session(&session_id, None) {
-            eprintln!("failed to create session {session_id}: {error}");
+            warn!(%session_id, %error, "failed to create websocket session");
         }
     }
 
@@ -434,7 +444,7 @@ async fn websocket_session(
         {
             Ok(Some(verdict)) => match verdict {
                 agent::TurnVerdict::Denied { reason, gate_id } => {
-                    eprintln!("{}", cli::format_denial_message(&reason, &gate_id));
+                    warn!(%gate_id, "websocket turn denied");
                     send_ws_terminal_denial(&tx, &reason);
                     break;
                 }
@@ -475,6 +485,7 @@ fn validate_session_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+#[tracing::instrument(level = "debug", skip(state, request, next))]
 async fn authenticate(
     State(state): State<ServerState>,
     mut request: Request<Body>,
@@ -554,14 +565,14 @@ fn spawn_http_queue_worker(state: ServerState, session_id: String) {
         .await
         {
             Ok(Some(verdict)) => match verdict {
-                agent::TurnVerdict::Denied { reason, gate_id } => {
-                    eprintln!("{}", cli::format_denial_message(&reason, &gate_id));
+                agent::TurnVerdict::Denied { reason: _, gate_id } => {
+                    warn!(%gate_id, "http turn denied");
                 }
                 _ => unreachable!("drain_queue only returns denial verdicts"),
             },
             Ok(None) => {}
             Err(error) => {
-                eprintln!("failed to drain queued HTTP messages for {session_id}: {error}");
+                warn!(%session_id, %error, "failed to drain queued HTTP messages");
             }
         }
     });

@@ -1,5 +1,6 @@
 use serde_json::{Value, from_str};
 use std::sync::Mutex;
+use tracing::debug;
 
 use crate::config::ShellPolicy;
 use crate::gate::secret_patterns::simple_command_reads_protected_path;
@@ -190,7 +191,11 @@ impl ShellSafety {
                 command: command.to_string(),
                 pattern: pattern.to_string(),
             });
-            eprintln!("{STANDING_APPROVAL_LOG_PREFIX}{pattern}");
+            debug!(
+                pattern = %pattern,
+                tainted,
+                "{STANDING_APPROVAL_LOG_PREFIX}{pattern}"
+            );
             return Verdict::Allow;
         }
 

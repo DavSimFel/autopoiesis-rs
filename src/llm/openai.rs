@@ -7,6 +7,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 // serde is used by tests and by request/response payload assembly.
 use serde_json::{Value, json};
+use tracing::trace;
 
 use crate::llm::{
     ChatMessage, ChatRole, FunctionTool, LlmProvider, MessageContent, StopReason, StreamedTurn,
@@ -179,17 +180,22 @@ enum SseEvent {
 
 fn parse_sse_line(line: &str) -> Option<SseEvent> {
     let line = line.trim();
+    trace!(line_len = line.len(), "parsing sse line");
     if line.is_empty() || line.starts_with(':') {
+        trace!(line_len = line.len(), "ignoring empty or comment sse line");
         return None;
     }
     if line == "data: [DONE]" {
+        trace!("parsed sse done frame");
         return Some(SseEvent::Done);
     }
 
     let data = line.strip_prefix("data: ")?;
+    trace!(data_len = data.len(), "parsed sse data frame");
 
     let event: Value = serde_json::from_str(data).ok()?;
     let event_type = event.get("type").and_then(|value| value.as_str())?;
+    trace!(event_type = %event_type, "decoded sse event type");
 
     match event_type {
         "response.output_text.delta" => event
@@ -409,11 +415,13 @@ impl LlmProvider for OpenAIProvider {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("failed to read streamed completion response chunk")?;
             let chunk = String::from_utf8_lossy(&chunk);
+            trace!(chunk_len = chunk.len(), "received sse chunk");
             stream_buffer.push_str(&chunk);
 
             while let Some(line_end) = stream_buffer.find('\n') {
                 let raw_line = stream_buffer[..line_end].to_string();
                 stream_buffer.drain(..line_end + 1);
+                trace!(line_len = raw_line.len(), "parsing sse line from stream");
                 match parse_sse_line(&raw_line) {
                     Some(SseEvent::TextDelta(delta)) => {
                         assistant_content.push_str(&delta);
@@ -506,6 +514,10 @@ impl LlmProvider for OpenAIProvider {
         if !stream_buffer.is_empty()
             && let Some(event) = parse_sse_line(stream_buffer.trim_end())
         {
+            trace!(
+                buffer_len = stream_buffer.len(),
+                "parsing trailing sse buffer"
+            );
             match event {
                 SseEvent::TextDelta(delta) => {
                     assistant_content.push_str(&delta);

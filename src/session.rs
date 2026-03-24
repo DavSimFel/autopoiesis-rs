@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tiktoken_rs::cl100k_base_singleton;
+use tracing::{debug, trace, warn};
 
 use crate::gate::BudgetSnapshot;
 use crate::llm::{ChatMessage, ChatRole, MessageContent, TurnMeta};
@@ -208,7 +209,7 @@ impl Session {
             "tool" => match (&call_id, &tool_name) {
                 (None, None) if entry_content.is_empty() => None,
                 (None, _) | (_, None) => {
-                    eprintln!(
+                    warn!(
                         "warning: dropping tool entry with missing call_id or tool_name \
                              (call_id={:?}, tool_name={:?})",
                         call_id, tool_name
@@ -288,6 +289,14 @@ impl Session {
         let entry = Self::to_entry(&message, meta.as_ref());
         let should_trim = Self::can_trim_after_append(&message);
 
+        debug!(
+            role = ?message.role,
+            principal = ?message.principal,
+            token_delta,
+            should_trim,
+            "append session message"
+        );
+
         self.messages.push(message);
         self.message_tokens.push(token_delta);
         self.total_tokens += token_delta;
@@ -325,15 +334,20 @@ impl Session {
         self.session_total_tokens = 0;
 
         for path in self.session_paths()? {
+            trace!(path = %path.display(), "replaying session file");
             let file = File::open(&path)
                 .with_context(|| format!("failed to open sessions file {}", path.display()))?;
             let reader = BufReader::new(file);
+            let mut line_index = 0usize;
 
             for raw_line in reader.lines() {
+                line_index += 1;
                 let raw_line = raw_line?;
                 if raw_line.trim().is_empty() {
                     continue;
                 }
+
+                trace!(path = %path.display(), line = line_index, "replaying session line");
 
                 let entry: SessionEntry = serde_json::from_str(&raw_line).with_context(|| {
                     format!("failed to parse session entry in {}", path.display())
@@ -442,10 +456,17 @@ impl Session {
     /// Trim oldest conversational groups when over token limit without splitting tool round-trips.
     fn trim_context(&mut self) {
         let use_estimation = self.total_tokens == 0;
+        debug!(
+            total_tokens = self.total_tokens,
+            estimated_tokens = self.estimate_context_tokens(),
+            max_context_tokens = self.max_context_tokens,
+            "trim context if needed"
+        );
         while self.current_context_tokens(use_estimation) > self.max_context_tokens {
             let Some((start, end)) = self.trim_group_range(self.trim_anchor_index()) else {
                 break;
             };
+            debug!(start, end, "trimming session messages");
             self.messages.drain(start..end);
             self.message_tokens.drain(start..end);
             self.total_tokens = self.message_tokens.iter().sum();
@@ -507,11 +528,18 @@ impl Session {
 
     /// Read the live budget snapshot used by budget guards.
     pub fn budget_snapshot(&self) -> Result<BudgetSnapshot> {
-        Ok(BudgetSnapshot {
+        let snapshot = BudgetSnapshot {
             turn_tokens: self.latest_turn_tokens(),
             session_tokens: self.session_total_tokens,
             day_tokens: self.today_token_total()?,
-        })
+        };
+        debug!(
+            turn_tokens = snapshot.turn_tokens,
+            session_tokens = snapshot.session_tokens,
+            day_tokens = snapshot.day_tokens,
+            "read budget snapshot"
+        );
+        Ok(snapshot)
     }
 
     /// Get total token count from provider metadata.

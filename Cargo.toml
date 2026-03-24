@@ -23,6 +23,8 @@ axum = { version = "0.7", features = ["ws", "json"] }
 axum-extra = "0.9"
 tower = "0.5"
 tower-http = "0.6"
+tracing = { version = "0.1", features = ["attributes"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [features]
 integration = []

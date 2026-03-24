@@ -26,6 +26,7 @@ use tokio::sync::watch;
 use tokio::time::{Instant, timeout};
 
 use crate::llm::FunctionTool;
+use tracing::{debug, warn};
 
 #[cfg(unix)]
 fn set_resource_limits() -> io::Result<()> {
@@ -181,6 +182,7 @@ impl Tool for Shell {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip(self, arguments))]
     fn execute(&self, arguments: &str) -> ToolFuture<'_> {
         let arguments = arguments.to_string();
         let max_output_bytes = self.max_output_bytes;
@@ -200,6 +202,10 @@ impl Tool for Shell {
                     .and_then(Value::as_u64)
                     .unwrap_or(DEFAULT_TIMEOUT_SECONDS * 1000),
                 max_timeout_ms,
+            );
+            debug!(
+                command_len = command.len(),
+                timeout_ms, max_output_bytes, "executing shell command"
             );
 
             // Keep command execution async and bounded by timeout.
@@ -247,11 +253,15 @@ impl Shell {
 
         #[cfg(unix)]
         if let Some(pid) = pid {
-            let _ = signal_process_group(pid, libc::SIGTERM);
+            if let Err(error) = signal_process_group(pid, libc::SIGTERM) {
+                warn!(%pid, %error, "failed to SIGTERM process group");
+            }
             match timeout(Duration::from_millis(TERMINATION_GRACE_MS), child.wait()).await {
                 Ok(_) => return Ok(()),
                 Err(_) => {
-                    let _ = signal_process_group(pid, libc::SIGKILL);
+                    if let Err(error) = signal_process_group(pid, libc::SIGKILL) {
+                        warn!(%pid, %error, "failed to SIGKILL process group");
+                    }
                 }
             }
         }
@@ -343,11 +353,16 @@ impl Shell {
         })
     }
 
+    #[tracing::instrument(level = "debug", skip(command_text))]
     async fn run_with_timeout(
         command_text: &str,
         timeout_ms: u64,
         max_output_bytes: usize,
     ) -> Result<ShellOutput> {
+        debug!(
+            command_len = command_text.len(),
+            timeout_ms, max_output_bytes, "starting shell execution"
+        );
         let mut command = StdCommand::new("sh");
         command.arg("-lc").arg(command_text);
 
@@ -371,6 +386,7 @@ impl Shell {
         let original_deadline = started_at + Duration::from_millis(timeout_ms);
         let mut effective_deadline = original_deadline;
         let mut child = command.spawn().context("failed to spawn shell command")?;
+        debug!(pid = child.id(), "spawned shell command");
         let child_id = child.id();
 
         let stdout = child.stdout.take().context("failed to capture stdout")?;
@@ -423,6 +439,7 @@ impl Shell {
                     }
                 }
                 _ = &mut sleep => {
+                    warn!(timeout_ms, "shell command timed out");
                     Self::kill_with_fallback(&mut child, child_id).await?;
                     if stdout_result.is_none() {
                         stdout_task.abort();
@@ -440,6 +457,11 @@ impl Shell {
         let stdout_result = stdout_result.context("stdout drain did not complete")?;
         let stderr_result = stderr_result.context("stderr drain did not complete")?;
         let status = status.context("shell command did not produce an exit status")?;
+        debug!(
+            exit_code = ?status.code(),
+            truncated = stdout_result.truncated || stderr_result.truncated,
+            "shell command finished"
+        );
 
         Ok(ShellOutput {
             status,

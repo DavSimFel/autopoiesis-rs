@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::identity;
 use crate::llm::{ChatMessage, ChatRole, MessageContent};
+use tracing::warn;
 
 /// Source for messages inserted into each turn before model invocation.
 pub trait ContextSource: Send + Sync {
@@ -42,7 +43,7 @@ impl Identity {
                 )
             }
             Err(error) => {
-                eprintln!(
+                warn!(
                     "warning: failed to load identity prompt from {}: {error}; using fallback prompt",
                     self.identity_dir
                 );

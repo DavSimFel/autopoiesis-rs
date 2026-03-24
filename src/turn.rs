@@ -9,6 +9,7 @@ use crate::gate::{
 };
 use crate::llm::{ChatMessage, FunctionTool, ToolCall};
 use crate::tool::Tool;
+use tracing::{debug, warn};
 
 /// Turn-level orchestration for context assembly, guard checks, and tools.
 pub struct Turn {
@@ -65,6 +66,7 @@ impl Turn {
         self.has_guard(crate::gate::budget::BUDGET_GUARD_ID)
     }
 
+    #[tracing::instrument(level = "debug", skip(self, messages, context), fields(message_count = messages.len()))]
     pub fn check_inbound(
         &self,
         messages: &mut Vec<ChatMessage>,
@@ -96,6 +98,7 @@ impl Turn {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip(self, call))]
     pub fn check_tool_call(&self, call: &ToolCall) -> Verdict {
         resolve_verdict(
             &self.guards,
@@ -108,6 +111,7 @@ impl Turn {
         )
     }
 
+    #[tracing::instrument(level = "debug", skip(self, calls), fields(call_count = calls.len()))]
     pub fn check_tool_batch(&self, calls: &[ToolCall]) -> Verdict {
         resolve_verdict(
             &self.guards,
@@ -120,6 +124,7 @@ impl Turn {
         )
     }
 
+    #[tracing::instrument(level = "debug", skip(self, text))]
     pub fn check_text_delta(&self, text: &mut String) -> Verdict {
         resolve_verdict(
             &self.guards,
@@ -132,6 +137,7 @@ impl Turn {
         )
     }
 
+    #[tracing::instrument(level = "debug", skip(self, arguments), fields(tool_name = %name))]
     pub async fn execute_tool(&self, name: &str, arguments: &str) -> Result<String> {
         let tool = self
             .tools
@@ -162,10 +168,12 @@ fn resolve_verdict(
     };
 
     for guard in guards {
+        debug!(guard = guard.name(), "evaluating guard");
         match guard.check(&mut event, &context) {
             Verdict::Allow => {}
             Verdict::Modify => verdict = Verdict::Modify,
             Verdict::Deny { reason, gate_id } => {
+                warn!(gate_id = %gate_id, "guard denied event");
                 return Verdict::Deny { reason, gate_id };
             }
             Verdict::Approve {
@@ -173,6 +181,7 @@ fn resolve_verdict(
                 gate_id,
                 severity,
             } => {
+                debug!(gate_id = %gate_id, severity = ?severity, "guard requested approval");
                 if approved
                     .as_ref()
                     .is_none_or(|(_, _, current)| severity > *current)
@@ -184,6 +193,7 @@ fn resolve_verdict(
     }
 
     if let Some((reason, gate_id, severity)) = approved {
+        debug!(gate_id = %gate_id, severity = ?severity, "guard approval selected");
         Verdict::Approve {
             reason,
             gate_id,

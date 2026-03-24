@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
+use crate::util::{STDERR_USER_OUTPUT_TARGET, STDOUT_USER_OUTPUT_TARGET};
 use anyhow::{Context, Result, anyhow};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -11,6 +12,7 @@ use serde_json::json;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use tokio::time::sleep;
+use tracing::{info, warn};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEVICE_AUTH_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
@@ -71,11 +73,15 @@ pub async fn device_code_login() -> Result<AuthTokens> {
         .ok_or_else(|| anyhow!("user code is missing from device auth response"))?;
     let interval = response.interval.unwrap_or(5).max(1);
 
-    println!(
+    info!(
+        target: STDOUT_USER_OUTPUT_TARGET,
         "Open {VERIFICATION_URL} and enter code: {}",
         format_user_code(&user_code)
     );
-    println!("Waiting for device authorization...");
+    info!(
+        target: STDOUT_USER_OUTPUT_TARGET,
+        "Waiting for device authorization..."
+    );
 
     let authorization =
         poll_for_authorization(&client, &response.device_auth_id, &user_code, interval).await?;
@@ -111,8 +117,14 @@ pub async fn get_valid_token() -> Result<String> {
         let refreshed = refresh_tokens(&tokens.refresh_token)
             .await
             .map_err(|error| {
-                eprintln!("Failed to refresh token: {error}");
-                eprintln!("Run: autopoiesis auth login");
+                warn!(
+                    target: STDERR_USER_OUTPUT_TARGET,
+                    "Failed to refresh token: {error}"
+                );
+                warn!(
+                    target: STDERR_USER_OUTPUT_TARGET,
+                    "Run: autopoiesis auth login"
+                );
                 error
             })?;
 
@@ -133,7 +145,7 @@ async fn poll_for_authorization(
 
     loop {
         if elapsed >= timeout {
-            println!();
+            info!(target: STDOUT_USER_OUTPUT_TARGET, "");
             return Err(anyhow!("authorization timed out after 15 minutes"));
         }
 
@@ -160,7 +172,7 @@ async fn poll_for_authorization(
                 elapsed += StdDuration::from_secs(interval);
             }
             StatusCode::OK => {
-                println!();
+                info!(target: STDOUT_USER_OUTPUT_TARGET, "");
                 let body = response
                     .json::<AuthorizationResponse>()
                     .await
@@ -173,7 +185,7 @@ async fn poll_for_authorization(
                     .text()
                     .await
                     .unwrap_or_else(|_| String::from("<failed to read response body>"));
-                println!();
+                info!(target: STDOUT_USER_OUTPUT_TARGET, "");
                 return Err(anyhow!("authorization request failed ({status}): {body}"));
             }
         }

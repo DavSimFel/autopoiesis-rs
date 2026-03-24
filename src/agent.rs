@@ -10,6 +10,7 @@ use crate::session::Session;
 use crate::store::{QueuedMessage, Store};
 use crate::turn::Turn;
 use crate::util::utc_timestamp;
+use tracing::{debug, info, warn};
 const MAX_DENIALS_PER_TURN: usize = 2;
 
 /// Receiver of streaming tokens emitted by the model during completion.
@@ -131,6 +132,16 @@ pub fn format_denial_message(reason: &str, gate_id: &str) -> String {
     format!("Command hard-denied by {gate_id}: {reason}")
 }
 
+fn inbound_verdict_name(verdict: &Verdict) -> &'static str {
+    match verdict {
+        Verdict::Allow => "allow",
+        Verdict::Modify => "modify",
+        Verdict::Deny { .. } => "deny",
+        Verdict::Approve { .. } => "approve",
+    }
+}
+
+#[tracing::instrument(level = "debug", skip(message, session, turn, make_provider, token_sink, approval_handler), fields(message_id = message.id, session_id = %message.session_id, role = %message.role))]
 pub(crate) async fn process_queued_message<F, Fut, P, TS, AH>(
     message: &QueuedMessage,
     session: &mut Session,
@@ -185,6 +196,7 @@ where
 }
 
 /// Run the agent loop until the model emits a non-tool stop reason.
+#[tracing::instrument(level = "info", skip(make_provider, session, turn, token_sink, approval_handler), fields(user_principal = ?user_principal))]
 pub async fn run_agent_loop<F, Fut, P, TS, AH>(
     make_provider: &mut F,
     session: &mut Session,
@@ -209,6 +221,7 @@ where
     let mut executed: Vec<ToolCall> = Vec::new();
     let mut had_user_approval = false;
     let mut denial_count = 0usize;
+    info!("starting agent turn");
 
     let denied_turn = 'agent_turn: loop {
         session.ensure_context_within_limit();
@@ -216,6 +229,7 @@ where
         if !persisted_user_message {
             messages.push(user_message.clone());
         }
+        debug!(message_count = messages.len(), "assembled turn context");
 
         let budget_context = if turn.needs_budget_context() {
             Some(GuardContext {
@@ -228,6 +242,10 @@ where
             None
         };
         let verdict = turn.check_inbound(&mut messages, budget_context);
+        debug!(
+            verdict = inbound_verdict_name(&verdict),
+            "inbound guard verdict"
+        );
 
         match verdict {
             Verdict::Allow | Verdict::Modify => {
@@ -242,6 +260,7 @@ where
                         })?;
                     session.append(user_message, None)?;
                     persisted_user_message = true;
+                    info!("persisted inbound user message");
                 }
             }
             Verdict::Deny { reason, gate_id } => {
@@ -258,6 +277,7 @@ where
                     session.append(user_message, None)?;
                 }
                 append_inbound_deny(session, &gate_id)?;
+                warn!(%gate_id, "inbound message denied");
                 break 'agent_turn Some(make_denial_verdict(&mut denial_count, gate_id, reason));
             }
             Verdict::Approve {
@@ -265,6 +285,7 @@ where
                 gate_id,
                 severity,
             } => {
+                debug!(%gate_id, ?severity, "inbound approval required");
                 let command = messages
                     .iter()
                     .find_map(|message| {
@@ -289,6 +310,7 @@ where
                         session.append(user_message, None)?;
                     }
                     append_inbound_approval_denied(session, &gate_id)?;
+                    warn!(%gate_id, "inbound approval denied");
                     break 'agent_turn Some(make_denial_verdict(
                         &mut denial_count,
                         gate_id,
@@ -315,6 +337,7 @@ where
         }
 
         let provider = make_provider().await?;
+        debug!("provider created");
         let mut streaming_output = crate::gate::StreamingTextBuffer::new();
         let mut redact_text = |segment: String| crate::gate::guard_text_output(turn, segment);
         let mut emit_token = |token: String| token_sink.on_token(token);
@@ -329,11 +352,13 @@ where
         streaming_output.finish(&mut redact_text, &mut emit_token);
         crate::gate::guard_message_output(turn, &mut turn_reply.assistant_message);
         let turn_meta = turn_reply.meta;
+        debug!(stop_reason = ?turn_reply.stop_reason, tool_call_count = turn_reply.tool_calls.len(), "streamed completion received");
 
         match turn_reply.stop_reason {
             StopReason::ToolCalls => {
                 let tool_calls = turn_reply.tool_calls.clone();
                 for call in &tool_calls {
+                    debug!(call_id = %call.id, tool_name = %call.name, "evaluating tool call");
                     match turn.check_tool_call(call) {
                         Verdict::Allow => {}
                         Verdict::Modify => {}
@@ -345,6 +370,7 @@ where
                                 turn_meta,
                             )?;
                             append_hard_deny(session, &gate_id)?;
+                            warn!(%gate_id, "tool call hard-denied");
                             break 'agent_turn Some(make_denial_verdict(
                                 &mut denial_count,
                                 gate_id,
@@ -368,6 +394,7 @@ where
                                     turn_meta,
                                 )?;
                                 append_approval_denied(session, &gate_id)?;
+                                warn!(%gate_id, "tool call approval denied");
                                 break 'agent_turn Some(make_denial_verdict(
                                     &mut denial_count,
                                     gate_id,
@@ -390,6 +417,7 @@ where
                             turn_meta,
                         )?;
                         append_hard_deny(session, &gate_id)?;
+                        warn!(%gate_id, "tool batch hard-denied");
                         break 'agent_turn Some(make_denial_verdict(
                             &mut denial_count,
                             gate_id,
@@ -413,6 +441,7 @@ where
                                 turn_meta,
                             )?;
                             append_approval_denied(session, &gate_id)?;
+                            warn!(%gate_id, "tool batch approval denied");
                             break 'agent_turn Some(make_denial_verdict(
                                 &mut denial_count,
                                 gate_id,
@@ -427,6 +456,7 @@ where
                 session.append(turn_reply.assistant_message, turn_meta)?;
 
                 for call in &tool_calls {
+                    debug!(call_id = %call.id, tool_name = %call.name, "executing tool");
                     let result = match turn.execute_tool(&call.name, &call.arguments).await {
                         Ok(output) => output,
                         Err(err) => format!(r#"{{"error": "{err}"}}"#),
@@ -456,10 +486,15 @@ where
                 session.append(turn_reply.assistant_message, turn_meta)?;
                 token_sink.on_complete();
                 if had_user_approval {
+                    info!(
+                        tool_call_count = executed.len(),
+                        "agent turn completed after approval"
+                    );
                     return Ok(TurnVerdict::Approved {
                         tool_calls: executed,
                     });
                 }
+                info!(tool_call_count = executed.len(), "agent turn completed");
                 return Ok(TurnVerdict::Executed(executed));
             }
         }
@@ -508,6 +543,7 @@ where
     Fut: std::future::Future<Output = Result<P>>,
     P: LlmProvider,
 {
+    info!(%session_id, "draining queue");
     while let Some(message) = store.dequeue_next_message(session_id)? {
         let outcome = process_message(
             &message,
@@ -525,9 +561,13 @@ where
                 match verdict {
                     TurnVerdict::Executed(_) => {}
                     TurnVerdict::Approved { .. } => {
-                        eprintln!("Command approved by user and executed.");
+                        info!(
+                            message_id = message.id,
+                            "command approved by user and executed"
+                        );
                     }
                     TurnVerdict::Denied { reason, gate_id } => {
+                        warn!(message_id = message.id, %gate_id, "turn denied");
                         return Ok(Some(TurnVerdict::Denied { reason, gate_id }));
                     }
                 }
@@ -536,14 +576,12 @@ where
                 store.mark_processed(message.id)?;
             }
             Ok(QueueOutcome::UnsupportedRole(role)) => {
-                eprintln!(
-                    "unsupported queued role '{role}' for message {}",
-                    message.id
-                );
+                warn!(message_id = message.id, %role, "unsupported queued role");
                 store.mark_processed(message.id)?;
             }
             Err(error) => {
                 store.mark_failed(message.id)?;
+                warn!(message_id = message.id, %error, "failed processing queued message");
                 return Err(error);
             }
         }
