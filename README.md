@@ -109,14 +109,16 @@ cargo clippy -- -D warnings       # lints
 
 ## Safety
 
-The guard pipeline (SecretRedactor, ShellSafety, ExfilDetector) provides **risk reduction, not containment**. Shell commands run as the current user with full filesystem and network access. RLIMIT caps NPROC/FSIZE/CPU only. See [docs/current/risks.md](docs/current/risks.md) for known hazards.
+The guard pipeline (SecretRedactor, ShellSafety, ExfilDetector) provides **risk reduction, not containment**. Shell commands run as the current user with full filesystem and network access. RLIMIT caps NPROC/FSIZE/CPU only. See [docs/risks.md](docs/risks.md) for known hazards.
 
 ## Documentation
 
-- [docs/current/architecture.md](docs/current/architecture.md) — how the code works today
-- [docs/current/risks.md](docs/current/risks.md) — known broken invariants and hazards
+- [docs/index.md](docs/index.md) — docs manifest and reading order
+- [docs/architecture/overview.md](docs/architecture/overview.md) — how the code works today
+- [docs/risks.md](docs/risks.md) — known hazards and open issues
 - [docs/roadmap.md](docs/roadmap.md) — build order and priorities
 - [docs/vision.md](docs/vision.md) — future-state design
+- [docs/specs/](docs/specs/) — pre-implementation specs
 - [AGENTS.md](AGENTS.md) — instructions for AI agents working on this repo
 
 ## License

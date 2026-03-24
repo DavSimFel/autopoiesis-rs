@@ -1,7 +1,7 @@
 # Vision — Future State
 
-> **This is aspirational.** For current state, see [current/architecture.md](current/architecture.md).
-> For what's broken right now, see [current/risks.md](current/risks.md).
+> **This is aspirational.** For current state, see [architecture/overview.md](architecture/overview.md).
+> For what's broken right now, see [risks.md](risks.md).
 > For build order, see [roadmap.md](roadmap.md).
 
 ## Core ideas

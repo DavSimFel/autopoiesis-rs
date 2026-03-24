@@ -1,7 +1,7 @@
 # Architecture — How the Code Works Today
 
-> **Current state only.** For future design, see [docs/vision.md](../vision.md).
-> For known hazards, see [risks.md](risks.md).
+> **Current state only.** For future design, see [../vision.md](../vision.md).
+> For known hazards, see [../risks.md](../risks.md).
 
 ## Overview
 
