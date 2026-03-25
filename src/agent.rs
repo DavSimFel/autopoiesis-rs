@@ -1,14 +1,16 @@
 //! Agent orchestration loop coordinating model turns and tool execution.
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::{Value, from_str};
+use std::path::Path;
 
 use crate::delegation::{self, DelegationAdvice};
 use crate::gate::{GuardContext, Severity, Verdict};
 use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall, TurnMeta};
 use crate::principal::Principal;
 use crate::session::Session;
-pub use crate::spawn::{SpawnRequest, SpawnResult};
+pub use crate::spawn::{SpawnDrainResult, SpawnRequest, SpawnResult};
 use crate::store::{QueuedMessage, Store};
 use crate::turn::Turn;
 use crate::util::utc_timestamp;
@@ -52,6 +54,179 @@ pub fn spawn_child(
     request: SpawnRequest,
 ) -> Result<SpawnResult> {
     crate::spawn::spawn_child(store, config, parent_budget, request)
+}
+
+#[derive(Debug, Deserialize)]
+struct SpawnedChildMetadata {
+    tier: String,
+    resolved_model: String,
+    resolved_provider_model: String,
+    #[serde(default)]
+    reasoning_override: Option<String>,
+}
+
+fn parse_spawned_child_metadata(metadata: &str) -> Result<SpawnedChildMetadata> {
+    serde_json::from_str(metadata).context("failed to parse spawned child metadata")
+}
+
+async fn spawn_and_drain_with_provider<F, Fut, P, TS>(
+    store: &mut Store,
+    config: &crate::config::Config,
+    session_dir: &Path,
+    request: SpawnRequest,
+    make_provider: &mut F,
+    token_sink: &mut TS,
+    approval_handler: &mut (dyn ApprovalHandler + Send),
+) -> Result<SpawnDrainResult>
+where
+    F: FnMut(&crate::config::Config) -> Fut,
+    Fut: std::future::Future<Output = Result<P>>,
+    P: LlmProvider,
+    TS: TokenSink + Send,
+{
+    let parent_session_dir = session_dir.join(&request.parent_session_id);
+    let mut parent_session =
+        Session::new(&parent_session_dir).context("failed to open parent session")?;
+    parent_session
+        .load_today()
+        .context("failed to load parent session history")?;
+    let parent_budget = parent_session
+        .budget_snapshot()
+        .context("failed to read parent budget snapshot")?;
+
+    let spawn_result = crate::spawn::spawn_child(store, config, parent_budget, request)?;
+    let metadata_json = store
+        .get_session_metadata(&spawn_result.child_session_id)?
+        .ok_or_else(|| anyhow::anyhow!("spawned child session metadata is missing"))?;
+    let context = SpawnDrainContext {
+        store,
+        config,
+        session_dir,
+        spawn_result,
+    };
+    finish_spawned_child_drain(
+        context,
+        &metadata_json,
+        make_provider,
+        token_sink,
+        approval_handler,
+    )
+    .await
+}
+
+struct SpawnDrainContext<'a> {
+    store: &'a mut Store,
+    config: &'a crate::config::Config,
+    session_dir: &'a Path,
+    spawn_result: SpawnResult,
+}
+
+async fn finish_spawned_child_drain<F, Fut, P, TS>(
+    context: SpawnDrainContext<'_>,
+    metadata_json: &str,
+    make_provider: &mut F,
+    token_sink: &mut TS,
+    approval_handler: &mut (dyn ApprovalHandler + Send),
+) -> Result<SpawnDrainResult>
+where
+    F: FnMut(&crate::config::Config) -> Fut,
+    Fut: std::future::Future<Output = Result<P>>,
+    P: LlmProvider,
+    TS: TokenSink + Send,
+{
+    let metadata = parse_spawned_child_metadata(metadata_json)?;
+    if metadata.resolved_model != context.spawn_result.resolved_model {
+        return Err(anyhow::anyhow!(
+            "spawned child metadata resolved_model does not match spawn result"
+        ));
+    }
+
+    let child_config = context.config.with_spawned_child_runtime(
+        &metadata.tier,
+        &metadata.resolved_provider_model,
+        metadata.reasoning_override.as_deref(),
+    )?;
+    let turn = crate::turn::build_turn_for_config(&child_config);
+
+    let child_session_dir = context
+        .session_dir
+        .join(&context.spawn_result.child_session_id);
+    let mut child_session =
+        Session::new(&child_session_dir).context("failed to open child session")?;
+    child_session
+        .load_today()
+        .context("failed to load child session history")?;
+
+    let mut make_provider_for_turn = || make_provider(&child_config);
+    match drain_queue(
+        context.store,
+        &context.spawn_result.child_session_id,
+        &mut child_session,
+        &turn,
+        &mut make_provider_for_turn,
+        token_sink,
+        approval_handler,
+    )
+    .await?
+    {
+        Some(TurnVerdict::Denied { reason, gate_id }) => {
+            return Err(anyhow::anyhow!(
+                "child session denied by {gate_id}: {reason}"
+            ));
+        }
+        Some(TurnVerdict::Executed(_)) | Some(TurnVerdict::Approved { .. }) => {
+            return Err(anyhow::anyhow!(
+                "child drain returned an unexpected terminal verdict"
+            ));
+        }
+        None => {}
+    }
+
+    let last_assistant_response = crate::spawn::latest_assistant_response(&child_session);
+    Ok(SpawnDrainResult {
+        child_session_id: context.spawn_result.child_session_id,
+        resolved_model: context.spawn_result.resolved_model,
+        last_assistant_response,
+    })
+}
+
+/// Spawn a child session and drain its queue to completion.
+pub async fn spawn_and_drain(
+    store: &mut Store,
+    config: &crate::config::Config,
+    session_dir: impl AsRef<Path>,
+    request: SpawnRequest,
+    approval_handler: &mut (dyn ApprovalHandler + Send),
+) -> Result<SpawnDrainResult> {
+    let http_client = reqwest::Client::new();
+    let mut provider_factory = move |child_config: &crate::config::Config| {
+        let client = http_client.clone();
+        let child_config = child_config.clone();
+        async move {
+            let api_key = crate::auth::get_valid_token().await?;
+            Ok::<crate::llm::openai::OpenAIProvider, anyhow::Error>(
+                crate::llm::openai::OpenAIProvider::with_client(
+                    client,
+                    api_key,
+                    child_config.base_url,
+                    child_config.model,
+                    child_config.reasoning_effort,
+                ),
+            )
+        }
+    };
+    let mut token_sink = |_token: String| {};
+
+    spawn_and_drain_with_provider(
+        store,
+        config,
+        session_dir.as_ref(),
+        request,
+        &mut provider_factory,
+        &mut token_sink,
+        approval_handler,
+    )
+    .await
 }
 
 pub enum TurnVerdict {
@@ -876,6 +1051,43 @@ mod tests {
         path
     }
 
+    #[derive(Clone)]
+    struct RecordingProvider {
+        assistant_text: String,
+        observed_tools: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl crate::llm::LlmProvider for RecordingProvider {
+        async fn stream_completion(
+            &self,
+            _messages: &[ChatMessage],
+            tools: &[FunctionTool],
+            _on_token: &mut (dyn FnMut(String) + Send),
+        ) -> Result<StreamedTurn> {
+            self.observed_tools
+                .lock()
+                .expect("tools mutex poisoned")
+                .push(tools.iter().map(|tool| tool.name.clone()).collect());
+
+            Ok(StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    principal: Principal::Agent,
+                    content: vec![MessageContent::text(self.assistant_text.clone())],
+                },
+                tool_calls: vec![],
+                meta: Some(crate::llm::TurnMeta {
+                    model: Some("gpt-child".to_string()),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    reasoning_tokens: None,
+                    reasoning_trace: None,
+                }),
+                stop_reason: StopReason::Stop,
+            })
+        }
+    }
+
     fn message_text(message: &ChatMessage) -> Option<&str> {
         message.content.iter().find_map(|block| match block {
             MessageContent::Text { text } => Some(text.as_str()),
@@ -1215,6 +1427,7 @@ mod tests {
                 parent_session_id: "parent".to_string(),
                 task: "child task".to_string(),
                 task_kind: Some("code_review".to_string()),
+                tier: Some("t2".to_string()),
                 model_override: Some("gpt-child".to_string()),
                 reasoning_override: Some("low".to_string()),
             },
@@ -1270,6 +1483,642 @@ mod tests {
         );
         assert!(completion.content.contains("Child session"));
         assert!(completion.content.contains("child finished"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_and_drain_uses_child_runtime_config_and_returns_last_assistant_response() {
+        use std::sync::{Arc, Mutex};
+
+        let root = temp_queue_root("spawn_and_drain");
+        let queue_path = root.join("queue.sqlite");
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let mut store = Store::new(&queue_path).unwrap();
+        store.create_session("parent", None).unwrap();
+
+        let config = crate::config::Config {
+            model: "gpt-test".to_string(),
+            system_prompt: "system".to_string(),
+            base_url: "https://example.test/api".to_string(),
+            reasoning_effort: Some("medium".to_string()),
+            session_name: None,
+            operator_key: None,
+            shell_policy: crate::config::ShellPolicy::default(),
+            budget: None,
+            read: crate::config::ReadToolConfig::default(),
+            queue: crate::config::QueueConfig::default(),
+            identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
+            agents: {
+                let mut agents = crate::config::AgentsConfig::default();
+                agents.entries.insert(
+                    "silas".to_string(),
+                    crate::config::AgentDefinition {
+                        identity: Some("silas".to_string()),
+                        tier: None,
+                        model: None,
+                        base_url: None,
+                        system_prompt: None,
+                        session_name: None,
+                        reasoning_effort: None,
+                        t1: crate::config::AgentTierConfig {
+                            delegation_token_threshold: Some(12_000),
+                            delegation_tool_depth: Some(3),
+                            ..Default::default()
+                        },
+                        t2: crate::config::AgentTierConfig {
+                            model: Some("o3".to_string()),
+                            reasoning: Some("high".to_string()),
+                            ..Default::default()
+                        },
+                    },
+                );
+                agents
+            },
+            models: {
+                let mut models = crate::config::ModelsConfig::default();
+                models.default = Some("gpt-child".to_string());
+                models.catalog.insert(
+                    "gpt-child".to_string(),
+                    crate::config::ModelDefinition {
+                        provider: "openai".to_string(),
+                        model: "gpt-child".to_string(),
+                        caps: vec!["code_review".to_string()],
+                        context_window: Some(128_000),
+                        cost_tier: Some("medium".to_string()),
+                        cost_unit: Some(2),
+                        enabled: Some(true),
+                    },
+                );
+                models.routes.insert(
+                    "code_review".to_string(),
+                    crate::config::ModelRoute {
+                        requires: vec!["code_review".to_string()],
+                        prefer: vec!["gpt-child".to_string()],
+                    },
+                );
+                models
+            },
+            domains: Default::default(),
+            active_agent: Some("silas".to_string()),
+        };
+
+        let observed_models = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let observed_tools = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        let mut provider_factory = {
+            let observed_models = observed_models.clone();
+            let observed_tools = observed_tools.clone();
+            move |child_config: &crate::config::Config| {
+                observed_models
+                    .lock()
+                    .expect("models mutex poisoned")
+                    .push((
+                        child_config.model.clone(),
+                        child_config.reasoning_effort.clone(),
+                    ));
+                let provider = RecordingProvider {
+                    assistant_text: "child finished".to_string(),
+                    observed_tools: observed_tools.clone(),
+                };
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        let result = spawn_and_drain_with_provider(
+            &mut store,
+            &config,
+            &sessions_dir,
+            SpawnRequest {
+                parent_session_id: "parent".to_string(),
+                task: "child task".to_string(),
+                task_kind: Some("code_review".to_string()),
+                tier: Some("t2".to_string()),
+                model_override: Some("gpt-child".to_string()),
+                reasoning_override: Some("high".to_string()),
+            },
+            &mut provider_factory,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.resolved_model, "gpt-child");
+        assert_eq!(
+            result.last_assistant_response,
+            Some("child finished".to_string())
+        );
+        assert_eq!(
+            observed_models
+                .lock()
+                .expect("models mutex poisoned")
+                .as_slice(),
+            &[("gpt-child".to_string(), Some("high".to_string()))]
+        );
+        assert_eq!(
+            observed_tools
+                .lock()
+                .expect("tools mutex poisoned")
+                .as_slice(),
+            &[vec!["read_file".to_string()]]
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_and_drain_uses_t3_runtime_config_and_returns_last_assistant_response() {
+        use std::sync::{Arc, Mutex};
+
+        let root = temp_queue_root("spawn_and_drain_t3");
+        let queue_path = root.join("queue.sqlite");
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let mut store = Store::new(&queue_path).unwrap();
+        store.create_session("parent", None).unwrap();
+
+        let config = crate::config::Config {
+            model: "gpt-test".to_string(),
+            system_prompt: "system".to_string(),
+            base_url: "https://example.test/api".to_string(),
+            reasoning_effort: Some("medium".to_string()),
+            session_name: None,
+            operator_key: None,
+            shell_policy: crate::config::ShellPolicy::default(),
+            budget: None,
+            read: crate::config::ReadToolConfig::default(),
+            queue: crate::config::QueueConfig::default(),
+            identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
+            agents: {
+                let mut agents = crate::config::AgentsConfig::default();
+                agents.entries.insert(
+                    "silas".to_string(),
+                    crate::config::AgentDefinition {
+                        identity: Some("silas".to_string()),
+                        tier: None,
+                        model: None,
+                        base_url: None,
+                        system_prompt: None,
+                        session_name: None,
+                        reasoning_effort: None,
+                        t1: crate::config::AgentTierConfig::default(),
+                        t2: crate::config::AgentTierConfig::default(),
+                    },
+                );
+                agents
+            },
+            models: {
+                let mut models = crate::config::ModelsConfig::default();
+                models.default = Some("gpt-child".to_string());
+                models.catalog.insert(
+                    "gpt-child".to_string(),
+                    crate::config::ModelDefinition {
+                        provider: "openai".to_string(),
+                        model: "gpt-child".to_string(),
+                        caps: vec!["code_review".to_string()],
+                        context_window: Some(128_000),
+                        cost_tier: Some("medium".to_string()),
+                        cost_unit: Some(2),
+                        enabled: Some(true),
+                    },
+                );
+                models.routes.insert(
+                    "code_review".to_string(),
+                    crate::config::ModelRoute {
+                        requires: vec!["code_review".to_string()],
+                        prefer: vec!["gpt-child".to_string()],
+                    },
+                );
+                models
+            },
+            domains: Default::default(),
+            active_agent: Some("silas".to_string()),
+        };
+
+        let observed_models = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let observed_tools = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        let mut provider_factory = {
+            let observed_models = observed_models.clone();
+            let observed_tools = observed_tools.clone();
+            move |child_config: &crate::config::Config| {
+                observed_models
+                    .lock()
+                    .expect("models mutex poisoned")
+                    .push((
+                        child_config.model.clone(),
+                        child_config.reasoning_effort.clone(),
+                    ));
+                let provider = RecordingProvider {
+                    assistant_text: "child finished".to_string(),
+                    observed_tools: observed_tools.clone(),
+                };
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| false;
+
+        let result = spawn_and_drain_with_provider(
+            &mut store,
+            &config,
+            &sessions_dir,
+            SpawnRequest {
+                parent_session_id: "parent".to_string(),
+                task: "child task".to_string(),
+                task_kind: Some("code_review".to_string()),
+                tier: Some("t3".to_string()),
+                model_override: Some("gpt-child".to_string()),
+                reasoning_override: Some("high".to_string()),
+            },
+            &mut provider_factory,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.resolved_model, "gpt-child");
+        assert_eq!(
+            result.last_assistant_response,
+            Some("child finished".to_string())
+        );
+        assert_eq!(
+            observed_models
+                .lock()
+                .expect("models mutex poisoned")
+                .as_slice(),
+            &[("gpt-child".to_string(), Some("high".to_string()))]
+        );
+        assert_eq!(
+            observed_tools
+                .lock()
+                .expect("tools mutex poisoned")
+                .as_slice(),
+            &[vec!["execute".to_string()]]
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_and_drain_invokes_approval_handler_for_t3_shell_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct ApprovalGateProvider {
+            call_index: Arc<AtomicUsize>,
+        }
+
+        impl crate::llm::LlmProvider for ApprovalGateProvider {
+            async fn stream_completion(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: &[FunctionTool],
+                _on_token: &mut (dyn FnMut(String) + Send),
+            ) -> Result<StreamedTurn> {
+                match self.call_index.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(streamed_turn_with_tool_call(
+                        Some("requesting approval"),
+                        "true",
+                        "call-1",
+                    )),
+                    _ => Ok(StreamedTurn {
+                        assistant_message: ChatMessage {
+                            role: crate::llm::ChatRole::Assistant,
+                            principal: Principal::Agent,
+                            content: vec![MessageContent::text("approval handled")],
+                        },
+                        tool_calls: vec![],
+                        meta: Some(crate::llm::TurnMeta {
+                            model: Some("gpt-child".to_string()),
+                            input_tokens: Some(1),
+                            output_tokens: Some(1),
+                            reasoning_tokens: None,
+                            reasoning_trace: None,
+                        }),
+                        stop_reason: StopReason::Stop,
+                    }),
+                }
+            }
+        }
+
+        let root = temp_queue_root("spawn_and_drain_approval");
+        let queue_path = root.join("queue.sqlite");
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let mut store = Store::new(&queue_path).unwrap();
+        store.create_session("parent", None).unwrap();
+
+        let mut config = crate::config::Config {
+            model: "gpt-test".to_string(),
+            system_prompt: "system".to_string(),
+            base_url: "https://example.test/api".to_string(),
+            reasoning_effort: Some("medium".to_string()),
+            session_name: None,
+            operator_key: None,
+            shell_policy: shell_policy("approve", &[], &[], &[], "medium"),
+            budget: None,
+            read: crate::config::ReadToolConfig::default(),
+            queue: crate::config::QueueConfig::default(),
+            identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
+            agents: {
+                let mut agents = crate::config::AgentsConfig::default();
+                agents.entries.insert(
+                    "silas".to_string(),
+                    crate::config::AgentDefinition {
+                        identity: Some("silas".to_string()),
+                        tier: None,
+                        model: None,
+                        base_url: None,
+                        system_prompt: None,
+                        session_name: None,
+                        reasoning_effort: None,
+                        t1: crate::config::AgentTierConfig::default(),
+                        t2: crate::config::AgentTierConfig::default(),
+                    },
+                );
+                agents
+            },
+            models: {
+                let mut models = crate::config::ModelsConfig::default();
+                models.default = Some("gpt-child".to_string());
+                models.catalog.insert(
+                    "gpt-child".to_string(),
+                    crate::config::ModelDefinition {
+                        provider: "openai".to_string(),
+                        model: "gpt-child".to_string(),
+                        caps: vec!["code_review".to_string()],
+                        context_window: Some(128_000),
+                        cost_tier: Some("medium".to_string()),
+                        cost_unit: Some(2),
+                        enabled: Some(true),
+                    },
+                );
+                models.routes.insert(
+                    "code_review".to_string(),
+                    crate::config::ModelRoute {
+                        requires: vec!["code_review".to_string()],
+                        prefer: vec!["gpt-child".to_string()],
+                    },
+                );
+                models
+            },
+            domains: Default::default(),
+            active_agent: Some("silas".to_string()),
+        };
+        config.agents.entries.get_mut("silas").unwrap().tier = Some("t3".to_string());
+
+        let approval_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let mut provider_factory = {
+            let call_index = Arc::new(AtomicUsize::new(0));
+            let observed_calls = observed_calls.clone();
+            move |_child_config: &crate::config::Config| {
+                let provider = ApprovalGateProvider {
+                    call_index: call_index.clone(),
+                };
+                let observed_calls = observed_calls.clone();
+                async move {
+                    observed_calls
+                        .lock()
+                        .expect("calls mutex poisoned")
+                        .push(vec!["execute".to_string()]);
+                    Ok::<_, anyhow::Error>(provider)
+                }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| {
+            approval_calls.fetch_add(1, Ordering::SeqCst);
+            true
+        };
+
+        let result = spawn_and_drain_with_provider(
+            &mut store,
+            &config,
+            &sessions_dir,
+            SpawnRequest {
+                parent_session_id: "parent".to_string(),
+                task: "child task".to_string(),
+                task_kind: Some("code_review".to_string()),
+                tier: Some("t3".to_string()),
+                model_override: Some("gpt-child".to_string()),
+                reasoning_override: Some("high".to_string()),
+            },
+            &mut provider_factory,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.last_assistant_response,
+            Some("approval handled".to_string())
+        );
+        assert!(approval_calls.load(Ordering::SeqCst) > 0);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_and_drain_rejects_invalid_persisted_tier() {
+        use std::sync::{Arc, Mutex};
+
+        let root = temp_queue_root("spawn_and_drain_bad_tier");
+        let queue_path = root.join("queue.sqlite");
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let mut store = Store::new(&queue_path).unwrap();
+        store.create_session("parent", None).unwrap();
+        let spawn_result = spawn_child(
+            &mut store,
+            &crate::config::Config {
+                model: "gpt-test".to_string(),
+                system_prompt: "system".to_string(),
+                base_url: "https://example.test/api".to_string(),
+                reasoning_effort: None,
+                session_name: None,
+                operator_key: None,
+                shell_policy: crate::config::ShellPolicy::default(),
+                budget: None,
+                read: crate::config::ReadToolConfig::default(),
+                queue: crate::config::QueueConfig::default(),
+                identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
+                agents: {
+                    let mut agents = crate::config::AgentsConfig::default();
+                    agents.entries.insert(
+                        "silas".to_string(),
+                        crate::config::AgentDefinition {
+                            identity: Some("silas".to_string()),
+                            tier: None,
+                            model: None,
+                            base_url: None,
+                            system_prompt: None,
+                            session_name: None,
+                            reasoning_effort: None,
+                            t1: crate::config::AgentTierConfig::default(),
+                            t2: crate::config::AgentTierConfig::default(),
+                        },
+                    );
+                    agents
+                },
+                models: {
+                    let mut models = crate::config::ModelsConfig::default();
+                    models.default = Some("gpt-child".to_string());
+                    models.catalog.insert(
+                        "gpt-child".to_string(),
+                        crate::config::ModelDefinition {
+                            provider: "openai".to_string(),
+                            model: "gpt-child".to_string(),
+                            caps: vec!["code_review".to_string()],
+                            context_window: Some(128_000),
+                            cost_tier: Some("medium".to_string()),
+                            cost_unit: Some(2),
+                            enabled: Some(true),
+                        },
+                    );
+                    models.routes.insert(
+                        "code_review".to_string(),
+                        crate::config::ModelRoute {
+                            requires: vec!["code_review".to_string()],
+                            prefer: vec!["gpt-child".to_string()],
+                        },
+                    );
+                    models
+                },
+                domains: Default::default(),
+                active_agent: Some("silas".to_string()),
+            },
+            crate::gate::BudgetSnapshot::default(),
+            SpawnRequest {
+                parent_session_id: "parent".to_string(),
+                task: "child task".to_string(),
+                task_kind: Some("code_review".to_string()),
+                tier: Some("t2".to_string()),
+                model_override: Some("gpt-child".to_string()),
+                reasoning_override: Some("high".to_string()),
+            },
+        )
+        .unwrap();
+
+        let bad_metadata = serde_json::json!({
+            "parent_session_id": "parent",
+            "task": "child task",
+            "task_kind": "code_review",
+            "tier": "bogus",
+            "model_override": "gpt-child",
+            "reasoning_override": "high",
+            "resolved_model": spawn_result.resolved_model,
+            "resolved_provider_model": "gpt-child",
+        })
+        .to_string();
+
+        let observed_tools = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let mut provider_factory = {
+            let observed_tools = observed_tools.clone();
+            move |_child_config: &crate::config::Config| {
+                let provider = RecordingProvider {
+                    assistant_text: "child finished".to_string(),
+                    observed_tools: observed_tools.clone(),
+                };
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        let context = SpawnDrainContext {
+            store: &mut store,
+            config: &crate::config::Config {
+                model: "gpt-test".to_string(),
+                system_prompt: "system".to_string(),
+                base_url: "https://example.test/api".to_string(),
+                reasoning_effort: None,
+                session_name: None,
+                operator_key: None,
+                shell_policy: crate::config::ShellPolicy::default(),
+                budget: None,
+                read: crate::config::ReadToolConfig::default(),
+                queue: crate::config::QueueConfig::default(),
+                identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
+                agents: {
+                    let mut agents = crate::config::AgentsConfig::default();
+                    agents.entries.insert(
+                        "silas".to_string(),
+                        crate::config::AgentDefinition {
+                            identity: Some("silas".to_string()),
+                            tier: None,
+                            model: None,
+                            base_url: None,
+                            system_prompt: None,
+                            session_name: None,
+                            reasoning_effort: None,
+                            t1: crate::config::AgentTierConfig::default(),
+                            t2: crate::config::AgentTierConfig::default(),
+                        },
+                    );
+                    agents
+                },
+                models: {
+                    let mut models = crate::config::ModelsConfig::default();
+                    models.default = Some("gpt-child".to_string());
+                    models.catalog.insert(
+                        "gpt-child".to_string(),
+                        crate::config::ModelDefinition {
+                            provider: "openai".to_string(),
+                            model: "gpt-child".to_string(),
+                            caps: vec!["code_review".to_string()],
+                            context_window: Some(128_000),
+                            cost_tier: Some("medium".to_string()),
+                            cost_unit: Some(2),
+                            enabled: Some(true),
+                        },
+                    );
+                    models.routes.insert(
+                        "code_review".to_string(),
+                        crate::config::ModelRoute {
+                            requires: vec!["code_review".to_string()],
+                            prefer: vec!["gpt-child".to_string()],
+                        },
+                    );
+                    models
+                },
+                domains: Default::default(),
+                active_agent: Some("silas".to_string()),
+            },
+            session_dir: &sessions_dir,
+            spawn_result,
+        };
+
+        let error = finish_spawned_child_drain(
+            context,
+            &bad_metadata,
+            &mut provider_factory,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .expect_err("invalid persisted tier should fail");
+
+        assert!(error.to_string().contains("invalid child tier"));
+        assert!(
+            observed_tools
+                .lock()
+                .expect("tools mutex poisoned")
+                .is_empty(),
+            "provider should never be created for invalid metadata"
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }

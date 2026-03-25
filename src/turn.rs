@@ -301,7 +301,7 @@ fn build_turn_with_tool(
     turn
 }
 
-/// Build the default turn used by both CLI and server execution paths.
+/// Build the default T1 turn, kept for backward compatibility.
 pub fn build_default_turn(config: &crate::config::Config) -> Turn {
     build_turn_with_tool(
         config,
@@ -824,6 +824,85 @@ mod tests {
         assert!(turn.delegation_config().is_none());
     }
 
+    #[test]
+    fn build_turn_for_spawned_t1_child_contains_execute_and_delegation() {
+        let mut config = test_config_for_tier(None, None);
+        let agent = config
+            .agents
+            .entries
+            .get_mut("silas")
+            .expect("test config should include silas");
+        agent.t1.delegation_token_threshold = Some(12_000);
+        agent.t1.delegation_tool_depth = Some(3);
+
+        let child_config = config
+            .with_spawned_child_runtime("t1", "gpt-5.4", None)
+            .expect("expected spawned child config");
+        let turn = build_turn_for_config(&child_config);
+        let tool_names: Vec<_> = turn
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        assert_eq!(tool_names, vec!["execute".to_string()]);
+        assert_eq!(
+            turn.delegation_config(),
+            Some(&crate::delegation::DelegationConfig {
+                token_threshold: Some(12_000),
+                tool_depth_threshold: Some(3),
+            })
+        );
+    }
+
+    #[test]
+    fn build_turn_for_spawned_t2_child_contains_only_read_file() {
+        let config = test_config_for_tier(None, None)
+            .with_spawned_child_runtime("t2", "o3", Some("high"))
+            .expect("expected spawned child config");
+        let turn = build_turn_for_config(&config);
+        let tool_names: Vec<_> = turn
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let guard_names: Vec<_> = turn.guards.iter().map(|guard| guard.name()).collect();
+
+        assert_eq!(tool_names, vec!["read_file".to_string()]);
+        assert_eq!(guard_names, vec!["secret-redactor".to_string()]);
+        assert!(turn.delegation_config().is_none());
+    }
+
+    #[tokio::test]
+    async fn build_turn_for_spawned_t2_child_missing_shell_tool_fails_closed() {
+        let config = test_config_for_tier(None, None)
+            .with_spawned_child_runtime("t2", "o3", None)
+            .expect("expected spawned child config");
+        let turn = build_turn_for_config(&config);
+
+        let err = turn
+            .execute_tool("execute", "{}")
+            .await
+            .expect_err("shell tool should not be available in spawned T2");
+        assert!(err.to_string().contains("tool 'execute' not found"));
+    }
+
+    #[test]
+    fn build_turn_for_spawned_t3_child_contains_execute() {
+        let config = test_config_for_tier(None, None)
+            .with_spawned_child_runtime("t3", "gpt-child", None)
+            .expect("expected spawned child config");
+        let turn = build_turn_for_config(&config);
+        let tool_names: Vec<_> = turn
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        assert_eq!(tool_names, vec!["execute".to_string()]);
+        assert!(turn.delegation_config().is_none());
+    }
+
     #[tokio::test]
     async fn build_t2_turn_missing_shell_tool_fails_closed() {
         let turn = build_t2_turn(&test_config_for_tier(Some("t2"), None));
@@ -837,14 +916,22 @@ mod tests {
 
     #[test]
     fn build_t3_turn_contains_execute_and_full_shell_guards() {
-        let turn = build_t3_turn(&test_config_for_tier(
+        let mut config = test_config_for_tier(
             Some("t3"),
             Some(BudgetConfig {
                 max_tokens_per_turn: Some(1),
                 max_tokens_per_session: None,
                 max_tokens_per_day: None,
             }),
-        ));
+        );
+        let agent = config
+            .agents
+            .entries
+            .get_mut("silas")
+            .expect("test config should include silas");
+        agent.t1.delegation_token_threshold = Some(12_000);
+        agent.t1.delegation_tool_depth = Some(3);
+        let turn = build_t3_turn(&config);
 
         let tool_names: Vec<_> = turn
             .tool_definitions()

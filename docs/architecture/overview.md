@@ -30,12 +30,12 @@ gate/budget.rs (199L)       Per-turn/session/day token ceiling enforcement
 gate/output_cap.rs (215L)   Shell output cap + file-backed result storage
 gate/secret_patterns.rs (778L)  Shared secret pattern catalog + protected path detection + env wrapper stripping
 context.rs (383L)           ContextSource trait — Identity (prompt files), History (replay, not wired)
-turn.rs (723L)              Turn composition: tier-aware ContextSource + Tool + Guard builder, taint via is_taint_source()
+turn.rs                     Turn composition: tier-aware ContextSource + Tool + Guard builder, taint via is_taint_source()
 tool.rs (665L)              Shell tool: async exec, RLIMIT, process-group kill, bounded output drain
 store.rs (715L)             SQLite session registry + message queue + subscriptions table
 auth.rs (401L)              OAuth device flow, token storage/refresh
 config.rs                    agents.toml loading, ShellPolicy, BudgetConfig, resolved identity file lists
-spawn.rs                     Child-session creation, model resolution, budget preflight, completion enqueueing
+spawn.rs                     Child-session creation, tier/model resolution, budget preflight, completion enqueueing
 identity.rs                  Loads explicit identity file lists and template helpers
 principal.rs (92L)          Principal enum (Operator/User/System/Agent), trust/taint source mapping
 cli.rs (116L)               CLI display helpers, denial formatting
@@ -71,7 +71,7 @@ agent loop (run_agent_loop):
 Shell (`sh -lc`) remains the execution tool for T1 and T3. T2 uses the structured `read_file` API only. Tool selection now happens in `turn.rs`, not in the agent loop or provider layers.
 
 ### Guard pipeline (gate/)
-Guards in order: BudgetGuard → SecretRedactor → ShellSafety → ExfilDetector.
+Guards in order for shell-backed turns: BudgetGuard → SecretRedactor → ShellSafety → ExfilDetector. T2 skips ShellSafety and ExfilDetector because it uses `read_file` only.
 BudgetGuard is only wired when `[budget]` config exists.
 Verdict precedence: Deny > Approve > Allow. `resolve_verdict()` in turn.rs.
 Guards check inbound messages, tool calls, and outbound text.
@@ -80,7 +80,7 @@ ShellSafety uses a configurable policy (`[shell]` in agents.toml) with allow/den
 **Note:** these are heuristics, not a security boundary. See [../risks.md](../risks.md).
 
 ### Model routing
-Model selection is config-only in this phase. `models.catalog` stores the enabled provider/model definitions, `models.routes` maps task kinds to preferred catalog keys, and `models.default` is the fail-closed fallback. Unknown task kinds do not invent a model; if routing does not produce an enabled catalog entry, spawn fails. `spawn_child()` resolves the final catalog key before persistence and stores the resolved name in child metadata for later runtime wiring.
+Model selection is config-only in this phase. `models.catalog` stores the enabled provider/model definitions, `models.routes` maps task kinds to preferred catalog keys, and `models.default` is the fail-closed fallback. Unknown task kinds do not invent a model; if routing does not produce an enabled catalog entry, spawn fails. `spawn_child()` resolves the final catalog key before persistence and stores the resolved name, resolved provider model, and concrete tier in child metadata. `spawn_and_drain()` reads that metadata back, rebuilds the child `Config`, and then drains the child queue with the tier-specific `Turn`.
 
 Pre-spawn budget validation happens before the child session is created. It checks the live `BudgetSnapshot` against session/day ceilings only; the per-turn ceiling remains part of the agent loop guard pipeline, not child spawn preflight.
 

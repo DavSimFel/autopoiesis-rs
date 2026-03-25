@@ -425,6 +425,130 @@ mod tests {
     }
 
     #[test]
+    fn spawned_child_runtime_uses_t2_identity_files_and_reasoning_override() {
+        let path = temp_toml_path(
+            "spawned_child_t2",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nbase_url='https://example.test/api'\nsystem_prompt='legacy defaults'\nsession_name='legacy-session'\nmodel='gpt-5.4-mini'\nreasoning='medium'\ndelegation_token_threshold=12000\ndelegation_tool_depth=3\n[agents.silas.t2]\nmodel='o3'\nreasoning='xhigh'\n[models]\ndefault='gpt5_mini'\n[models.catalog.gpt5_mini]\nprovider='openai'\nmodel='gpt-5.4-mini'\n[domains]\nselected=['fitness']\n[domains.fitness]\ncontext_extend='identity-templates/domains/fitness.md'\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        let child = config
+            .with_spawned_child_runtime("t2", "o3", Some("high"))
+            .expect("expected child runtime config");
+
+        assert_eq!(child.model, "o3");
+        assert_eq!(child.reasoning_effort, Some("high".to_string()));
+        assert_eq!(
+            child.identity_files,
+            vec![
+                PathBuf::from("identity-templates/constitution.md"),
+                PathBuf::from("identity-templates/context.md"),
+                PathBuf::from("identity-templates/domains/fitness.md"),
+            ]
+        );
+        assert_eq!(
+            child
+                .active_agent_definition()
+                .and_then(|agent| agent.tier.as_deref()),
+            Some("t2")
+        );
+    }
+
+    #[test]
+    fn spawned_child_runtime_uses_t1_identity_files_and_selected_domains() {
+        let path = temp_toml_path(
+            "spawned_child_t1",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nbase_url='https://example.test/api'\nsystem_prompt='legacy defaults'\nsession_name='legacy-session'\nmodel='gpt-5.4-mini'\nreasoning='medium'\n[agents.silas.t2]\nmodel='o3'\nreasoning='xhigh'\n[models]\ndefault='gpt5_mini'\n[models.catalog.gpt5_mini]\nprovider='openai'\nmodel='gpt-5.4-mini'\n[domains]\nselected=['fitness']\n[domains.fitness]\ncontext_extend='identity-templates/domains/fitness.md'\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        let child = config
+            .with_spawned_child_runtime("t1", "gpt-5.4-mini", None)
+            .expect("expected child runtime config");
+
+        assert_eq!(child.model, "gpt-5.4-mini");
+        assert_eq!(
+            child.identity_files,
+            vec![
+                PathBuf::from("identity-templates/constitution.md"),
+                PathBuf::from("identity-templates/agents/silas/agent.md"),
+                PathBuf::from("identity-templates/context.md"),
+                PathBuf::from("identity-templates/domains/fitness.md"),
+            ]
+        );
+        assert_eq!(
+            child
+                .active_agent_definition()
+                .and_then(|agent| agent.tier.as_deref()),
+            Some("t1")
+        );
+    }
+
+    #[test]
+    fn spawned_child_runtime_falls_back_to_parent_reasoning_and_session_name() {
+        let config = Config {
+            model: "gpt-5.4-mini".to_string(),
+            system_prompt: "parent system".to_string(),
+            base_url: "https://example.test/api".to_string(),
+            reasoning_effort: Some("parent-reasoning".to_string()),
+            session_name: Some("parent-session".to_string()),
+            operator_key: None,
+            shell_policy: ShellPolicy::default(),
+            budget: None,
+            read: ReadToolConfig::default(),
+            queue: QueueConfig::default(),
+            identity_files: vec![
+                PathBuf::from("identity-templates/constitution.md"),
+                PathBuf::from("identity-templates/context.md"),
+            ],
+            agents: {
+                let mut agents = AgentsConfig::default();
+                agents.entries.insert(
+                    "silas".to_string(),
+                    AgentDefinition {
+                        identity: Some("silas".to_string()),
+                        tier: None,
+                        model: None,
+                        base_url: None,
+                        system_prompt: None,
+                        session_name: None,
+                        reasoning_effort: None,
+                        t1: AgentTierConfig::default(),
+                        t2: AgentTierConfig::default(),
+                    },
+                );
+                agents
+            },
+            models: {
+                let mut models = ModelsConfig::default();
+                models.default = Some("gpt-5.4-mini".to_string());
+                models.catalog.insert(
+                    "gpt-5.4-mini".to_string(),
+                    ModelDefinition {
+                        provider: "openai".to_string(),
+                        model: "gpt-5.4-mini".to_string(),
+                        caps: vec!["code_review".to_string()],
+                        context_window: Some(128_000),
+                        cost_tier: Some("medium".to_string()),
+                        cost_unit: Some(2),
+                        enabled: Some(true),
+                    },
+                );
+                models
+            },
+            domains: Default::default(),
+            active_agent: Some("silas".to_string()),
+        };
+
+        let child = config
+            .with_spawned_child_runtime("t1", "gpt-5.4-mini", None)
+            .expect("expected child runtime config");
+
+        assert_eq!(child.reasoning_effort, Some("parent-reasoning".to_string()));
+        assert_eq!(child.session_name, Some("parent-session".to_string()));
+    }
+
+    #[test]
     fn loads_tightened_shell_policy_fixture() {
         let path = temp_toml_path(
             "tightened_shell",
@@ -1069,6 +1193,125 @@ impl Config {
     pub fn active_t1_config(&self) -> Option<&AgentTierConfig> {
         self.active_agent_definition().map(|agent| &agent.t1)
     }
+
+    /// Clone the current runtime config and retarget it for a spawned child session.
+    pub fn with_spawned_child_runtime(
+        &self,
+        tier: &str,
+        provider_model: &str,
+        reasoning_override: Option<&str>,
+    ) -> Result<Self> {
+        validate_spawn_tier(tier)?;
+
+        let mut config = self.clone();
+        let parent_reasoning_effort = config.reasoning_effort.clone();
+        let parent_session_name = config.session_name.clone();
+        let active_name = config
+            .active_agent
+            .clone()
+            .ok_or_else(|| anyhow!("spawned child config requires an active agent"))?;
+
+        let selected_identity = {
+            let agent = config
+                .agents
+                .entries
+                .get_mut(&active_name)
+                .ok_or_else(|| anyhow!("spawned child config missing active agent entry"))?;
+            agent.tier = Some(tier.to_string());
+            agent
+                .identity
+                .clone()
+                .unwrap_or_else(|| active_name.clone())
+        };
+
+        config.identity_files = if matches!(tier, "t2" | "t3") {
+            identity::t2_identity_files("identity-templates")
+        } else {
+            identity::t1_identity_files("identity-templates", &selected_identity)
+        };
+        if !config.domains.entries.is_empty() && config.domains.selected.is_empty() {
+            return Err(anyhow!(
+                "domains config must select at least one context pack"
+            ));
+        }
+        for domain_name in &config.domains.selected {
+            let Some(domain) = config.domains.entries.get(domain_name) else {
+                return Err(anyhow!(
+                    "selected domain pack is missing from [domains]: {domain_name}"
+                ));
+            };
+            let Some(path) = domain.context_extend.as_ref() else {
+                return Err(anyhow!(
+                    "selected domain pack is missing context_extend: {domain_name}"
+                ));
+            };
+            validate_domain_context_extend(path)?;
+            config.identity_files.push(PathBuf::from(path));
+        }
+
+        config.model = provider_model.to_string();
+        config.reasoning_effort = reasoning_override.map(ToString::to_string).or_else(|| {
+            let agent = config.active_agent_definition()?;
+            let tier_config = if matches!(tier, "t2" | "t3") {
+                &agent.t2
+            } else {
+                &agent.t1
+            };
+            tier_config
+                .reasoning
+                .clone()
+                .or_else(|| tier_config.reasoning_effort.clone())
+                .or_else(|| agent.reasoning_effort.clone())
+                .or(parent_reasoning_effort.clone())
+        });
+        config.base_url = {
+            let agent = config
+                .active_agent_definition()
+                .ok_or_else(|| anyhow!("spawned child config missing active agent definition"))?;
+            let tier_config = if matches!(tier, "t2" | "t3") {
+                &agent.t2
+            } else {
+                &agent.t1
+            };
+            tier_config
+                .base_url
+                .clone()
+                .or_else(|| agent.base_url.clone())
+                .unwrap_or_else(|| config.base_url.clone())
+        };
+        config.system_prompt = {
+            let agent = config
+                .active_agent_definition()
+                .ok_or_else(|| anyhow!("spawned child config missing active agent definition"))?;
+            let tier_config = if matches!(tier, "t2" | "t3") {
+                &agent.t2
+            } else {
+                &agent.t1
+            };
+            tier_config
+                .system_prompt
+                .clone()
+                .or_else(|| agent.system_prompt.clone())
+                .unwrap_or_else(|| config.system_prompt.clone())
+        };
+        config.session_name = {
+            let agent = config
+                .active_agent_definition()
+                .ok_or_else(|| anyhow!("spawned child config missing active agent definition"))?;
+            let tier_config = if matches!(tier, "t2" | "t3") {
+                &agent.t2
+            } else {
+                &agent.t1
+            };
+            tier_config
+                .session_name
+                .clone()
+                .or_else(|| agent.session_name.clone())
+                .or(parent_session_name.clone())
+        };
+
+        Ok(config)
+    }
 }
 
 fn validate_read_tool_config(read: &ReadToolConfig) -> Result<()> {
@@ -1081,4 +1324,11 @@ fn validate_read_tool_config(read: &ReadToolConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_spawn_tier(tier: &str) -> Result<()> {
+    match tier {
+        "t1" | "t2" | "t3" => Ok(()),
+        other => Err(anyhow!("invalid child tier: {other}")),
+    }
 }

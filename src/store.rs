@@ -181,6 +181,19 @@ impl Store {
         }
     }
 
+    /// Return the stored metadata for a session, if the session exists.
+    pub fn get_session_metadata(&self, session_id: &str) -> Result<Option<String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT metadata FROM sessions WHERE id = ?1")
+            .context("failed to prepare get_session_metadata query")?;
+        match statement.query_row(params![session_id], |row| row.get::<_, Option<String>>(0)) {
+            Ok(metadata) => Ok(metadata),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error).context("failed to read session metadata"),
+        }
+    }
+
     /// Return child session ids ordered by creation time.
     pub fn list_child_sessions(&self, parent_id: &str) -> Result<Vec<String>> {
         let mut statement = self
@@ -606,6 +619,29 @@ mod tests {
             store.list_child_sessions("parent").unwrap(),
             vec!["child-a".to_string(), "child-b".to_string()]
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn get_session_metadata_reads_persisted_json() {
+        let path = temp_db_path("session_metadata");
+        let mut store = Store::new(&path).unwrap();
+
+        store
+            .create_session("root", Some(r#"{"tier":"t2","model":"gpt-5.4-mini"}"#))
+            .unwrap();
+        store.create_session("empty", None).unwrap();
+
+        assert_eq!(
+            store.get_session_metadata("root").unwrap(),
+            Some(r#"{"tier":"t2","model":"gpt-5.4-mini"}"#.to_string())
+        );
+        assert_eq!(
+            store.get_session_metadata("empty").unwrap(),
+            Some("{}".to_string())
+        );
+        assert_eq!(store.get_session_metadata("missing").unwrap(), None);
 
         let _ = std::fs::remove_file(&path);
     }

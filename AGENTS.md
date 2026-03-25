@@ -37,11 +37,11 @@ docs/                Architecture, specs, risks, vision, roadmap (see docs/index
 
 ## Architecture rules
 
-1. **One tool.** Shell is the universal tool. Don't add tools — teach the prompt.
+1. **Tiered tools.** Shell remains the universal execution tool for T1/T3. T2 uses `read_file` only.
 2. **Guard pipeline order.** Deny > Approve > Allow in `resolve_verdict()` (turn.rs).
 3. **No `unsafe` outside tool.rs.** `set_resource_limits()`, `signal_process_group()`, and the `pre_exec` closure.
 4. **Traits for composition.** ContextSource, Tool, Guard, LlmProvider, TokenSink, ApprovalHandler.
-5. **Two paths share one Turn.** CLI and server both use `build_default_turn()`. Don't diverge.
+5. **Two paths share one Turn.** CLI and server both use `build_turn_for_config()`. Don't diverge.
 6. **Specs sync on every merge.** Every merge that changes `src/` must update relevant docs. Pre-commit hook auto-updates architecture stats.
 
 ## Coding standards
@@ -134,7 +134,7 @@ docs/                Architecture, specs, risks, vision, roadmap (see docs/index
 
 ## Don't
 
-- Don't add tools. One tool.
+- Don't add tools without updating the tier rules.
 - Don't add `#[allow(unused)]` to suppress real issues.
 - Don't skip tests or weaken assertions.
 - Don't put secrets in code.

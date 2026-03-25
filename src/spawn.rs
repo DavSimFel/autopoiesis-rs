@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use serde_json::json;
 
 use crate::config::Config;
 use crate::gate::BudgetSnapshot;
@@ -20,6 +19,7 @@ pub struct SpawnRequest {
     pub parent_session_id: String,
     pub task: String,
     pub task_kind: Option<String>,
+    pub tier: Option<String>,
     pub model_override: Option<String>,
     pub reasoning_override: Option<String>,
 }
@@ -29,6 +29,33 @@ pub struct SpawnRequest {
 pub struct SpawnResult {
     pub child_session_id: String,
     pub resolved_model: String,
+}
+
+/// Result returned after a spawned child drains to completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnDrainResult {
+    pub child_session_id: String,
+    pub resolved_model: String,
+    pub last_assistant_response: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ChildSessionMetadata {
+    parent_session_id: String,
+    task: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_kind: Option<String>,
+    tier: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_override: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_override: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_model: Option<String>,
+    resolved_model: String,
+    resolved_provider_model: String,
 }
 
 static NEXT_CHILD_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -82,6 +109,26 @@ fn resolve_model<'a>(
     ModelSelector::new(&config.models).select_model(request.task_kind.as_deref())
 }
 
+fn validate_tier(tier: &str) -> Result<()> {
+    match tier {
+        "t1" | "t2" | "t3" => Ok(()),
+        other => Err(anyhow::anyhow!("invalid child tier: {other}")),
+    }
+}
+
+fn resolve_spawn_tier(config: &Config, request: &SpawnRequest) -> Result<String> {
+    let tier = if let Some(tier) = request.tier.as_deref() {
+        tier
+    } else {
+        config
+            .active_agent_definition()
+            .and_then(|agent| agent.tier.as_deref())
+            .unwrap_or("t1")
+    };
+    validate_tier(tier)?;
+    Ok(tier.to_string())
+}
+
 /// Create a child session and enqueue its initial task in the shared store.
 pub fn spawn_child(
     store: &mut Store,
@@ -90,20 +137,23 @@ pub fn spawn_child(
     request: SpawnRequest,
 ) -> Result<SpawnResult> {
     validate_spawn_budget(config, parent_budget)?;
+    let resolved_tier = resolve_spawn_tier(config, &request)?;
     let selected_model = resolve_model(config, &request)?;
     let child_session_id = generate_child_session_id();
-    let metadata = json!({
-        "parent_session_id": request.parent_session_id,
-        "task": request.task,
-        "task_kind": request.task_kind,
-        "model_override": request.model_override,
-        "reasoning_override": request.reasoning_override,
-        "active_agent": config.active_agent,
-        "default_model": config.models.default.clone(),
-        "resolved_model": selected_model.key,
-        "resolved_provider_model": selected_model.definition.model,
-    })
-    .to_string();
+    let metadata = ChildSessionMetadata {
+        parent_session_id: request.parent_session_id.clone(),
+        task: request.task.clone(),
+        task_kind: request.task_kind.clone(),
+        tier: resolved_tier,
+        model_override: request.model_override.clone(),
+        reasoning_override: request.reasoning_override.clone(),
+        active_agent: config.active_agent.clone(),
+        default_model: config.models.default.clone(),
+        resolved_model: selected_model.key.to_string(),
+        resolved_provider_model: selected_model.definition.model.to_string(),
+    };
+    let metadata =
+        serde_json::to_string(&metadata).context("failed to serialize child metadata")?;
 
     store
         .create_child_session_with_task(
@@ -277,6 +327,7 @@ mod tests {
             parent_session_id: "parent".to_string(),
             task: "inspect the tree".to_string(),
             task_kind: Some("code_review".to_string()),
+            tier: Some("t2".to_string()),
             model_override: Some("gpt-child".to_string()),
             reasoning_override: Some("high".to_string()),
         };
@@ -339,6 +390,7 @@ mod tests {
             parent_session_id: "parent".to_string(),
             task: "inspect the tree".to_string(),
             task_kind: None,
+            tier: None,
             model_override: None,
             reasoning_override: None,
         };
@@ -376,6 +428,7 @@ mod tests {
             parent_session_id: "parent".to_string(),
             task: "inspect the tree".to_string(),
             task_kind: Some("code_review".to_string()),
+            tier: None,
             model_override: Some("missing".to_string()),
             reasoning_override: None,
         };
@@ -419,6 +472,7 @@ mod tests {
             parent_session_id: "parent".to_string(),
             task: "inspect the tree".to_string(),
             task_kind: Some("code_review".to_string()),
+            tier: None,
             model_override: Some("gpt-child".to_string()),
             reasoning_override: None,
         };
@@ -450,6 +504,7 @@ mod tests {
             parent_session_id: "missing".to_string(),
             task: "do work".to_string(),
             task_kind: None,
+            tier: None,
             model_override: None,
             reasoning_override: None,
         };
@@ -484,6 +539,7 @@ mod tests {
             parent_session_id: "parent".to_string(),
             task: "inspect".to_string(),
             task_kind: Some("code_review".to_string()),
+            tier: None,
             model_override: None,
             reasoning_override: None,
         };
@@ -535,6 +591,7 @@ mod tests {
             parent_session_id: "parent".to_string(),
             task: "inspect".to_string(),
             task_kind: Some("code_review".to_string()),
+            tier: None,
             model_override: None,
             reasoning_override: None,
         };
@@ -586,6 +643,7 @@ mod tests {
             parent_session_id: "parent".to_string(),
             task: "inspect".to_string(),
             task_kind: Some("code_review".to_string()),
+            tier: None,
             model_override: None,
             reasoning_override: None,
         };
