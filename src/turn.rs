@@ -2,13 +2,14 @@ use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::context::ContextSource;
+use crate::context::{ContextSource, Identity, SkillContext, SkillLoader};
 use crate::gate::{
     BudgetGuard, ExfilDetector, Guard, GuardContext, GuardEvent, SecretRedactor, Severity,
     ShellSafety, Verdict,
 };
 use crate::llm::{ChatMessage, FunctionTool, ToolCall};
 use crate::read_tool::ReadFile;
+use crate::skills::SkillDefinition;
 use crate::tool::Tool;
 use tracing::{debug, warn};
 
@@ -272,16 +273,19 @@ fn build_turn_with_tool(
     include_shell_guards: bool,
     include_delegation: bool,
     include_skills: bool,
+    skill_loader: Option<Vec<crate::skills::SkillDefinition>>,
 ) -> Turn {
     let tool_definition = tool.definition();
     let vars = identity_vars_for_turn(config, std::slice::from_ref(&tool_definition));
 
     let mut turn = Turn::new().context(
-        crate::context::Identity::new(config.identity_files.clone(), vars, &config.system_prompt)
-            .strict(),
+        Identity::new(config.identity_files.clone(), vars, &config.system_prompt).strict(),
     );
     if include_skills {
-        turn = turn.context(crate::context::SkillContext::new(config.skills.browse()));
+        turn = turn.context(SkillContext::new(config.skills.browse()));
+    }
+    if let Some(skills) = skill_loader {
+        turn = turn.context(SkillLoader::new(skills));
     }
     turn = turn.tool(tool);
     turn = add_budget_guard(turn, config).guard(SecretRedactor::default_catalog());
@@ -325,6 +329,7 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
         true,
         true,
         true,
+        None,
     )
 }
 
@@ -351,6 +356,7 @@ pub fn build_t2_turn(config: &crate::config::Config) -> Turn {
         false,
         false,
         true,
+        None,
     )
 }
 
@@ -365,6 +371,21 @@ pub fn build_t3_turn(config: &crate::config::Config) -> Turn {
         true,
         false,
         false,
+        None,
+    )
+}
+
+pub fn build_spawned_t3_turn(config: &crate::config::Config, skills: Vec<SkillDefinition>) -> Turn {
+    build_turn_with_tool(
+        config,
+        crate::tool::Shell::with_limits(
+            config.shell_policy.max_output_bytes,
+            config.shell_policy.max_timeout_ms,
+        ),
+        true,
+        false,
+        false,
+        Some(skills),
     )
 }
 
@@ -1129,6 +1150,92 @@ mod tests {
             .collect();
 
         assert_eq!(tool_names, vec!["execute".to_string()]);
+        assert!(turn.delegation_config().is_none());
+    }
+
+    #[test]
+    fn build_spawned_t3_turn_merges_skill_loader_fragment_into_first_system_message() {
+        let config = test_config_for_tier(Some("t3"), None);
+        let turn = build_spawned_t3_turn(
+            &config,
+            vec![SkillDefinition {
+                name: "planning".to_string(),
+                description: "Produces implementation plans".to_string(),
+                instructions: "Plan work carefully.".to_string(),
+                required_caps: vec!["reasoning".to_string()],
+                token_estimate: 10,
+            }],
+        );
+
+        let mut messages = Vec::new();
+        turn.assemble_context(&mut messages);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, crate::llm::ChatRole::System);
+        let system_text = messages[0]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                MessageContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(system_text.contains("system"));
+        assert!(system_text.contains("Skill: planning"));
+        assert!(system_text.contains("Plan work carefully."));
+    }
+
+    #[test]
+    fn build_spawned_t3_turn_does_not_include_available_skills_summary_block() {
+        let config = test_config_for_tier(Some("t3"), None);
+        let turn = build_spawned_t3_turn(
+            &config,
+            vec![SkillDefinition {
+                name: "planning".to_string(),
+                description: "Produces implementation plans".to_string(),
+                instructions: "Plan work carefully.".to_string(),
+                required_caps: vec!["reasoning".to_string()],
+                token_estimate: 10,
+            }],
+        );
+
+        let mut messages = Vec::new();
+        turn.assemble_context(&mut messages);
+        let system_text = messages[0]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                MessageContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!system_text.contains("Available skills:"));
+    }
+
+    #[test]
+    fn build_spawned_t3_turn_keeps_t3_toolset_and_guard_behavior() {
+        let config = test_config_for_tier(Some("t3"), None);
+        let turn = build_spawned_t3_turn(
+            &config,
+            vec![SkillDefinition {
+                name: "planning".to_string(),
+                description: "Produces implementation plans".to_string(),
+                instructions: "Plan work carefully.".to_string(),
+                required_caps: vec!["reasoning".to_string()],
+                token_estimate: 10,
+            }],
+        );
+        let tool_names: Vec<_> = turn
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        assert_eq!(tool_names, vec!["execute".to_string()]);
+        assert!(turn.has_guard("shell-policy"));
+        assert!(turn.has_guard("exfiltration-detector"));
         assert!(turn.delegation_config().is_none());
     }
 

@@ -1,7 +1,6 @@
 //! Agent orchestration loop coordinating model turns and tool execution.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use serde_json::{Value, from_str};
 use std::path::Path;
 
@@ -54,19 +53,6 @@ pub fn spawn_child(
     request: SpawnRequest,
 ) -> Result<SpawnResult> {
     crate::spawn::spawn_child(store, config, parent_budget, request)
-}
-
-#[derive(Debug, Deserialize)]
-struct SpawnedChildMetadata {
-    tier: String,
-    resolved_model: String,
-    resolved_provider_model: String,
-    #[serde(default)]
-    reasoning_override: Option<String>,
-}
-
-fn parse_spawned_child_metadata(metadata: &str) -> Result<SpawnedChildMetadata> {
-    serde_json::from_str(metadata).context("failed to parse spawned child metadata")
 }
 
 async fn spawn_and_drain_with_provider<F, Fut, P, TS>(
@@ -134,7 +120,7 @@ where
     P: LlmProvider,
     TS: TokenSink + Send,
 {
-    let metadata = parse_spawned_child_metadata(metadata_json)?;
+    let metadata = crate::spawn::parse_child_session_metadata(metadata_json)?;
     if metadata.resolved_model != context.spawn_result.resolved_model {
         return Err(anyhow::anyhow!(
             "spawned child metadata resolved_model does not match spawn result"
@@ -146,7 +132,10 @@ where
         &metadata.resolved_provider_model,
         metadata.reasoning_override.as_deref(),
     )?;
-    let turn = crate::turn::build_turn_for_config(&child_config);
+    let turn = match metadata.tier.as_str() {
+        "t3" => crate::turn::build_spawned_t3_turn(&child_config, metadata.skills.clone()),
+        _ => crate::turn::build_turn_for_config(&child_config),
+    };
 
     let child_session_dir = context
         .session_dir
@@ -1088,6 +1077,126 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct MessageRecordingProvider {
+        assistant_text: String,
+        observed_system_texts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl crate::llm::LlmProvider for MessageRecordingProvider {
+        async fn stream_completion(
+            &self,
+            messages: &[ChatMessage],
+            tools: &[FunctionTool],
+            _on_token: &mut (dyn FnMut(String) + Send),
+        ) -> Result<StreamedTurn> {
+            self.observed_system_texts
+                .lock()
+                .expect("system text mutex poisoned")
+                .push(
+                    messages
+                        .iter()
+                        .find(|message| message.role == crate::llm::ChatRole::System)
+                        .map(|message| {
+                            message
+                                .content
+                                .iter()
+                                .filter_map(|block| match block {
+                                    MessageContent::Text { text } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default(),
+                );
+
+            let _ = tools;
+            Ok(StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    principal: Principal::Agent,
+                    content: vec![MessageContent::text(self.assistant_text.clone())],
+                },
+                tool_calls: vec![],
+                meta: Some(crate::llm::TurnMeta {
+                    model: Some("gpt-child".to_string()),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    reasoning_tokens: None,
+                    reasoning_trace: None,
+                }),
+                stop_reason: StopReason::Stop,
+            })
+        }
+    }
+
+    fn spawned_t3_test_config(
+        skills_dir: std::path::PathBuf,
+        skills: crate::skills::SkillCatalog,
+    ) -> crate::config::Config {
+        crate::config::Config {
+            model: "gpt-test".to_string(),
+            system_prompt: "system".to_string(),
+            base_url: "https://example.test/api".to_string(),
+            reasoning_effort: Some("medium".to_string()),
+            session_name: None,
+            operator_key: None,
+            shell_policy: crate::config::ShellPolicy::default(),
+            budget: None,
+            read: crate::config::ReadToolConfig::default(),
+            queue: crate::config::QueueConfig::default(),
+            identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
+            skills_dir: skills_dir.clone(),
+            skills_dir_resolved: skills_dir,
+            skills,
+            agents: {
+                let mut agents = crate::config::AgentsConfig::default();
+                agents.entries.insert(
+                    "silas".to_string(),
+                    crate::config::AgentDefinition {
+                        identity: Some("silas".to_string()),
+                        tier: None,
+                        model: None,
+                        base_url: None,
+                        system_prompt: None,
+                        session_name: None,
+                        reasoning_effort: None,
+                        t1: crate::config::AgentTierConfig::default(),
+                        t2: crate::config::AgentTierConfig::default(),
+                    },
+                );
+                agents
+            },
+            models: {
+                let mut models = crate::config::ModelsConfig::default();
+                models.default = Some("gpt-child".to_string());
+                models.catalog.insert(
+                    "gpt-child".to_string(),
+                    crate::config::ModelDefinition {
+                        provider: "openai".to_string(),
+                        model: "gpt-child".to_string(),
+                        caps: vec!["code_review".to_string()],
+                        context_window: Some(128_000),
+                        cost_tier: Some("medium".to_string()),
+                        cost_unit: Some(2),
+                        enabled: Some(true),
+                    },
+                );
+                models.routes.insert(
+                    "code_review".to_string(),
+                    crate::config::ModelRoute {
+                        requires: vec!["code_review".to_string()],
+                        prefer: vec!["gpt-child".to_string()],
+                    },
+                );
+                models
+            },
+            domains: Default::default(),
+            active_agent: Some("silas".to_string()),
+        }
+    }
+
     fn message_text(message: &ChatMessage) -> Option<&str> {
         message.content.iter().find_map(|block| match block {
             MessageContent::Text { text } => Some(text.as_str()),
@@ -1433,6 +1542,7 @@ mod tests {
                 tier: Some("t2".to_string()),
                 model_override: Some("gpt-child".to_string()),
                 reasoning_override: Some("low".to_string()),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1606,6 +1716,7 @@ mod tests {
                 tier: Some("t2".to_string()),
                 model_override: Some("gpt-child".to_string()),
                 reasoning_override: Some("high".to_string()),
+                ..Default::default()
             },
             &mut provider_factory,
             &mut token_sink,
@@ -1745,6 +1856,7 @@ mod tests {
                 tier: Some("t3".to_string()),
                 model_override: Some("gpt-child".to_string()),
                 reasoning_override: Some("high".to_string()),
+                ..Default::default()
             },
             &mut provider_factory,
             &mut token_sink,
@@ -1772,6 +1884,198 @@ mod tests {
                 .as_slice(),
             &[vec!["execute".to_string()]]
         );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_spawned_t3_uses_persisted_skill_snapshot_not_catalog_lookup() {
+        use std::sync::{Arc, Mutex};
+
+        let root = temp_queue_root("spawned_t3_skill_snapshot");
+        let queue_path = root.join("queue.sqlite");
+        let sessions_dir = root.join("sessions");
+        let skills_dir = root.join("skills");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("code-review.toml"),
+            "[skill]\nname='code-review'\ndescription='Reviews code changes'\nrequired_caps=['code_review']\ntoken_estimate=500\ninstructions='Original instructions.'\n",
+        )
+        .unwrap();
+
+        let mut config = spawned_t3_test_config(
+            skills_dir.clone(),
+            crate::skills::SkillCatalog::load_from_dir(&skills_dir).unwrap(),
+        );
+
+        let mut store = Store::new(&queue_path).unwrap();
+        store.create_session("parent", None).unwrap();
+
+        let spawn_result = spawn_child(
+            &mut store,
+            &config,
+            crate::gate::BudgetSnapshot::default(),
+            SpawnRequest {
+                parent_session_id: "parent".to_string(),
+                task: "child task".to_string(),
+                task_kind: Some("code_review".to_string()),
+                tier: Some("t3".to_string()),
+                model_override: Some("gpt-child".to_string()),
+                reasoning_override: Some("high".to_string()),
+                skills: vec!["code-review".to_string()],
+                skill_token_budget: Some(2_000),
+            },
+        )
+        .unwrap();
+
+        std::fs::write(
+            skills_dir.join("code-review.toml"),
+            "[skill]\nname='code-review'\ndescription='Reviews code changes'\nrequired_caps=['code_review']\ntoken_estimate=500\ninstructions='Mutated instructions.'\n",
+        )
+        .unwrap();
+        config.skills = crate::skills::SkillCatalog::load_from_dir(&skills_dir).unwrap_or_default();
+
+        let observed_system_texts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut provider_factory = {
+            let observed_system_texts = observed_system_texts.clone();
+            move |_child_config: &crate::config::Config| {
+                let provider = MessageRecordingProvider {
+                    assistant_text: "child finished".to_string(),
+                    observed_system_texts: observed_system_texts.clone(),
+                };
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        let metadata_json = store
+            .get_session_metadata(&spawn_result.child_session_id)
+            .unwrap()
+            .expect("child metadata should exist");
+        let context = SpawnDrainContext {
+            store: &mut store,
+            config: &config,
+            session_dir: &sessions_dir,
+            spawn_result,
+        };
+
+        let result = finish_spawned_child_drain(
+            context,
+            &metadata_json,
+            &mut provider_factory,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.resolved_model, "gpt-child");
+        let system_texts = observed_system_texts
+            .lock()
+            .expect("system text mutex poisoned");
+        assert_eq!(system_texts.len(), 1);
+        assert!(system_texts[0].contains("Skill: code-review"));
+        assert!(system_texts[0].contains("Original instructions."));
+        assert!(!system_texts[0].contains("Mutated instructions."));
+        assert!(!system_texts[0].contains("Available skills:"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_old_spawned_child_without_skills_metadata_still_runs() {
+        use std::sync::{Arc, Mutex};
+
+        let root = temp_queue_root("spawned_t3_old_metadata");
+        let queue_path = root.join("queue.sqlite");
+        let sessions_dir = root.join("sessions");
+        let skills_dir = root.join("skills");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("code-review.toml"),
+            "[skill]\nname='code-review'\ndescription='Reviews code changes'\nrequired_caps=['code_review']\ntoken_estimate=500\ninstructions='Original instructions.'\n",
+        )
+        .unwrap();
+
+        let config = spawned_t3_test_config(
+            skills_dir.clone(),
+            crate::skills::SkillCatalog::load_from_dir(&skills_dir).unwrap(),
+        );
+
+        let mut store = Store::new(&queue_path).unwrap();
+        store.create_session("parent", None).unwrap();
+
+        let spawn_result = spawn_child(
+            &mut store,
+            &config,
+            crate::gate::BudgetSnapshot::default(),
+            SpawnRequest {
+                parent_session_id: "parent".to_string(),
+                task: "child task".to_string(),
+                task_kind: Some("code_review".to_string()),
+                tier: Some("t3".to_string()),
+                model_override: Some("gpt-child".to_string()),
+                reasoning_override: Some("high".to_string()),
+                skills: vec!["code-review".to_string()],
+                skill_token_budget: Some(2_000),
+            },
+        )
+        .unwrap();
+
+        let mut metadata_value: Value = serde_json::from_str(
+            &store
+                .get_session_metadata(&spawn_result.child_session_id)
+                .unwrap()
+                .expect("child metadata should exist"),
+        )
+        .unwrap();
+        metadata_value
+            .as_object_mut()
+            .expect("metadata should be an object")
+            .remove("skills");
+        let old_metadata_json = metadata_value.to_string();
+
+        let observed_system_texts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut provider_factory = {
+            let observed_system_texts = observed_system_texts.clone();
+            move |_child_config: &crate::config::Config| {
+                let provider = MessageRecordingProvider {
+                    assistant_text: "child finished".to_string(),
+                    observed_system_texts: observed_system_texts.clone(),
+                };
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        let context = SpawnDrainContext {
+            store: &mut store,
+            config: &config,
+            session_dir: &sessions_dir,
+            spawn_result,
+        };
+
+        let result = finish_spawned_child_drain(
+            context,
+            &old_metadata_json,
+            &mut provider_factory,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.resolved_model, "gpt-child");
+        let system_texts = observed_system_texts
+            .lock()
+            .expect("system text mutex poisoned");
+        assert_eq!(system_texts.len(), 1);
+        assert!(!system_texts[0].contains("Skill: code-review"));
+        assert!(!system_texts[0].contains("Available skills:"));
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1925,6 +2229,7 @@ mod tests {
                 tier: Some("t3".to_string()),
                 model_override: Some("gpt-child".to_string()),
                 reasoning_override: Some("high".to_string()),
+                ..Default::default()
             },
             &mut provider_factory,
             &mut token_sink,
@@ -2023,6 +2328,7 @@ mod tests {
                 tier: Some("t2".to_string()),
                 model_override: Some("gpt-child".to_string()),
                 reasoning_override: Some("high".to_string()),
+                ..Default::default()
             },
         )
         .unwrap();

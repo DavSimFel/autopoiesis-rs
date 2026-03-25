@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::identity;
 use crate::llm::{ChatMessage, ChatRole, MessageContent};
+use crate::skills::SkillDefinition;
 use crate::skills::SkillSummary;
 use tracing::warn;
 
@@ -97,6 +98,47 @@ pub struct SkillContext {
 impl SkillContext {
     pub fn new(summaries: Vec<SkillSummary>) -> Self {
         Self { summaries }
+    }
+}
+
+/// Full skill instructions for spawned T3 children.
+pub struct SkillLoader {
+    skills: Vec<SkillDefinition>,
+}
+
+impl SkillLoader {
+    pub fn new(skills: Vec<SkillDefinition>) -> Self {
+        Self { skills }
+    }
+
+    pub fn render_fragment(&self) -> String {
+        self.skills
+            .iter()
+            .map(|skill| format!("Skill: {}\n{}", skill.name, skill.instructions))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
+
+impl ContextSource for SkillLoader {
+    fn name(&self) -> &str {
+        "skill_loader"
+    }
+
+    fn assemble(&self, messages: &mut Vec<ChatMessage>) {
+        let rendered = self.render_fragment();
+        if rendered.is_empty() {
+            return;
+        }
+
+        if let Some(first) = messages.first_mut()
+            && first.role == ChatRole::System
+        {
+            first.content.push(MessageContent::text(rendered));
+            return;
+        }
+
+        messages.insert(0, ChatMessage::system(rendered));
     }
 }
 
@@ -369,6 +411,81 @@ mod tests {
             )
         );
         assert!(messages[0].content.iter().any(|block| matches!(block, MessageContent::Text { text } if text == "Available skills: code-review (Reviews code changes)")));
+    }
+
+    #[test]
+    fn skill_loader_renders_single_skill_fragment() {
+        let source = SkillLoader::new(vec![SkillDefinition {
+            name: "code-review".to_string(),
+            description: "Reviews code changes".to_string(),
+            instructions: "Review carefully.".to_string(),
+            required_caps: vec!["code".to_string()],
+            token_estimate: 100,
+        }]);
+
+        assert_eq!(
+            source.render_fragment(),
+            "Skill: code-review\nReview carefully."
+        );
+
+        let mut messages = Vec::new();
+        source.assemble(&mut messages);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, ChatRole::System);
+        assert!(matches!(
+            &messages[0].content[..],
+            [MessageContent::Text { text }] if text == "Skill: code-review\nReview carefully."
+        ));
+    }
+
+    #[test]
+    fn skill_loader_renders_multiple_skills_in_request_order() {
+        let source = SkillLoader::new(vec![
+            SkillDefinition {
+                name: "planning".to_string(),
+                description: "Plans work".to_string(),
+                instructions: "Plan carefully.".to_string(),
+                required_caps: vec!["reasoning".to_string()],
+                token_estimate: 10,
+            },
+            SkillDefinition {
+                name: "code-review".to_string(),
+                description: "Reviews code changes".to_string(),
+                instructions: "Review carefully.".to_string(),
+                required_caps: vec!["code".to_string()],
+                token_estimate: 20,
+            },
+        ]);
+
+        assert_eq!(
+            source.render_fragment(),
+            "Skill: planning\nPlan carefully.\n\nSkill: code-review\nReview carefully."
+        );
+    }
+
+    #[test]
+    fn skill_loader_merges_into_existing_system_message() {
+        let source = SkillLoader::new(vec![SkillDefinition {
+            name: "code-review".to_string(),
+            description: "Reviews code changes".to_string(),
+            instructions: "Review carefully.".to_string(),
+            required_caps: vec!["code".to_string()],
+            token_estimate: 100,
+        }]);
+
+        let mut messages = vec![ChatMessage::system("base".to_string())];
+        source.assemble(&mut messages);
+        assert_eq!(messages.len(), 1);
+        let text = messages[0]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                MessageContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text, "base\nSkill: code-review\nReview carefully.");
     }
 
     #[test]

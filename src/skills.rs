@@ -6,9 +6,9 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillDefinition {
     pub name: String,
     pub description: String,
@@ -142,6 +142,33 @@ impl SkillCatalog {
         self.skills.iter().find(|skill| skill.name == name)
     }
 
+    pub fn resolve_requested_skills(&self, requested: &[String]) -> Result<Vec<SkillDefinition>> {
+        let mut resolved = Vec::with_capacity(requested.len());
+        let mut seen = HashSet::new();
+
+        for name in requested {
+            if !seen.insert(name.clone()) {
+                return Err(anyhow!("duplicate skill request: {name}"));
+            }
+
+            let skill = self
+                .get(name)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown skill requested: {name}"))?;
+            resolved.push(skill);
+        }
+
+        Ok(resolved)
+    }
+
+    pub fn sum_token_estimates(skills: &[SkillDefinition]) -> Result<u64> {
+        skills.iter().try_fold(0u64, |total, skill| {
+            total
+                .checked_add(skill.token_estimate)
+                .ok_or_else(|| anyhow!("skill token estimate overflow"))
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.skills.is_empty()
     }
@@ -258,6 +285,7 @@ Full prompt body.
             summaries[0].description,
             "Reviews code changes for correctness, style, and security"
         );
+        assert_eq!(summaries[1].description, "Produces implementation plans");
     }
 
     #[test]
@@ -364,5 +392,63 @@ instructions = "real"
             .expect_err("duplicate names should fail");
         assert!(err.to_string().contains("duplicate skill name"));
         assert_eq!(skills.len(), 1);
+    }
+
+    #[test]
+    fn resolve_requested_skills_preserves_order() {
+        let catalog = catalog();
+        let requested = vec!["planning".to_string(), "code-review".to_string()];
+        let resolved = catalog.resolve_requested_skills(&requested).unwrap();
+        assert_eq!(resolved[0].name, "planning");
+        assert_eq!(resolved[1].name, "code-review");
+    }
+
+    #[test]
+    fn resolve_requested_skills_rejects_unknown_name() {
+        let catalog = catalog();
+        let err = catalog
+            .resolve_requested_skills(&["missing".to_string()])
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown skill requested"));
+    }
+
+    #[test]
+    fn resolve_requested_skills_rejects_duplicate_name() {
+        let catalog = catalog();
+        let err = catalog
+            .resolve_requested_skills(&["planning".to_string(), "planning".to_string()])
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate skill request"));
+    }
+
+    #[test]
+    fn sum_skill_token_estimates_matches_requested_set() {
+        let catalog = catalog();
+        let requested = vec!["planning".to_string(), "code-review".to_string()];
+        let resolved = catalog.resolve_requested_skills(&requested).unwrap();
+        assert_eq!(SkillCatalog::sum_token_estimates(&resolved).unwrap(), 800);
+    }
+
+    #[test]
+    fn sum_skill_token_estimates_rejects_overflow() {
+        let skills = vec![
+            SkillDefinition {
+                name: "overflow-a".to_string(),
+                description: "a".to_string(),
+                instructions: "a".to_string(),
+                required_caps: vec![],
+                token_estimate: u64::MAX,
+            },
+            SkillDefinition {
+                name: "overflow-b".to_string(),
+                description: "b".to_string(),
+                instructions: "b".to_string(),
+                required_caps: vec![],
+                token_estimate: 1,
+            },
+        ];
+
+        let err = SkillCatalog::sum_token_estimates(&skills).unwrap_err();
+        assert!(err.to_string().contains("overflow"));
     }
 }

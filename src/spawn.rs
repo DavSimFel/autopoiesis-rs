@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::gate::BudgetSnapshot;
@@ -11,10 +12,11 @@ use crate::llm::{ChatRole, MessageContent};
 use crate::model_selection::ModelSelector;
 use crate::principal::Principal;
 use crate::session::Session;
+use crate::skills::{SkillCatalog, SkillDefinition};
 use crate::store::Store;
 
 /// Parameters for creating a child session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SpawnRequest {
     pub parent_session_id: String,
     pub task: String,
@@ -22,6 +24,10 @@ pub struct SpawnRequest {
     pub tier: Option<String>,
     pub model_override: Option<String>,
     pub reasoning_override: Option<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub skill_token_budget: Option<u64>,
 }
 
 /// Result returned after a child session is created.
@@ -39,23 +45,29 @@ pub struct SpawnDrainResult {
     pub last_assistant_response: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct ChildSessionMetadata {
-    parent_session_id: String,
-    task: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ChildSessionMetadata {
+    pub(crate) parent_session_id: String,
+    pub(crate) task: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    task_kind: Option<String>,
-    tier: String,
+    pub(crate) task_kind: Option<String>,
+    pub(crate) tier: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    model_override: Option<String>,
+    pub(crate) model_override: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_override: Option<String>,
+    pub(crate) reasoning_override: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    active_agent: Option<String>,
+    pub(crate) active_agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    default_model: Option<String>,
-    resolved_model: String,
-    resolved_provider_model: String,
+    pub(crate) default_model: Option<String>,
+    pub(crate) resolved_model: String,
+    pub(crate) resolved_provider_model: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) skills: Vec<SkillDefinition>,
+}
+
+pub(crate) fn parse_child_session_metadata(metadata: &str) -> Result<ChildSessionMetadata> {
+    serde_json::from_str(metadata).context("failed to parse spawned child metadata")
 }
 
 static NEXT_CHILD_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -129,6 +141,54 @@ fn resolve_spawn_tier(config: &Config, request: &SpawnRequest) -> Result<String>
     Ok(tier.to_string())
 }
 
+fn validate_requested_skills(
+    config: &Config,
+    resolved_tier: &str,
+    selected_model: &crate::model_selection::SelectedModel<'_>,
+    request: &SpawnRequest,
+) -> Result<Vec<SkillDefinition>> {
+    if !request.skills.is_empty() && resolved_tier != "t3" {
+        return Err(anyhow::anyhow!(
+            "skills may only be loaded for spawned t3 children"
+        ));
+    }
+
+    let resolved_skills = config
+        .skills
+        .resolve_requested_skills(&request.skills)
+        .map_err(|error| anyhow::anyhow!("failed to resolve requested child skills: {error}"))?;
+
+    let budget = request.skill_token_budget.unwrap_or(4_096);
+    let total_tokens = SkillCatalog::sum_token_estimates(&resolved_skills)?;
+    if total_tokens > budget {
+        return Err(anyhow::anyhow!(
+            "spawn rejected: requested skills exceed token budget (estimated {}, budget {})",
+            total_tokens,
+            budget
+        ));
+    }
+
+    for skill in &resolved_skills {
+        for required_cap in &skill.required_caps {
+            if !selected_model
+                .definition
+                .caps
+                .iter()
+                .any(|cap| cap == required_cap)
+            {
+                return Err(anyhow::anyhow!(
+                    "spawn rejected: model {} lacks required cap `{}` for skill `{}`",
+                    selected_model.key,
+                    required_cap,
+                    skill.name
+                ));
+            }
+        }
+    }
+
+    Ok(resolved_skills)
+}
+
 /// Create a child session and enqueue its initial task in the shared store.
 pub fn spawn_child(
     store: &mut Store,
@@ -139,6 +199,8 @@ pub fn spawn_child(
     validate_spawn_budget(config, parent_budget)?;
     let resolved_tier = resolve_spawn_tier(config, &request)?;
     let selected_model = resolve_model(config, &request)?;
+    let resolved_skills =
+        validate_requested_skills(config, &resolved_tier, &selected_model, &request)?;
     let child_session_id = generate_child_session_id();
     let metadata = ChildSessionMetadata {
         parent_session_id: request.parent_session_id.clone(),
@@ -151,6 +213,7 @@ pub fn spawn_child(
         default_model: config.models.default.clone(),
         resolved_model: selected_model.key.to_string(),
         resolved_provider_model: selected_model.definition.model.to_string(),
+        skills: resolved_skills,
     };
     let metadata =
         serde_json::to_string(&metadata).context("failed to serialize child metadata")?;
@@ -312,6 +375,21 @@ mod tests {
         }
     }
 
+    fn write_skill(path: &std::path::Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, body).unwrap();
+    }
+
+    fn skill_config(skill_dir: &std::path::Path) -> Config {
+        let mut config = test_config();
+        config.skills_dir = skill_dir.to_path_buf();
+        config.skills_dir_resolved = skill_dir.to_path_buf();
+        config.skills = SkillCatalog::load_from_dir(skill_dir).unwrap();
+        config
+    }
+
     fn assistant_message(text: &str, principal: Principal) -> ChatMessage {
         let mut message =
             ChatMessage::with_role_with_principal(ChatRole::Assistant, Some(principal));
@@ -333,6 +411,7 @@ mod tests {
             tier: Some("t2".to_string()),
             model_override: Some("gpt-child".to_string()),
             reasoning_override: Some("high".to_string()),
+            ..Default::default()
         };
 
         let result = spawn_child(
@@ -396,6 +475,7 @@ mod tests {
             tier: None,
             model_override: None,
             reasoning_override: None,
+            ..Default::default()
         };
 
         let result = spawn_child(
@@ -434,6 +514,7 @@ mod tests {
             tier: None,
             model_override: Some("missing".to_string()),
             reasoning_override: None,
+            ..Default::default()
         };
 
         let err = spawn_child(
@@ -478,6 +559,7 @@ mod tests {
             tier: None,
             model_override: Some("gpt-child".to_string()),
             reasoning_override: None,
+            ..Default::default()
         };
 
         let err = spawn_child(&mut store, &config, BudgetSnapshot::default(), request)
@@ -510,6 +592,7 @@ mod tests {
             tier: None,
             model_override: None,
             reasoning_override: None,
+            ..Default::default()
         };
 
         let err = spawn_child(
@@ -545,6 +628,7 @@ mod tests {
             tier: None,
             model_override: None,
             reasoning_override: None,
+            ..Default::default()
         };
 
         let err = spawn_child(
@@ -597,6 +681,7 @@ mod tests {
             tier: None,
             model_override: None,
             reasoning_override: None,
+            ..Default::default()
         };
 
         let err = spawn_child(
@@ -649,6 +734,7 @@ mod tests {
             tier: None,
             model_override: None,
             reasoning_override: None,
+            ..Default::default()
         };
 
         let result = spawn_child(
@@ -777,6 +863,371 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_request_deserializes_missing_skills_as_empty() {
+        let request: SpawnRequest =
+            serde_json::from_str(r#"{"parent_session_id":"parent","task":"inspect the tree"}"#)
+                .unwrap();
+        assert!(request.skills.is_empty());
+        assert!(request.skill_token_budget.is_none());
+    }
+
+    #[test]
+    fn spawn_rejects_skills_for_non_t3_child() {
+        let root = temp_root("spawn_child_skills_non_t3");
+        let skills_dir = root.join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        write_skill(
+            &skills_dir.join("code-review.toml"),
+            "[skill]\nname='code-review'\ndescription='Reviews code changes'\nrequired_caps=['code_review']\ntoken_estimate=500\ninstructions='Original instructions.'\n",
+        );
+
+        let mut store = Store::new(&root.join("queue.sqlite")).unwrap();
+        store.create_session("parent", None).unwrap();
+
+        let request = SpawnRequest {
+            parent_session_id: "parent".to_string(),
+            task: "inspect".to_string(),
+            task_kind: Some("code_review".to_string()),
+            tier: Some("t2".to_string()),
+            model_override: Some("gpt-child".to_string()),
+            reasoning_override: None,
+            skills: vec!["code-review".to_string()],
+            skill_token_budget: None,
+        };
+
+        let err = spawn_child(
+            &mut store,
+            &skill_config(&skills_dir),
+            BudgetSnapshot::default(),
+            request,
+        )
+        .expect_err("non-t3 children must reject skills");
+        assert!(
+            err.to_string()
+                .contains("skills may only be loaded for spawned t3 children")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_rejects_unknown_skill_name() {
+        let root = temp_root("spawn_child_unknown_skill");
+        let skills_dir = root.join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        write_skill(
+            &skills_dir.join("code-review.toml"),
+            "[skill]\nname='code-review'\ndescription='Reviews code changes'\nrequired_caps=['code_review']\ntoken_estimate=500\ninstructions='Original instructions.'\n",
+        );
+
+        let mut store = Store::new(&root.join("queue.sqlite")).unwrap();
+        store.create_session("parent", None).unwrap();
+
+        let request = SpawnRequest {
+            parent_session_id: "parent".to_string(),
+            task: "inspect".to_string(),
+            task_kind: Some("code_review".to_string()),
+            tier: Some("t3".to_string()),
+            model_override: Some("gpt-child".to_string()),
+            reasoning_override: None,
+            skills: vec!["missing".to_string()],
+            skill_token_budget: None,
+        };
+
+        let err = spawn_child(
+            &mut store,
+            &skill_config(&skills_dir),
+            BudgetSnapshot::default(),
+            request,
+        )
+        .expect_err("unknown skills must fail closed");
+        assert!(err.to_string().contains("unknown skill requested"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_rejects_duplicate_skill_name() {
+        let root = temp_root("spawn_child_duplicate_skill");
+        let skills_dir = root.join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        write_skill(
+            &skills_dir.join("code-review.toml"),
+            "[skill]\nname='code-review'\ndescription='Reviews code changes'\nrequired_caps=['code_review']\ntoken_estimate=500\ninstructions='Original instructions.'\n",
+        );
+
+        let mut store = Store::new(&root.join("queue.sqlite")).unwrap();
+        store.create_session("parent", None).unwrap();
+
+        let request = SpawnRequest {
+            parent_session_id: "parent".to_string(),
+            task: "inspect".to_string(),
+            task_kind: Some("code_review".to_string()),
+            tier: Some("t3".to_string()),
+            model_override: Some("gpt-child".to_string()),
+            reasoning_override: None,
+            skills: vec!["code-review".to_string(), "code-review".to_string()],
+            skill_token_budget: None,
+        };
+
+        let err = spawn_child(
+            &mut store,
+            &skill_config(&skills_dir),
+            BudgetSnapshot::default(),
+            request,
+        )
+        .expect_err("duplicate skills must fail closed");
+        assert!(err.to_string().contains("duplicate skill request"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_rejects_when_skill_tokens_exceed_explicit_budget() {
+        let root = temp_root("spawn_child_skill_budget_explicit");
+        let skills_dir = root.join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        write_skill(
+            &skills_dir.join("code-review.toml"),
+            "[skill]\nname='code-review'\ndescription='Reviews code changes'\nrequired_caps=['code_review']\ntoken_estimate=500\ninstructions='Original instructions.'\n",
+        );
+
+        let mut store = Store::new(&root.join("queue.sqlite")).unwrap();
+        store.create_session("parent", None).unwrap();
+
+        let request = SpawnRequest {
+            parent_session_id: "parent".to_string(),
+            task: "inspect".to_string(),
+            task_kind: Some("code_review".to_string()),
+            tier: Some("t3".to_string()),
+            model_override: Some("gpt-child".to_string()),
+            reasoning_override: None,
+            skills: vec!["code-review".to_string()],
+            skill_token_budget: Some(400),
+        };
+
+        let err = spawn_child(
+            &mut store,
+            &skill_config(&skills_dir),
+            BudgetSnapshot::default(),
+            request,
+        )
+        .expect_err("skill budget should be enforced");
+        assert!(err.to_string().contains("exceed token budget"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_rejects_when_skill_tokens_exceed_default_budget_4096() {
+        let root = temp_root("spawn_child_skill_budget_default");
+        let skills_dir = root.join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        write_skill(
+            &skills_dir.join("code-review.toml"),
+            "[skill]\nname='code-review'\ndescription='Reviews code changes'\nrequired_caps=['code_review']\ntoken_estimate=5000\ninstructions='Original instructions.'\n",
+        );
+
+        let mut store = Store::new(&root.join("queue.sqlite")).unwrap();
+        store.create_session("parent", None).unwrap();
+
+        let request = SpawnRequest {
+            parent_session_id: "parent".to_string(),
+            task: "inspect".to_string(),
+            task_kind: Some("code_review".to_string()),
+            tier: Some("t3".to_string()),
+            model_override: Some("gpt-child".to_string()),
+            reasoning_override: None,
+            skills: vec!["code-review".to_string()],
+            skill_token_budget: None,
+        };
+
+        let err = spawn_child(
+            &mut store,
+            &skill_config(&skills_dir),
+            BudgetSnapshot::default(),
+            request,
+        )
+        .expect_err("default skill budget should be enforced");
+        assert!(err.to_string().contains("exceed token budget"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_rejects_when_resolved_model_lacks_required_caps() {
+        let root = temp_root("spawn_child_skill_caps");
+        let skills_dir = root.join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        write_skill(
+            &skills_dir.join("planning.toml"),
+            "[skill]\nname='planning'\ndescription='Plans work'\nrequired_caps=['reasoning']\ntoken_estimate=500\ninstructions='Original instructions.'\n",
+        );
+
+        let mut store = Store::new(&root.join("queue.sqlite")).unwrap();
+        store.create_session("parent", None).unwrap();
+
+        let request = SpawnRequest {
+            parent_session_id: "parent".to_string(),
+            task: "inspect".to_string(),
+            task_kind: Some("code_review".to_string()),
+            tier: Some("t3".to_string()),
+            model_override: Some("gpt-child".to_string()),
+            reasoning_override: None,
+            skills: vec!["planning".to_string()],
+            skill_token_budget: Some(1000),
+        };
+
+        let err = spawn_child(
+            &mut store,
+            &skill_config(&skills_dir),
+            BudgetSnapshot::default(),
+            request,
+        )
+        .expect_err("missing caps should fail closed");
+        assert!(err.to_string().contains("lacks required cap"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_persists_resolved_skill_definitions_in_child_metadata() {
+        let root = temp_root("spawn_child_skill_metadata");
+        let skills_dir = root.join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        write_skill(
+            &skills_dir.join("code-review.toml"),
+            "[skill]\nname='code-review'\ndescription='Reviews code changes'\nrequired_caps=['code_review']\ntoken_estimate=500\ninstructions='Original instructions.'\n",
+        );
+
+        let mut store = Store::new(&root.join("queue.sqlite")).unwrap();
+        store.create_session("parent", None).unwrap();
+
+        let result = spawn_child(
+            &mut store,
+            &skill_config(&skills_dir),
+            BudgetSnapshot::default(),
+            SpawnRequest {
+                parent_session_id: "parent".to_string(),
+                task: "inspect".to_string(),
+                task_kind: Some("code_review".to_string()),
+                tier: Some("t3".to_string()),
+                model_override: Some("gpt-child".to_string()),
+                reasoning_override: None,
+                skills: vec!["code-review".to_string()],
+                skill_token_budget: Some(1000),
+            },
+        )
+        .unwrap();
+
+        let conn = rusqlite::Connection::open(root.join("queue.sqlite")).unwrap();
+        let metadata: String = conn
+            .query_row(
+                "SELECT metadata FROM sessions WHERE id = ?1",
+                [&result.child_session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(metadata.contains(r#""skills":[{"name":"code-review""#));
+        assert!(metadata.contains("Original instructions."));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawned_child_metadata_deserializes_old_rows_without_skills_field() {
+        let root = temp_root("spawn_child_skill_metadata_compat");
+        let skills_dir = root.join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        write_skill(
+            &skills_dir.join("code-review.toml"),
+            "[skill]\nname='code-review'\ndescription='Reviews code changes'\nrequired_caps=['code_review']\ntoken_estimate=500\ninstructions='Original instructions.'\n",
+        );
+
+        let mut store = Store::new(&root.join("queue.sqlite")).unwrap();
+        store.create_session("parent", None).unwrap();
+
+        let result = spawn_child(
+            &mut store,
+            &skill_config(&skills_dir),
+            BudgetSnapshot::default(),
+            SpawnRequest {
+                parent_session_id: "parent".to_string(),
+                task: "inspect".to_string(),
+                task_kind: Some("code_review".to_string()),
+                tier: Some("t3".to_string()),
+                model_override: Some("gpt-child".to_string()),
+                reasoning_override: None,
+                skills: vec!["code-review".to_string()],
+                skill_token_budget: Some(1000),
+            },
+        )
+        .unwrap();
+
+        let metadata_json: String = store
+            .get_session_metadata(&result.child_session_id)
+            .unwrap()
+            .expect("child metadata should exist");
+        let mut metadata_value: serde_json::Value = serde_json::from_str(&metadata_json).unwrap();
+        metadata_value
+            .as_object_mut()
+            .expect("metadata should be an object")
+            .remove("skills");
+        let parsed = parse_child_session_metadata(&metadata_value.to_string()).unwrap();
+        assert!(parsed.skills.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spawn_rejects_overflowing_skill_token_estimates() {
+        let root = temp_root("spawn_child_skill_budget_overflow");
+        let skills_dir = root.join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        write_skill(
+            &skills_dir.join("overflow.toml"),
+            "[skill]\nname='overflow'\ndescription='Overflow test'\nrequired_caps=['code_review']\ntoken_estimate=9223372036854775807\ninstructions='Original instructions.'\n",
+        );
+        write_skill(
+            &skills_dir.join("overflow-two.toml"),
+            "[skill]\nname='overflow-two'\ndescription='Overflow test'\nrequired_caps=['code_review']\ntoken_estimate=9223372036854775807\ninstructions='Original instructions.'\n",
+        );
+        write_skill(
+            &skills_dir.join("overflow-three.toml"),
+            "[skill]\nname='overflow-three'\ndescription='Overflow test'\nrequired_caps=['code_review']\ntoken_estimate=9223372036854775807\ninstructions='Original instructions.'\n",
+        );
+
+        let mut store = Store::new(&root.join("queue.sqlite")).unwrap();
+        store.create_session("parent", None).unwrap();
+
+        let request = SpawnRequest {
+            parent_session_id: "parent".to_string(),
+            task: "inspect".to_string(),
+            task_kind: Some("code_review".to_string()),
+            tier: Some("t3".to_string()),
+            model_override: Some("gpt-child".to_string()),
+            reasoning_override: None,
+            skills: vec![
+                "overflow".to_string(),
+                "overflow-two".to_string(),
+                "overflow-three".to_string(),
+            ],
+            skill_token_budget: None,
+        };
+
+        let err = spawn_child(
+            &mut store,
+            &skill_config(&skills_dir),
+            BudgetSnapshot::default(),
+            request,
+        )
+        .expect_err("overflowing skill estimates must fail closed");
+        assert!(err.to_string().contains("overflow"));
 
         let _ = fs::remove_dir_all(&root);
     }
