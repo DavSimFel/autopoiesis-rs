@@ -1514,45 +1514,49 @@ mod tests {
                 .unwrap();
         }
 
-        let release = Arc::new(tokio::sync::Notify::new());
-        let (starts_tx, mut starts_rx) = tokio::sync::mpsc::unbounded_channel();
-        let acquired = Arc::new(tokio::sync::Notify::new());
-        let turn = Arc::new(turn::Turn::new());
-
         #[derive(Clone)]
-        struct NotifyProvider {
-            label: &'static str,
+        struct BlockingProvider {
+            first_started: Arc<tokio::sync::Notify>,
             release: Arc<tokio::sync::Notify>,
-            starts: tokio::sync::mpsc::UnboundedSender<&'static str>,
-            turn: StreamedTurn,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
         }
 
-        impl llm::LlmProvider for NotifyProvider {
+        impl llm::LlmProvider for BlockingProvider {
             async fn stream_completion(
                 &self,
                 _messages: &[ChatMessage],
                 _tools: &[FunctionTool],
                 _on_token: &mut (dyn FnMut(String) + Send),
             ) -> Result<StreamedTurn> {
-                let _ = self.starts.send(self.label);
-                self.release.notified().await;
-                Ok(self.turn.clone())
+                match self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => {
+                        self.first_started.notify_one();
+                        self.release.notified().await;
+                        Ok(blocking_turn("serialized"))
+                    }
+                    1 => Ok(blocking_turn("serialized")),
+                    other => panic!("unexpected extra provider call: {other}"),
+                }
             }
         }
 
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let turn = Arc::new(turn::Turn::new());
+
         let state_a = state.clone();
-        let release_a = release.clone();
-        let starts_a = starts_tx.clone();
         let turn_a = turn.clone();
+        let provider = BlockingProvider {
+            first_started: first_started.clone(),
+            release: release.clone(),
+            calls: calls.clone(),
+        };
+        let provider_a = provider.clone();
+        let provider_b = provider.clone();
         let worker_a = tokio::spawn(async move {
-            let provider = NotifyProvider {
-                label: "first",
-                release: release_a,
-                starts: starts_a,
-                turn: blocking_turn("first"),
-            };
             let mut provider_factory = move || {
-                let provider = provider.clone();
+                let provider = provider_a.clone();
                 async move { Ok::<_, anyhow::Error>(provider) }
             };
             let mut token_sink = |_token: String| {};
@@ -1566,41 +1570,52 @@ mod tests {
                 &mut approval_handler,
             )
             .await
-            .unwrap()
         });
 
-        assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(2), starts_rx.recv())
-                .await
-                .expect("first worker should start")
-                .unwrap(),
-            "first"
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), first_started.notified())
+            .await
+            .expect("first worker should reach provider startup");
 
         let state_b = state.clone();
-        let acquired_b = acquired.clone();
-        let worker_b = tokio::spawn(async move {
-            let session_lock = state_b.session_lock(session_id);
-            let _guard = session_lock.lock().await;
-            acquired_b.notify_one();
+        let turn_b = turn.clone();
+        let mut worker_b = tokio::spawn(async move {
+            let mut provider_factory = move || {
+                let provider = provider_b.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            };
+            let mut token_sink = |_token: String| {};
+            let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+            drain_session_queue(
+                state_b,
+                session_id.to_string(),
+                turn_b.as_ref(),
+                &mut provider_factory,
+                &mut token_sink,
+                &mut approval_handler,
+            )
+            .await
         });
 
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(200), acquired.notified())
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut worker_b)
                 .await
                 .is_err(),
-            "second worker should wait on the same-session lock"
+            "second drain_session_queue call should stay pending until the first worker releases the session"
         );
 
         release.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            worker_a
-                .await
-                .expect("first worker should complete successfully");
-            acquired.notified().await;
+            assert!(
+                worker_a
+                    .await
+                    .expect("first worker should complete successfully")
+                    .is_ok(),
+                "first worker drain should succeed"
+            );
             worker_b
                 .await
-                .expect("second worker should complete successfully");
+                .expect("second worker should complete successfully")
+                .expect("second worker drain should succeed");
         })
         .await
         .expect("both workers should finish after lock release");

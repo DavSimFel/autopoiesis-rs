@@ -197,9 +197,9 @@ mod tests {
         let outbound_gate = make_secret_gate();
 
         let mut inbound = make_messages(&secret_string(2, "1234567890ABCDEF"));
-        let mut outbound = make_messages(&secret_string(2, "1234567890ABCDEF"));
         let mut inbound_event = GuardEvent::Inbound(&mut inbound);
-        let mut outbound_event = GuardEvent::Inbound(&mut outbound);
+        let mut outbound_delta = secret_string(2, "1234567890ABCDEF");
+        let mut outbound_event = GuardEvent::TextDelta(&mut outbound_delta);
 
         assert!(matches!(
             inbound_gate.check(&mut inbound_event, &GuardContext::default()),
@@ -209,6 +209,11 @@ mod tests {
             outbound_gate.check(&mut outbound_event, &GuardContext::default()),
             Verdict::Modify
         ));
+        match &inbound[0].content[0] {
+            MessageContent::Text { text } => assert_eq!(text, "[REDACTED]"),
+            other => panic!("expected text content, got {other:?}"),
+        }
+        assert_eq!(outbound_delta, "[REDACTED]");
     }
 
     #[test]

@@ -1380,4 +1380,56 @@ mod tests {
 
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    mod append_failure_regressions {
+        use super::*;
+
+        #[test]
+        fn append_failure_keeps_memory_and_persistence_separate() {
+            let dir = temp_sessions_dir("read_only_path_collision");
+            let mut session = Session::new(&dir).unwrap();
+            let today_path = session.today_path().to_path_buf();
+            std::fs::create_dir_all(&today_path).unwrap();
+
+            let assistant = ChatMessage {
+                role: ChatRole::Assistant,
+                principal: Principal::Agent,
+                content: vec![MessageContent::text("persist me")],
+            };
+
+            let meta = TurnMeta {
+                model: Some("gpt-test".to_string()),
+                input_tokens: Some(11),
+                output_tokens: Some(7),
+                reasoning_tokens: None,
+                reasoning_trace: None,
+            };
+
+            let error = session
+                .append(assistant, Some(meta))
+                .expect_err("append should fail when the target path is a directory");
+            let error_text = error.to_string();
+            assert!(!error_text.is_empty());
+            assert_eq!(session.history().len(), 1);
+            assert_eq!(
+                session.history()[0]
+                    .content
+                    .iter()
+                    .find_map(|block| match block {
+                        MessageContent::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    }),
+                Some("persist me")
+            );
+
+            std::fs::remove_dir_all(&today_path).unwrap();
+            let live_snapshot = session.budget_snapshot().unwrap();
+            let mut reloaded = Session::new(&dir).unwrap();
+            reloaded.load_today().unwrap();
+            assert!(reloaded.history().is_empty());
+            assert_ne!(live_snapshot, reloaded.budget_snapshot().unwrap());
+
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
 }

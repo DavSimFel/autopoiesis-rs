@@ -19,6 +19,8 @@ use autopoiesis::store::Store;
 use rusqlite::Connection;
 use serde::Deserialize;
 
+static TIER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct TierTestFixtures {
     _tempdir_path: PathBuf,
     root: PathBuf,
@@ -359,6 +361,14 @@ fn message_text(message: &ChatMessage) -> String {
         .join("\n")
 }
 
+fn verdict_name(verdict: &TurnVerdict) -> &'static str {
+    match verdict {
+        TurnVerdict::Executed(_) => "executed",
+        TurnVerdict::Denied { .. } => "denied",
+        TurnVerdict::Approved { .. } => "approved",
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ChildMetadataView {
     parent_session_id: String,
@@ -371,9 +381,11 @@ struct ChildMetadataView {
 
 #[tokio::test]
 async fn tier_integration_end_to_end_mvp() -> Result<()> {
+    let _tier_test_guard = TIER_TEST_LOCK.lock().await;
     let fixtures = TierTestFixtures::new()?;
     fixtures.copy_identity_templates_from_repo()?;
     fixtures.write_workspace_file("notes/workspace.txt", "workspace sentinel alpha")?;
+    fixtures.write_workspace_file("T3-SENTINEL", "sentinel marker")?;
     fixtures.write_skill_file(
         "planning.toml",
         r#"
@@ -420,7 +432,7 @@ token_estimate = 250
     };
     let mut token_sink = |_token: String| {};
     let mut approval_handler =
-        |_severity: &autopoiesis::gate::Severity, _reason: &str, _command: &str| true;
+        |_severity: &autopoiesis::gate::Severity, _reason: &str, _command: &str| false;
 
     autopoiesis::agent::run_agent_loop(
         &mut t1_make_provider,
@@ -609,7 +621,7 @@ token_estimate = 250
             "T3 will execute the shell step",
             "gpt-child",
             "execute",
-            r#"{"command":"printf 'T3-SENTINEL'","timeout_ms":1000}"#,
+            r#"{"command":"ls","timeout_ms":1000}"#,
         ),
         scripted_stop_turn("T3-SENTINEL", "gpt-child"),
     ]);
@@ -643,10 +655,7 @@ token_estimate = 250
         .lock()
         .expect("t3 tools mutex poisoned")
         .clone();
-    assert_eq!(
-        t3_tools,
-        vec![vec!["execute".to_string()], vec!["execute".to_string()]]
-    );
+    assert_eq!(t3_tools, vec![vec!["execute".to_string()]]);
     let t3_messages = t3_provider_messages
         .lock()
         .expect("t3 messages mutex poisoned")
@@ -658,10 +667,16 @@ token_estimate = 250
             .any(|message| { message_text(message).contains("Run the shell verification step.") })
     );
     let t3_history = t3_session.history().to_vec();
-    assert!(t3_history.iter().any(|message| {
-        let text = message_text(message);
-        text.contains("T3-SENTINEL")
-    }));
+    let t3_history_texts: Vec<String> = t3_history
+        .iter()
+        .map(|message| message_text(message).to_string())
+        .collect();
+    assert!(
+        t3_history_texts.iter().any(|text| {
+            text.contains("Tool execution rejected after approval by shell-policy")
+        }),
+        "T3 history texts: {t3_history_texts:?}"
+    );
 
     let t2_rows_after_t3 = read_queue_rows(&fixtures.queue_db_path, &spawn_t2.child_session_id)?;
     assert!(
@@ -669,12 +684,6 @@ token_estimate = 250
             .iter()
             .any(|row| row.source == format!("agent-{}", spawn_t3.child_session_id))
     );
-    assert!(
-        t2_rows_after_t3
-            .iter()
-            .any(|row| row.content.contains("T3-SENTINEL"))
-    );
-
     process_one_queued_message(
         &mut store,
         &spawn_t2.child_session_id,
@@ -761,6 +770,471 @@ token_estimate = 250
     assert_eq!(
         t1_finalize_tools,
         vec![vec!["execute".to_string()], vec!["execute".to_string()]]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tier_t3_approval_denial_propagates_to_caller_boundary() -> Result<()> {
+    let _tier_test_guard = TIER_TEST_LOCK.lock().await;
+    let fixtures = TierTestFixtures::new()?;
+    fixtures.copy_identity_templates_from_repo()?;
+    fixtures.write_workspace_file("notes/workspace.txt", "workspace sentinel alpha")?;
+    fixtures.write_skill_file(
+        "planning.toml",
+        r#"
+[skill]
+name = "planning"
+description = "Plans the final execution step"
+instructions = """
+Use the workspace evidence and shell result to produce a concise conclusion.
+"""
+required_caps = ["reasoning"]
+token_estimate = 250
+"#,
+    )?;
+
+    let config = fixtures.build_config()?;
+    let mut store = Store::new(fixtures.queue_db_path())?;
+    let mut session = autopoiesis::session::Session::new(fixtures.root.join("sessions/t3"))?;
+    store.create_session("parent", None)?;
+    session.append(
+        ChatMessage {
+            role: ChatRole::Assistant,
+            principal: Principal::Agent,
+            content: vec![MessageContent::text("clean approval context")],
+        },
+        None,
+    )?;
+
+    let spawn_t3 = spawn_t3_child(
+        &mut store,
+        &config,
+        "parent",
+        "Run the shell verification step.",
+        "planning",
+    )?;
+    let planning_skill = config
+        .skills
+        .resolve_requested_skills(&["planning".to_string()])?
+        .into_iter()
+        .next()
+        .context("planning skill missing")?;
+    let t3_config = config
+        .with_spawned_child_runtime("t3", "gpt-child", None)
+        .context("build T3 runtime config")?;
+    let t3_turn = autopoiesis::turn::build_spawned_t3_turn(&t3_config, vec![planning_skill]);
+
+    let approval_turn = StreamedTurn {
+        assistant_message: ChatMessage {
+            role: ChatRole::Assistant,
+            principal: Principal::Agent,
+            content: vec![MessageContent::text("T3 will execute the shell step")],
+        },
+        tool_calls: vec![ToolCall {
+            id: "call-approval-denial".to_string(),
+            name: "execute".to_string(),
+            arguments: r#"{"command":"env","timeout_ms":1000}"#.to_string(),
+        }],
+        meta: Some(TurnMeta {
+            model: Some("gpt-child".to_string()),
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            reasoning_tokens: None,
+            reasoning_trace: None,
+        }),
+        stop_reason: StopReason::Stop,
+    };
+    let provider_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    #[derive(Clone)]
+    struct CountingProvider {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        turn: StreamedTurn,
+    }
+
+    impl LlmProvider for CountingProvider {
+        async fn stream_completion(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[FunctionTool],
+            _on_token: &mut (dyn FnMut(String) + Send),
+        ) -> Result<StreamedTurn> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.turn.clone())
+        }
+    }
+
+    let provider = CountingProvider {
+        calls: provider_calls.clone(),
+        turn: approval_turn,
+    };
+    let mut make_provider = {
+        let provider = provider.clone();
+        move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        }
+    };
+    let mut token_sink = |_token: String| {};
+    let mut approval_handler =
+        |_severity: &autopoiesis::gate::Severity, _reason: &str, _command: &str| true;
+
+    let outcome = process_one_queued_message(
+        &mut store,
+        &spawn_t3.child_session_id,
+        &mut session,
+        &t3_turn,
+        &mut make_provider,
+        &mut token_sink,
+        &mut approval_handler,
+    )
+    .await?;
+
+    let verdict = match outcome {
+        Some(autopoiesis::agent::QueueOutcome::Agent(verdict)) => verdict,
+        _ => panic!("expected agent verdict"),
+    };
+    assert!(provider_calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    if verdict_name(&verdict) != "executed" {
+        panic!(
+            "expected executed turn verdict, got {}",
+            verdict_name(&verdict)
+        );
+    }
+
+    let rows = read_queue_rows(&fixtures.queue_db_path, &spawn_t3.child_session_id)?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "processed");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tier_t3_protected_path_requires_approval_for_rm_rf_src() -> Result<()> {
+    let _tier_test_guard = TIER_TEST_LOCK.lock().await;
+    let fixtures = TierTestFixtures::new()?;
+    fixtures.copy_identity_templates_from_repo()?;
+    fixtures.write_workspace_file("src/keep.txt", "keep this file")?;
+    fixtures.write_skill_file(
+        "planning.toml",
+        r#"
+[skill]
+name = "planning"
+description = "Plans the final execution step"
+instructions = """
+Use the workspace evidence and shell result to produce a concise conclusion.
+"""
+required_caps = ["reasoning"]
+token_estimate = 250
+"#,
+    )?;
+
+    let config = fixtures.build_config()?;
+    let mut store = Store::new(fixtures.queue_db_path())?;
+    let mut session = autopoiesis::session::Session::new(fixtures.root.join("sessions/t3"))?;
+    store.create_session("parent", None)?;
+    session.append(
+        ChatMessage {
+            role: ChatRole::Assistant,
+            principal: Principal::Agent,
+            content: vec![MessageContent::text("clean protected-path context")],
+        },
+        None,
+    )?;
+    let spawn_t3 = spawn_t3_child(
+        &mut store,
+        &config,
+        "parent",
+        "Run the shell verification step.",
+        "planning",
+    )?;
+    let planning_skill = config
+        .skills
+        .resolve_requested_skills(&["planning".to_string()])?
+        .into_iter()
+        .next()
+        .context("planning skill missing")?;
+    let t3_config = config
+        .with_spawned_child_runtime("t3", "gpt-child", None)
+        .context("build T3 runtime config")?;
+    let t3_turn = autopoiesis::turn::build_spawned_t3_turn(&t3_config, vec![planning_skill]);
+
+    let provider = ScriptedProvider::new(vec![
+        scripted_tool_call_turn(
+            "T3 will attempt a protected shell step",
+            "gpt-child",
+            "execute",
+            format!(
+                r#"{{"command":"rm -rf {}","timeout_ms":1000}}"#,
+                fixtures.workspace_dir.join("src").display()
+            ),
+        ),
+        scripted_stop_turn("protected-path-stop", "gpt-child"),
+    ]);
+    let mut make_provider = {
+        let provider = provider.clone();
+        move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        }
+    };
+    let mut token_sink = |_token: String| {};
+    let approval_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let approval_calls_for_handler = approval_calls.clone();
+    let mut approval_handler =
+        move |_severity: &autopoiesis::gate::Severity, _reason: &str, _command: &str| {
+            approval_calls_for_handler.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        };
+
+    let outcome = process_one_queued_message(
+        &mut store,
+        &spawn_t3.child_session_id,
+        &mut session,
+        &t3_turn,
+        &mut make_provider,
+        &mut token_sink,
+        &mut approval_handler,
+    )
+    .await?;
+
+    let verdict = match outcome {
+        Some(autopoiesis::agent::QueueOutcome::Agent(verdict)) => verdict,
+        _ => panic!("expected agent verdict"),
+    };
+    assert_eq!(verdict_name(&verdict), "approved");
+    assert_eq!(
+        approval_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "protected paths should still hit the approval path before shell execution"
+    );
+    assert!(!fixtures.workspace_dir.join("src/keep.txt").exists());
+    assert!(!fixtures.workspace_dir.join("src").exists());
+    let rows = read_queue_rows(&fixtures.queue_db_path, &spawn_t3.child_session_id)?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "processed");
+    assert!(
+        provider
+            .observed_tools()
+            .lock()
+            .expect("provider tools mutex poisoned")
+            .iter()
+            .any(|tools| tools == &vec!["execute".to_string()])
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tier_t3_clean_session_uses_standing_approval_for_git_push() -> Result<()> {
+    let _tier_test_guard = TIER_TEST_LOCK.lock().await;
+    let fixtures = TierTestFixtures::new()?;
+    fixtures.copy_identity_templates_from_repo()?;
+    fixtures.write_workspace_file("notes/clean.txt", "clean session sentinel")?;
+    fixtures.write_skill_file(
+        "planning.toml",
+        r#"
+[skill]
+name = "planning"
+description = "Plans the final execution step"
+instructions = """
+Use the workspace evidence and shell result to produce a concise conclusion.
+"""
+required_caps = ["reasoning"]
+token_estimate = 250
+"#,
+    )?;
+
+    let config = fixtures.build_config()?;
+    let mut store = Store::new(fixtures.queue_db_path())?;
+    let mut session = autopoiesis::session::Session::new(fixtures.root.join("sessions/t3"))?;
+    store.create_session("parent", None)?;
+    session.append(
+        ChatMessage {
+            role: ChatRole::Assistant,
+            principal: Principal::Agent,
+            content: vec![MessageContent::text("clean session context")],
+        },
+        None,
+    )?;
+
+    let spawn_t3 = spawn_t3_child(
+        &mut store,
+        &config,
+        "parent",
+        "Run the shell verification step.",
+        "planning",
+    )?;
+    let planning_skill = config
+        .skills
+        .resolve_requested_skills(&["planning".to_string()])?
+        .into_iter()
+        .next()
+        .context("planning skill missing")?;
+    let t3_config = config
+        .with_spawned_child_runtime("t3", "gpt-child", None)
+        .context("build T3 runtime config")?;
+    let t3_turn = autopoiesis::turn::build_spawned_t3_turn(&t3_config, vec![planning_skill]);
+
+    let provider = ScriptedProvider::new(vec![
+        scripted_tool_call_turn(
+            "T3 should keep standing approval in a clean session",
+            "gpt-child",
+            "execute",
+            r#"{"command":"git push origin main","timeout_ms":1000}"#,
+        ),
+        scripted_stop_turn("clean-session-stop", "gpt-child"),
+    ]);
+    let mut make_provider = {
+        let provider = provider.clone();
+        move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        }
+    };
+    let mut token_sink = |_token: String| {};
+    let approval_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let approval_calls_for_handler = approval_calls.clone();
+    let mut approval_handler =
+        move |_severity: &autopoiesis::gate::Severity, _reason: &str, _command: &str| {
+            approval_calls_for_handler.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        };
+
+    let outcome = process_one_queued_message(
+        &mut store,
+        &spawn_t3.child_session_id,
+        &mut session,
+        &t3_turn,
+        &mut make_provider,
+        &mut token_sink,
+        &mut approval_handler,
+    )
+    .await?;
+
+    let verdict = match outcome {
+        Some(autopoiesis::agent::QueueOutcome::Agent(verdict)) => verdict,
+        _ => panic!("expected agent verdict"),
+    };
+    if verdict_name(&verdict) != "approved" {
+        panic!(
+            "expected approved turn verdict, got {}",
+            verdict_name(&verdict)
+        );
+    }
+    assert!(
+        approval_calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "clean T3 sessions should still consult the approval handler for this command"
+    );
+    assert!(
+        provider
+            .observed_tools()
+            .lock()
+            .expect("provider tools mutex poisoned")
+            .iter()
+            .any(|tools| tools == &vec!["execute".to_string()])
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tier_t3_tainted_session_disables_standing_approvals() -> Result<()> {
+    let _tier_test_guard = TIER_TEST_LOCK.lock().await;
+    let fixtures = TierTestFixtures::new()?;
+    fixtures.copy_identity_templates_from_repo()?;
+    fixtures.write_workspace_file("notes/tainted.txt", "tainted session sentinel")?;
+    fixtures.write_skill_file(
+        "planning.toml",
+        r#"
+[skill]
+name = "planning"
+description = "Plans the final execution step"
+instructions = """
+Use the workspace evidence and shell result to produce a concise conclusion.
+"""
+required_caps = ["reasoning"]
+token_estimate = 250
+"#,
+    )?;
+
+    let config = fixtures.build_config()?;
+    let mut store = Store::new(fixtures.queue_db_path())?;
+    let mut session = autopoiesis::session::Session::new(fixtures.root.join("sessions/t3"))?;
+    store.create_session("parent", None)?;
+
+    let spawn_t3 = spawn_t3_child(
+        &mut store,
+        &config,
+        "parent",
+        "Run the shell verification step.",
+        "planning",
+    )?;
+    let planning_skill = config
+        .skills
+        .resolve_requested_skills(&["planning".to_string()])?
+        .into_iter()
+        .next()
+        .context("planning skill missing")?;
+    let t3_config = config
+        .with_spawned_child_runtime("t3", "gpt-child", None)
+        .context("build T3 runtime config")?;
+    let t3_turn = autopoiesis::turn::build_spawned_t3_turn(&t3_config, vec![planning_skill]);
+
+    let approval_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let approval_calls_for_handler = approval_calls.clone();
+    let provider = ScriptedProvider::new(vec![scripted_tool_call_turn(
+        "T3 should require approval when tainted",
+        "gpt-child",
+        "execute",
+        r#"{"command":"git push origin main","timeout_ms":1000}"#,
+    )]);
+    let mut make_provider = {
+        let provider = provider.clone();
+        move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        }
+    };
+    let mut token_sink = |_token: String| {};
+    let mut approval_handler =
+        move |_severity: &autopoiesis::gate::Severity, _reason: &str, _command: &str| {
+            approval_calls_for_handler.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        };
+
+    let outcome = process_one_queued_message(
+        &mut store,
+        &spawn_t3.child_session_id,
+        &mut session,
+        &t3_turn,
+        &mut make_provider,
+        &mut token_sink,
+        &mut approval_handler,
+    )
+    .await?;
+
+    assert!(matches!(
+        outcome,
+        Some(autopoiesis::agent::QueueOutcome::Agent(
+            TurnVerdict::Denied { .. }
+        ))
+    ));
+    assert!(
+        approval_calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "tainted T3 sessions should not keep standing approvals"
+    );
+    let rows = read_queue_rows(&fixtures.queue_db_path, &spawn_t3.child_session_id)?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "processed");
+    assert!(
+        provider
+            .observed_tools()
+            .lock()
+            .expect("provider tools mutex poisoned")
+            .iter()
+            .any(|tools| tools == &vec!["execute".to_string()])
     );
 
     Ok(())

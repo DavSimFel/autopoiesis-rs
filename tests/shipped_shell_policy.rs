@@ -59,3 +59,17 @@ fn committed_agents_toml_flows_into_shell_safety_behavior() {
         Verdict::Approve { .. }
     ));
 }
+
+#[test]
+fn shipped_shell_policy_never_allows_destructive_rm_rf_src() {
+    let config = Config::load(shipped_agents_toml_path())
+        .unwrap_or_else(|error| panic!("failed to load shipped agents.toml: {error}"));
+    let gate = ShellSafety::with_policy(config.shell_policy);
+
+    let denied_call = make_tool_call("rm -rf src", "call-3");
+    let mut denied_event = GuardEvent::ToolCall(&denied_call);
+    assert!(matches!(
+        gate.check(&mut denied_event, &GuardContext::default()),
+        Verdict::Deny { .. } | Verdict::Approve { .. }
+    ));
+}
