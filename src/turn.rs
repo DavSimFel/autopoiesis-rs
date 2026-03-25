@@ -758,6 +758,7 @@ mod tests {
             operator_key: None,
             shell_policy: ShellPolicy::default(),
             budget,
+            read: crate::config::ReadToolConfig::default(),
             queue: crate::config::QueueConfig::default(),
             identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
             agents: crate::config::AgentsConfig::default(),

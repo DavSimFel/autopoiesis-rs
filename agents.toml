@@ -33,3 +33,7 @@ allow_patterns = ["cargo *", "ls *", "pwd", "which *", "date", "uname *"]
 deny_patterns = ["rm -rf /*", "rm -rf ~*", "curl * | sh*", "wget * | sh*", "> /dev/sd*"]
 default_severity = "medium"
 max_output_bytes = 1048576
+
+[read]
+allowed_paths = ["identity-templates"]
+max_read_bytes = 65536

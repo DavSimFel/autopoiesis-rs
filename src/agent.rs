@@ -1158,6 +1158,7 @@ mod tests {
             operator_key: None,
             shell_policy: crate::config::ShellPolicy::default(),
             budget: None,
+            read: crate::config::ReadToolConfig::default(),
             queue: crate::config::QueueConfig::default(),
             identity_files: Vec::new(),
             agents: crate::config::AgentsConfig::default(),

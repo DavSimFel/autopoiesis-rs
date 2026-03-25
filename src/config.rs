@@ -27,6 +27,8 @@ pub struct Config {
     pub shell_policy: ShellPolicy,
     /// Optional budget ceilings loaded from the optional `[budget]` table.
     pub budget: Option<BudgetConfig>,
+    /// Optional structured read policy loaded from the optional `[read]` table.
+    pub read: ReadToolConfig,
     /// Queue recovery settings loaded from the optional `[queue]` table.
     pub queue: QueueConfig,
     /// Resolved identity prompt files used to assemble the system prompt.
@@ -61,6 +63,16 @@ pub struct QueueConfig {
     pub stale_processing_timeout_secs: u64,
 }
 
+/// Structured read tool policy loaded from `[read]` in `agents.toml`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ReadToolConfig {
+    /// Root-relative paths allowed for structured file reads.
+    pub allowed_paths: Vec<String>,
+    /// Maximum bytes returned by one read.
+    pub max_read_bytes: usize,
+}
+
 pub(crate) const DEFAULT_SHELL_MAX_OUTPUT_BYTES: usize = 1_048_576;
 pub(crate) const DEFAULT_SHELL_MAX_TIMEOUT_MS: u64 = 120_000;
 pub(crate) const DEFAULT_STALE_PROCESSING_TIMEOUT_SECS: u64 = 300;
@@ -90,6 +102,7 @@ impl Config {
             operator_key: None,
             shell_policy: ShellPolicy::default(),
             budget: None,
+            read: ReadToolConfig::default(),
             queue: QueueConfig::default(),
             identity_files: identity::t1_identity_files("identity-templates", "silas"),
             agents: AgentsConfig::default(),
@@ -117,6 +130,8 @@ impl Config {
 
         config.models = file_config.models;
         config.domains = file_config.domains;
+        validate_read_tool_config(&file_config.read)?;
+        config.read = file_config.read;
 
         if let Some(agents) = file_config.agents {
             let (active_name, active_agent) = select_active_agent(&agents)?;
@@ -257,6 +272,11 @@ mod tests {
         );
     }
 
+    fn assert_default_read_config(read: &ReadToolConfig) {
+        assert_eq!(read.allowed_paths, vec!["identity-templates".to_string()]);
+        assert_eq!(read.max_read_bytes, 65_536);
+    }
+
     #[test]
     fn loads_valid_agents_toml_with_all_fields() {
         let path = temp_toml_path(
@@ -288,6 +308,7 @@ mod tests {
         assert_eq!(config.shell_policy.max_output_bytes, 2048);
         assert_eq!(config.shell_policy.max_timeout_ms, 4096);
         assert_eq!(config.budget, None);
+        assert_default_read_config(&config.read);
         assert_default_queue_config(&config.queue);
     }
 
@@ -351,6 +372,7 @@ mod tests {
                 .and_then(|domain| domain.context_extend.as_deref()),
             Some("identity-templates/domains/fitness.md")
         );
+        assert_default_read_config(&config.read);
         assert_default_queue_config(&config.queue);
     }
 
@@ -399,6 +421,7 @@ mod tests {
         );
         assert_eq!(config.model, "o3");
         assert_eq!(config.active_agent, Some("silas".to_string()));
+        assert_default_read_config(&config.read);
     }
 
     #[test]
@@ -498,6 +521,7 @@ mod tests {
         );
         assert_default_shell_policy(&config.shell_policy);
         assert_eq!(config.budget, None);
+        assert_default_read_config(&config.read);
         assert_default_queue_config(&config.queue);
     }
 
@@ -514,6 +538,7 @@ mod tests {
         assert_eq!(config.operator_key, None);
         assert_default_shell_policy(&config.shell_policy);
         assert_eq!(config.budget, None);
+        assert_default_read_config(&config.read);
         assert_default_queue_config(&config.queue);
     }
 
@@ -597,6 +622,56 @@ mod tests {
 
         let config = Config::load(&path).expect("expected config to load");
         assert_eq!(config.operator_key, Some("operator-from-file".to_string()));
+    }
+
+    #[test]
+    fn loads_read_config_with_all_fields() {
+        let path = temp_toml_path(
+            "read_all",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-read'\n[read]\nallowed_paths=['identity-templates','sessions']\nmax_read_bytes=4096\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(
+            config.read,
+            ReadToolConfig {
+                allowed_paths: vec!["identity-templates".to_string(), "sessions".to_string()],
+                max_read_bytes: 4096,
+            }
+        );
+    }
+
+    #[test]
+    fn missing_read_table_keeps_read_defaults() {
+        let path = temp_toml_path(
+            "read_missing",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-read'\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_default_read_config(&config.read);
+    }
+
+    #[test]
+    fn read_config_rejects_empty_allowed_path_entry() {
+        let path = temp_toml_path(
+            "read_empty_path",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-read'\n[read]\nallowed_paths=['identity-templates','']\n",
+        );
+
+        let err = Config::load(&path).expect_err("expected invalid read config to fail");
+        assert!(err.to_string().contains("read.allowed_paths"));
+    }
+
+    #[test]
+    fn read_config_rejects_zero_max_read_bytes() {
+        let path = temp_toml_path(
+            "read_zero_max",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-read'\n[read]\nmax_read_bytes=0\n",
+        );
+
+        let err = Config::load(&path).expect_err("expected invalid read config to fail");
+        assert!(err.to_string().contains("max_read_bytes"));
     }
 
     #[test]
@@ -739,6 +814,8 @@ struct RuntimeFileConfig {
     #[serde(default)]
     shell: ShellPolicy,
     budget: Option<BudgetConfig>,
+    #[serde(default)]
+    read: ReadToolConfig,
     #[serde(default)]
     queue: QueueConfig,
 }
@@ -972,6 +1049,15 @@ impl Default for QueueConfig {
     }
 }
 
+impl Default for ReadToolConfig {
+    fn default() -> Self {
+        Self {
+            allowed_paths: vec!["identity-templates".to_string()],
+            max_read_bytes: 65_536,
+        }
+    }
+}
+
 impl Config {
     /// Resolve the active agent definition, if v2 config loaded successfully.
     pub fn active_agent_definition(&self) -> Option<&AgentDefinition> {
@@ -983,4 +1069,16 @@ impl Config {
     pub fn active_t1_config(&self) -> Option<&AgentTierConfig> {
         self.active_agent_definition().map(|agent| &agent.t1)
     }
+}
+
+fn validate_read_tool_config(read: &ReadToolConfig) -> Result<()> {
+    if read.allowed_paths.iter().any(|path| path.trim().is_empty()) {
+        return Err(anyhow!("read.allowed_paths entries must not be empty"));
+    }
+
+    if read.max_read_bytes == 0 {
+        return Err(anyhow!("read.max_read_bytes must be greater than zero"));
+    }
+
+    Ok(())
 }

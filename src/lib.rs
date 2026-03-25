@@ -9,6 +9,7 @@ pub mod identity;
 pub mod llm;
 pub mod model_selection;
 pub mod principal;
+pub mod read_tool;
 pub mod server;
 pub mod session;
 pub mod spawn;

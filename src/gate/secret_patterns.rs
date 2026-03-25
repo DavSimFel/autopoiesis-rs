@@ -97,6 +97,11 @@ pub(crate) fn protected_path_fragments() -> &'static [&'static str] {
     &PROTECTED_PATH_FRAGMENTS
 }
 
+pub(crate) fn path_is_protected(path: impl AsRef<std::path::Path>) -> bool {
+    let path = path.as_ref().to_string_lossy();
+    is_protected_path_value(path.as_ref())
+}
+
 pub(crate) fn command_references_protected_path(command: &str) -> bool {
     let command = command.to_lowercase();
     protected_path_fragments()
@@ -1300,6 +1305,19 @@ mod tests {
         assert!(command_references_protected_path("echo .env.production"));
         assert!(command_references_protected_path("cat ~/.ssh/id_rsa"));
         assert!(!command_references_protected_path("printf '%s' hello"));
+    }
+
+    #[test]
+    fn path_is_protected_matches_known_fragments() {
+        assert!(path_is_protected("~/.autopoiesis/auth.json"));
+        assert!(path_is_protected(".env"));
+        assert!(path_is_protected(".env.local"));
+        assert!(path_is_protected(".env.production.local"));
+        assert!(path_is_protected("~/.ssh/id_rsa"));
+        assert!(path_is_protected("~/.ssh/id_ed25519"));
+        assert!(path_is_protected("~/.aws/credentials"));
+        assert!(!path_is_protected("config/auth.json"));
+        assert!(!path_is_protected(".env.example"));
     }
 
     #[test]

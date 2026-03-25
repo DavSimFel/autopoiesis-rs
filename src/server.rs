@@ -772,6 +772,7 @@ mod tests {
                     operator_key: Some("operator-key".to_string()),
                     shell_policy: config::ShellPolicy::default(),
                     budget: None,
+                    read: config::ReadToolConfig::default(),
                     queue: config::QueueConfig::default(),
                     identity_files: crate::identity::t1_identity_files(
                         "identity-templates",
