@@ -227,7 +227,7 @@ where
         };
         processed_any = true;
 
-        let outcome = agent::process_queued_message(
+        let outcome = agent::process_message(
             &message,
             &mut history,
             turn,
