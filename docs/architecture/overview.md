@@ -13,7 +13,7 @@ main.rs                     CLI entrypoint, clap args, REPL loop, server launch,
 agent.rs                    Agent loop, turn orchestration, output cap, approval flow
                             TokenSink + ApprovalHandler traits for I/O decoupling
                             Denied tool calls persist text-only (no broken tool_call replay)
-server.rs                   axum HTTP + WS, Principal-based auth, queue-driven agent exec
+server/                     axum HTTP + WS, Principal-based auth, queue-driven agent exec
 session.rs                  JSONL persistence, token tracking, replay warnings, context trimming,
                             budget snapshots
 subscription.rs             Subscription data layer: filters, path normalization, content loading,

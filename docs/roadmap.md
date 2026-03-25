@@ -73,8 +73,8 @@
 | Item | Files | Scope |
 |------|-------|-------|
 | Split agent.rs → agent loop + approval + tool exec | agent/ | 2 sessions |
-| Split server.rs → http + ws + sse | server/ | |
-| thiserror at boundaries (server responses, config) | server.rs, config.rs | |
+| Split server/ → http + ws + auth + queue | server/ | |
+| thiserror at boundaries (server responses, config) | server/, config.rs | |
 | End-to-end integration tests (temp SQLite + full turn) | tests/ | |
 | Persona stability eval (fixed scenario battery) | tests/constitution/ | |
 

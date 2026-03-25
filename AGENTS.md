@@ -25,7 +25,7 @@ cargo test --features integration  # live API tests (skip if no auth)
 ## Project structure
 
 ```
-src/                 27 Rust source files (~14.3K lines)
+src/                 45 Rust source files (~24.8K lines)
   gate/              Guard pipeline (budget, secret redaction, shell safety, exfil detection, protected paths)
   llm/               LLM provider trait + OpenAI backend
 identity-templates/  Git-tracked runtime prompt files (constitution, agent, context)
@@ -72,7 +72,7 @@ docs/                Architecture, specs, risks, vision, roadmap (see docs/index
 ### Module structure
 - Split by **responsibility**, not by line count. Each file does one thing.
 - `agent.rs` → agent loop, approval flow, tool execution (split when adding identity v2).
-- `server.rs` → when splitting: `server/http.rs`, `server/ws.rs`, `server/sse.rs`. Protocol obvious from filename.
+- `server/` → `server/mod.rs`, `server/http.rs`, `server/ws.rs`, `server/auth.rs`, `server/queue.rs`.
 - **Separate policy from I/O from state mutation.** Never mix all three in one function.
 
 ### Async patterns
