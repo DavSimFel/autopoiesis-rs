@@ -234,7 +234,7 @@ pub fn spawn_child(
     })
 }
 
-pub(crate) fn enqueue_child_completion(
+pub fn enqueue_child_completion(
     store: &mut Store,
     child_session_id: &str,
     session: &Session,

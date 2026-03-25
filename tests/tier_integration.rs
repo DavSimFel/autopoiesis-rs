@@ -304,6 +304,49 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn process_one_queued_message<F, Fut, P, TS, AH>(
+    store: &mut autopoiesis::store::Store,
+    child_session_id: &str,
+    session: &mut autopoiesis::session::Session,
+    turn: &autopoiesis::turn::Turn,
+    make_provider: &mut F,
+    token_sink: &mut TS,
+    approval_handler: &mut AH,
+) -> Result<Option<autopoiesis::agent::QueueOutcome>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<P>>,
+    P: autopoiesis::llm::LlmProvider,
+    TS: autopoiesis::agent::TokenSink + Send,
+    AH: autopoiesis::agent::ApprovalHandler,
+{
+    let Some(queued_message) = store.dequeue_next_message(child_session_id)? else {
+        return Ok(None);
+    };
+
+    let message_id = queued_message.id;
+    let verdict = autopoiesis::agent::process_message(
+        &queued_message,
+        session,
+        turn,
+        make_provider,
+        token_sink,
+        approval_handler,
+    )
+    .await;
+
+    match verdict {
+        Ok(verdict) => {
+            store.mark_processed(message_id)?;
+            Ok(Some(verdict))
+        }
+        Err(err) => {
+            store.mark_failed(message_id)?;
+            Err(err)
+        }
+    }
+}
+
 fn message_text(message: &ChatMessage) -> String {
     message
         .content
@@ -590,7 +633,11 @@ token_estimate = 250
         &mut approval_handler,
     )
     .await?;
-    enqueue_child_completion_for_test(&mut store, &spawn_t3.child_session_id, &t3_session)?;
+    assert!(autopoiesis::spawn::enqueue_child_completion(
+        &mut store,
+        &spawn_t3.child_session_id,
+        &t3_session
+    )?);
 
     let t3_tools = t3_provider_tools
         .lock()
@@ -638,7 +685,11 @@ token_estimate = 250
         &mut approval_handler,
     )
     .await?;
-    enqueue_child_completion_for_test(&mut store, &spawn_t2.child_session_id, &t2_session)?;
+    assert!(autopoiesis::spawn::enqueue_child_completion(
+        &mut store,
+        &spawn_t2.child_session_id,
+        &t2_session
+    )?);
 
     let t2_tools = t2_provider_tools
         .lock()
@@ -712,71 +763,5 @@ token_estimate = 250
         vec![vec!["execute".to_string()], vec!["execute".to_string()]]
     );
 
-    Ok(())
-}
-async fn process_one_queued_message<F, Fut, P, TS, AH>(
-    store: &mut autopoiesis::store::Store,
-    child_session_id: &str,
-    session: &mut autopoiesis::session::Session,
-    turn: &autopoiesis::turn::Turn,
-    make_provider: &mut F,
-    token_sink: &mut TS,
-    approval_handler: &mut AH,
-) -> Result<Option<autopoiesis::agent::QueueOutcome>>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<P>>,
-    P: autopoiesis::llm::LlmProvider,
-    TS: autopoiesis::agent::TokenSink + Send,
-    AH: autopoiesis::agent::ApprovalHandler,
-{
-    let Some(queued_message) = store.dequeue_next_message(child_session_id)? else {
-        return Ok(None);
-    };
-
-    let message_id = queued_message.id;
-    let verdict = autopoiesis::agent::process_message(
-        &queued_message,
-        session,
-        turn,
-        make_provider,
-        token_sink,
-        approval_handler,
-    )
-    .await;
-
-    match verdict {
-        Ok(verdict) => {
-            store.mark_processed(message_id)?;
-            Ok(Some(verdict))
-        }
-        Err(err) => {
-            store.mark_failed(message_id)?;
-            Err(err)
-        }
-    }
-}
-
-fn enqueue_child_completion_for_test(
-    store: &mut autopoiesis::store::Store,
-    child_session_id: &str,
-    session: &autopoiesis::session::Session,
-) -> Result<()> {
-    if let Some(parent_session_id) = store.get_parent_session(child_session_id)? {
-        let response = session
-            .history()
-            .iter()
-            .rev()
-            .find(|message| matches!(message.role, ChatRole::Assistant))
-            .map(message_text)
-            .unwrap_or_else(|| "No assistant response was produced.".to_string());
-        let completion = format!("Child session {child_session_id} completed.\n\n{response}");
-        store.enqueue_message(
-            &parent_session_id,
-            "user",
-            &completion,
-            &format!("agent-{child_session_id}"),
-        )?;
-    }
     Ok(())
 }
