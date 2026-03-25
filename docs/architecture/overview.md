@@ -5,7 +5,7 @@
 
 ## Overview
 
-29 source files, ~17.8K lines, 288 tests (287 run, 1 ignored).
+30 source files, ~18K lines, 288 tests (287 run, 1 ignored).
 
 ## Module map
 
@@ -29,12 +29,13 @@ gate/exfil_detector.rs (279L)   Cross-call read+send pattern detection
 gate/budget.rs (199L)       Per-turn/session/day token ceiling enforcement
 gate/output_cap.rs (215L)   Shell output cap + file-backed result storage
 gate/secret_patterns.rs (778L)  Shared secret pattern catalog + protected path detection + env wrapper stripping
-context.rs (383L)           ContextSource trait — Identity (prompt files), History (replay, not wired)
+context.rs (383L)           ContextSource trait — Identity (prompt files), Skills (discovery), History (replay, not wired)
 turn.rs                     Turn composition: tier-aware ContextSource + Tool + Guard builder, taint via is_taint_source()
 tool.rs (665L)              Shell tool: async exec, RLIMIT, process-group kill, bounded output drain
 store.rs (715L)             SQLite session registry + message queue + subscriptions table
 auth.rs (401L)              OAuth device flow, token storage/refresh
-config.rs                    agents.toml loading, ShellPolicy, BudgetConfig, resolved identity file lists
+config.rs                    agents.toml loading, ShellPolicy, BudgetConfig, skill catalog loading, resolved identity file lists
+skills.rs                   Local TOML skill catalog, discovery summaries, lookup by name
 spawn.rs                     Child-session creation, tier/model resolution, budget preflight, completion enqueueing
 identity.rs                  Loads explicit identity file lists and template helpers
 principal.rs (92L)          Principal enum (Operator/User/System/Agent), trust/taint source mapping

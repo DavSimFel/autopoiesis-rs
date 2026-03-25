@@ -246,6 +246,40 @@ No per-agent runtime copies of constitution or agent.md. Read directly from temp
 
 ---
 
+## Skills
+
+Skills are local TOML files on disk, not database records or remote plugins.
+
+Each skill contains:
+- `name` - unique identifier
+- `description` - short summary used for discovery
+- `instructions` - full prompt content loaded later for execution
+- `required_caps` - capability requirements matched against the model catalog
+- `token_estimate` - approximate prompt cost for loading the full instructions
+
+### File format
+
+Skill files live under `skills/` by default (configurable via `skills_dir`) and use one top-level `[skill]` table:
+
+```toml
+[skill]
+name = "code-review"
+description = "Reviews code changes for correctness, style, and security"
+required_caps = ["code"]
+token_estimate = 500
+instructions = """
+... full skill prompt ...
+"""
+```
+
+### Discovery
+
+- T1 and T2 only browse skill names plus descriptions.
+- T3 receives full instructions from the spawning tier.
+- Loading stays local to the runtime filesystem; there is no marketplace or remote fetch.
+
+---
+
 ## Security
 
 | File | Agent can read? | Agent can modify? | Enforcement |

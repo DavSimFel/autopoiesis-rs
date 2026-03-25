@@ -873,6 +873,27 @@ mod tests {
     }
 
     #[test]
+    fn build_input_preserves_multiple_text_blocks_in_the_first_system_message() {
+        let mut system = ChatMessage::system("Primary system instructions");
+        system.content.push(MessageContent::text(
+            "Available skills: code-review (Reviews code changes)",
+        ));
+        let messages = vec![system, ChatMessage::user("Hello")];
+        let (instructions, input) = OpenAIProvider::build_input(&messages);
+
+        assert_eq!(
+            instructions,
+            Some(
+                "Primary system instructions\nAvailable skills: code-review (Reviews code changes)"
+                    .to_string()
+            )
+        );
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "Hello");
+    }
+
+    #[test]
     fn build_input_keeps_audit_notes_out_of_system_replay_path() {
         let messages = vec![
             ChatMessage::system("Primary system instructions"),

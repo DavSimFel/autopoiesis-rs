@@ -12,6 +12,7 @@ pub mod principal;
 pub mod read_tool;
 pub mod server;
 pub mod session;
+pub mod skills;
 pub mod spawn;
 pub mod store;
 pub mod subscription;

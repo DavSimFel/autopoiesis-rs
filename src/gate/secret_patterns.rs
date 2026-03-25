@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 pub(crate) const SECRET_PATTERN_COUNT: usize = 3;
 
 pub(crate) const OPENAI_SECRET_PREFIX: &str = "sk-";
@@ -376,6 +378,127 @@ fn command_basename(command: &str) -> &str {
 
 fn identity_template_mentions_target(value: &str) -> bool {
     value.contains("identity-templates/") || value == "identity-templates"
+}
+
+pub(crate) fn command_writes_target_path(command: &str, target: &str) -> bool {
+    if target == "identity-templates" {
+        return command_writes_identity_template_path(command);
+    }
+
+    let target = normalize_lexical_path(&target.to_lowercase());
+    if target.is_empty() {
+        return false;
+    }
+
+    let normalized = rewrite_target_path_mentions(command, &target);
+    command_writes_identity_template_path(&normalized)
+}
+
+fn rewrite_target_path_mentions(command: &str, target: &str) -> String {
+    let mut rewritten = command.to_lowercase();
+    for (needle, replacement) in collect_target_path_replacements(command, target) {
+        rewritten = rewritten.replacen(&needle, &replacement, 1);
+    }
+    rewritten
+}
+
+fn collect_target_path_replacements(command: &str, target: &str) -> Vec<(String, String)> {
+    let mut replacements = Vec::new();
+    collect_target_path_replacements_into(command, target, &mut replacements);
+    replacements
+}
+
+fn collect_target_path_replacements_into(
+    command: &str,
+    target: &str,
+    replacements: &mut Vec<(String, String)>,
+) {
+    if let Ok(argv) = shell_words::split(command)
+        && argv.len() > 1
+    {
+        for argument in argv {
+            collect_target_path_replacements_into(&argument, target, replacements);
+        }
+        return;
+    }
+
+    if let Some(replacement) = rewrite_target_path_argument(command, target) {
+        replacements.push((command.to_lowercase(), replacement));
+    }
+}
+
+fn rewrite_target_path_argument(argument: &str, target: &str) -> Option<String> {
+    let lowered = argument.to_lowercase();
+    let candidate = if let Some(candidate) = git_path_spec_argument(&lowered) {
+        candidate
+    } else {
+        &lowered
+    };
+
+    let candidate_path = resolve_path_like(candidate)?;
+    let target_path = resolve_path_like(target)?;
+    if !path_matches_target(&candidate_path, &target_path) {
+        return None;
+    }
+
+    let suffix = candidate_path
+        .strip_prefix(&target_path)
+        .unwrap_or_else(|_| Path::new(""));
+    if suffix.as_os_str().is_empty() {
+        Some("identity-templates".to_string())
+    } else {
+        Some(format!("identity-templates/{}", suffix.to_string_lossy()))
+    }
+}
+
+fn resolve_path_like(path: &str) -> Option<PathBuf> {
+    let path = Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+
+    if absolute.exists() {
+        return std::fs::canonicalize(&absolute).ok();
+    }
+
+    let mut probe = absolute.as_path();
+    while let Some(parent) = probe.parent() {
+        if parent.exists() {
+            let canonical_parent = std::fs::canonicalize(parent).ok()?;
+            let suffix = absolute.strip_prefix(parent).ok()?;
+            return Some(canonical_parent.join(suffix));
+        }
+        probe = parent;
+    }
+
+    Some(normalize_path(&absolute))
+}
+
+fn path_matches_target(candidate: &Path, target: &Path) -> bool {
+    candidate == target || candidate.starts_with(target)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::Normal(part) => {
+                normalized.push(part);
+            }
+        }
+    }
+
+    normalized
 }
 
 fn identity_template_destination_argument(args: &[String]) -> Option<&str> {
@@ -1119,6 +1242,56 @@ fn git_config_value_references_protected_path(value: &str) -> bool {
     }
 }
 
+fn git_option_value_references_target_path(argv: &[String], target: &str) -> bool {
+    let mut index = 1usize;
+
+    while index < argv.len() {
+        let token = &argv[index];
+        if !token.starts_with('-') {
+            break;
+        }
+
+        if matches!(
+            token.as_str(),
+            "-c" | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--super-prefix"
+                | "--exec-path"
+                | "--config-env"
+                | "-C"
+        ) {
+            if let Some(value) = argv.get(index + 1)
+                && git_config_value_references_target_path(value, target)
+            {
+                return true;
+            }
+            index += 1;
+        }
+
+        index += 1;
+    }
+
+    false
+}
+
+fn git_config_value_references_target_path(value: &str, target: &str) -> bool {
+    let Some((key, command)) = value.split_once('=') else {
+        return false;
+    };
+
+    if !git_config_key_executes_shell_command(key) {
+        return false;
+    }
+
+    let command = command.trim_start_matches('!').trim();
+    if let Ok(argv) = shell_words::split(command) {
+        simple_command_reads_target_path(&argv, target)
+    } else {
+        command_argument_references_target_path(command, target)
+    }
+}
+
 fn git_config_key_executes_shell_command(key: &str) -> bool {
     matches!(key, k if k.starts_with("alias."))
         || matches!(
@@ -1163,6 +1336,29 @@ fn command_argument_references_protected_path(argument: &str) -> bool {
     } else {
         is_protected_path_value(argument)
     }
+}
+
+fn command_argument_references_target_path(argument: &str, target: &str) -> bool {
+    let target = normalize_lexical_path(&target.to_lowercase());
+    if target.is_empty() {
+        return false;
+    }
+
+    let argument = argument.to_lowercase();
+    let candidate = if let Some(candidate) = git_path_spec_argument(&argument) {
+        candidate
+    } else {
+        &argument
+    };
+
+    let Some(candidate_path) = resolve_path_like(candidate) else {
+        return false;
+    };
+    let Some(target_path) = resolve_path_like(&target) else {
+        return false;
+    };
+
+    path_matches_target(&candidate_path, &target_path)
 }
 
 fn grep_file_operands_refer_protected_path(args: &[String]) -> bool {
@@ -1248,6 +1444,89 @@ fn grep_file_operands_refer_protected_path(args: &[String]) -> bool {
     false
 }
 
+fn grep_file_operands_refer_target_path(args: &[String], target: &str) -> bool {
+    let mut options_done = false;
+    let mut pattern_specified = false;
+    let mut index = 0usize;
+
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            options_done = true;
+            index += 1;
+            continue;
+        }
+
+        if !options_done && argument.starts_with('-') && argument != "-" {
+            if argument == "-e" {
+                pattern_specified = true;
+                if args.get(index + 1).is_some() {
+                    index += 2;
+                    continue;
+                }
+            } else if let Some(value) = argument.strip_prefix("-e")
+                && !value.is_empty()
+            {
+                pattern_specified = true;
+                index += 1;
+                continue;
+            }
+
+            if argument == "-f" {
+                pattern_specified = true;
+                if let Some(value) = args.get(index + 1) {
+                    if command_argument_references_target_path(value, target) {
+                        return true;
+                    }
+                    index += 2;
+                    continue;
+                }
+            } else if let Some(value) = argument.strip_prefix("-f") {
+                if !value.is_empty() {
+                    pattern_specified = true;
+                    if command_argument_references_target_path(value, target) {
+                        return true;
+                    }
+                    index += 1;
+                    continue;
+                }
+            } else if let Some(value) = argument.strip_prefix("--file=") {
+                pattern_specified = true;
+                if command_argument_references_target_path(value, target) {
+                    return true;
+                }
+                index += 1;
+                continue;
+            } else if argument == "--file" {
+                pattern_specified = true;
+                if let Some(value) = args.get(index + 1) {
+                    if command_argument_references_target_path(value, target) {
+                        return true;
+                    }
+                    index += 2;
+                    continue;
+                }
+            }
+
+            index += 1;
+            continue;
+        }
+
+        if !pattern_specified {
+            pattern_specified = true;
+            index += 1;
+            continue;
+        }
+
+        if command_argument_references_target_path(argument, target) {
+            return true;
+        }
+
+        index += 1;
+    }
+
+    false
+}
+
 pub(crate) fn simple_command_reads_protected_path(argv: &[String]) -> bool {
     if let Some(expanded) = env_split_string_command(argv)
         && simple_command_reads_protected_path(&expanded)
@@ -1288,6 +1567,51 @@ pub(crate) fn simple_command_reads_protected_path(argv: &[String]) -> bool {
                 .iter()
                 .filter(|argument| !argument.starts_with('-'))
                 .any(|argument| command_argument_references_protected_path(argument))
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn simple_command_reads_target_path(argv: &[String], target: &str) -> bool {
+    if let Some(expanded) = env_split_string_command(argv)
+        && simple_command_reads_target_path(&expanded, target)
+    {
+        return true;
+    }
+
+    let argv = strip_env_wrapper(argv);
+    let Some((program, args)) = argv.split_first() else {
+        return false;
+    };
+
+    let program = program.to_lowercase();
+
+    match program.as_str() {
+        "cat" | "head" | "tail" | "sed" | "awk" => args
+            .iter()
+            .any(|argument| command_argument_references_target_path(argument, target)),
+        "grep" => grep_file_operands_refer_target_path(args, target),
+        "git" => {
+            if git_option_value_references_target_path(argv, target) {
+                return true;
+            }
+
+            if let Some((subcommand, sub_args)) = git_subcommand_and_args(argv) {
+                if !READ_ONLY_GIT_SUBCOMMANDS.contains(&subcommand) {
+                    return false;
+                }
+
+                if subcommand == "grep" {
+                    return grep_file_operands_refer_target_path(sub_args, target);
+                }
+
+                return sub_args
+                    .iter()
+                    .filter(|argument| !argument.starts_with('-'))
+                    .any(|argument| command_argument_references_target_path(argument, target));
+            }
+
+            false
         }
         _ => false,
     }
@@ -1551,6 +1875,51 @@ mod tests {
     }
 
     #[test]
+    fn simple_command_reads_target_path_matches_custom_directory() {
+        assert!(simple_command_reads_target_path(
+            &[
+                "cat".to_string(),
+                "custom-skills/code-review.toml".to_string()
+            ],
+            "custom-skills"
+        ));
+        assert!(simple_command_reads_target_path(
+            &[
+                "git".to_string(),
+                "grep".to_string(),
+                "-f".to_string(),
+                "custom-skills/code-review.toml".to_string(),
+                "README.md".to_string(),
+            ],
+            "custom-skills"
+        ));
+        assert!(simple_command_reads_target_path(
+            &[
+                "git".to_string(),
+                "-c".to_string(),
+                "alias.show=!cat custom-skills/code-review.toml".to_string(),
+                "show".to_string(),
+                "HEAD:README.md".to_string(),
+            ],
+            "custom-skills"
+        ));
+        assert!(simple_command_reads_target_path(
+            &[
+                "git".to_string(),
+                "-c".to_string(),
+                "core.pager=cat custom-skills/code-review.toml".to_string(),
+                "show".to_string(),
+                "HEAD:README.md".to_string(),
+            ],
+            "custom-skills"
+        ));
+        assert!(!simple_command_reads_target_path(
+            &["printf".to_string(), "hello".to_string()],
+            "custom-skills"
+        ));
+    }
+
+    #[test]
     fn identity_template_write_detection_requires_write_target() {
         assert!(command_writes_identity_template_path(
             "rm -rf identity-templates"
@@ -1651,6 +2020,14 @@ mod tests {
         assert!(command_writes_identity_template_path(
             "cp -t identity-templates /tmp/x"
         ));
+        assert!(command_writes_target_path(
+            "cp /tmp/x custom-skills/code-review.toml",
+            "custom-skills"
+        ));
+        assert!(command_writes_target_path(
+            "cp /tmp/x ./custom-skills/code-review.toml",
+            "./custom-skills"
+        ));
         assert!(command_writes_identity_template_path(
             "install --target-directory=identity-templates /tmp/x"
         ));
@@ -1690,9 +2067,50 @@ mod tests {
         assert!(command_writes_identity_template_path(
             "git -C . restore -- identity-templates/context.md"
         ));
+        assert!(command_writes_target_path(
+            "touch custom-skills/code-review.toml",
+            "custom-skills"
+        ));
+        assert!(!command_writes_target_path(
+            "touch myskills/code-review.toml",
+            "skills"
+        ));
+        assert!(!command_writes_target_path(
+            "touch vendor/skills/code-review.toml",
+            "skills"
+        ));
         assert!(!command_writes_identity_template_path(
             "git -C . restore -- README.md"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_writes_target_path_follows_symlink_alias_for_new_files() {
+        let root = std::env::temp_dir().join(format!(
+            "autopoiesis_secret_patterns_symlink_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let real = root.join("real-skills");
+        let alias = root.join("alias-skills");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let _cleanup = Cleanup(root.clone());
+        let alias_str = alias.to_string_lossy().to_string();
+        let command = format!("touch {alias_str}/new.toml");
+
+        assert!(command_writes_target_path(&command, &alias_str));
     }
 }
 

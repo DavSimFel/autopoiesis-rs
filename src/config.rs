@@ -3,10 +3,11 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 use crate::identity;
+use crate::skills::SkillCatalog;
 
 /// Runtime configuration loaded by the CLI when starting agent mode.
 #[derive(Debug, Clone)]
@@ -39,6 +40,12 @@ pub struct Config {
     pub models: ModelsConfig,
     /// Parsed `[domains]` packs.
     pub domains: DomainsConfig,
+    /// Directory containing local TOML skill definitions.
+    pub skills_dir: PathBuf,
+    /// Directory used to load local TOML skill definitions from disk.
+    pub skills_dir_resolved: PathBuf,
+    /// Loaded local skill catalog.
+    pub skills: SkillCatalog,
     /// Selected named brain, if v2 config is active.
     pub active_agent: Option<String>,
 }
@@ -108,12 +115,22 @@ impl Config {
             agents: AgentsConfig::default(),
             models: ModelsConfig::default(),
             domains: DomainsConfig::default(),
+            skills_dir: PathBuf::from("skills"),
+            skills_dir_resolved: PathBuf::from("skills"),
+            skills: SkillCatalog::default(),
             active_agent: None,
         };
 
-        let contents = match std::fs::read_to_string(config_path.as_ref()) {
+        let config_path = config_path.as_ref();
+        let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+
+        let contents = match std::fs::read_to_string(config_path) {
             Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(config),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                config.skills = SkillCatalog::load_from_dir(&config.skills_dir)
+                    .context("failed to load skills catalog")?;
+                return Ok(config);
+            }
             Err(error) => {
                 return Err(anyhow!("failed to read config file: {error}"));
             }
@@ -223,6 +240,18 @@ impl Config {
         config.shell_policy = file_config.shell;
         config.budget = file_config.budget;
         config.queue = file_config.queue;
+        let skills_dir = file_config
+            .skills_dir
+            .unwrap_or_else(|| PathBuf::from("skills"));
+        let resolved_skills_dir = if skills_dir.is_relative() {
+            config_dir.join(&skills_dir)
+        } else {
+            skills_dir.clone()
+        };
+        config.skills_dir = skills_dir;
+        config.skills_dir_resolved = resolved_skills_dir.clone();
+        config.skills = SkillCatalog::load_from_dir(&config.skills_dir_resolved)
+            .context("failed to load skills catalog")?;
 
         if let Ok(operator_key) = std::env::var("AUTOPOIESIS_OPERATOR_KEY") {
             config.operator_key = Some(operator_key);
@@ -501,6 +530,9 @@ mod tests {
                 PathBuf::from("identity-templates/constitution.md"),
                 PathBuf::from("identity-templates/context.md"),
             ],
+            skills_dir: PathBuf::from("skills"),
+            skills_dir_resolved: PathBuf::from("skills"),
+            skills: SkillCatalog::default(),
             agents: {
                 let mut agents = AgentsConfig::default();
                 agents.entries.insert(
@@ -749,6 +781,48 @@ mod tests {
     }
 
     #[test]
+    fn loads_skills_catalog_even_when_config_file_is_missing() {
+        let config = Config::load("/does/not/exist.toml").expect("expected defaults to be used");
+        assert!(!config.skills.is_empty());
+        assert!(config.skills.get("code-review").is_some());
+    }
+
+    #[test]
+    fn loads_skills_catalog_from_configured_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "autopoiesis_config_skills_test_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let skills_dir = root.join("custom-skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("code-review.toml"),
+            "[skill]\nname='code-review'\ndescription='Reviews code changes'\nrequired_caps=['code']\ntoken_estimate=500\ninstructions='full prompt'\n",
+        )
+        .unwrap();
+
+        let config_path = root.join("agents.toml");
+        let config_contents = format!(
+            "skills_dir='custom-skills'\n[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-skills'\n",
+        );
+        std::fs::write(&config_path, config_contents).unwrap();
+
+        let config = Config::load(&config_path).expect("expected config to load");
+        assert_eq!(config.skills_dir, PathBuf::from("custom-skills"));
+        assert_eq!(config.skills_dir_resolved, root.join("custom-skills"));
+        assert_eq!(config.skills.browse().len(), 1);
+        assert_eq!(
+            config.skills.get("code-review").unwrap().description,
+            "Reviews code changes"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn loads_read_config_with_all_fields() {
         let path = temp_toml_path(
             "read_all",
@@ -934,6 +1008,8 @@ struct RuntimeFileConfig {
     models: ModelsConfig,
     #[serde(default)]
     domains: DomainsConfig,
+    #[serde(default)]
+    skills_dir: Option<PathBuf>,
     auth: Option<AuthFileSection>,
     #[serde(default)]
     shell: ShellPolicy,

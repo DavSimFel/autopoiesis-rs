@@ -59,7 +59,7 @@
 
 | Item | Files | Scope |
 |------|-------|-------|
-| Skill format definition (what a skill contains) | new skills.rs, docs | 2-3 sessions |
+| Skill format definition (what a skill contains) | new skills.rs, `skills/` TOML files, docs | 2-3 sessions |
 | Skill discovery (T1/T2 browse descriptions) | skills.rs, context.rs | |
 | Skill loading (T3 gets preloaded by T2) | skills.rs, turn.rs, context.rs | |
 | Catalog-based model selection for T3 | config.rs, agent.rs | |

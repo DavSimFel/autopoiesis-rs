@@ -1,0 +1,12 @@
+[skill]
+name = "code-review"
+description = "Reviews code changes for correctness, style, and security"
+required_caps = ["code"]
+token_estimate = 500
+instructions = """
+You are a careful code reviewer.
+
+Focus on correctness first, then security, then style.
+Look for missing tests, regressions, edge cases, and mismatched invariants.
+Be concise and specific.
+"""

@@ -17,6 +17,7 @@ const PROVENANCE_PRINCIPAL: &str = "operator";
 #[derive(Debug, Clone)]
 pub struct ReadFile {
     allowed_paths: Vec<PathBuf>,
+    protected_paths: Vec<PathBuf>,
     max_read_bytes: usize,
 }
 
@@ -31,6 +32,19 @@ impl ReadFile {
     pub fn new(allowed_paths: Vec<PathBuf>, max_read_bytes: usize) -> Self {
         Self {
             allowed_paths,
+            protected_paths: Vec::new(),
+            max_read_bytes,
+        }
+    }
+
+    pub fn with_protected_paths(
+        allowed_paths: Vec<PathBuf>,
+        protected_paths: Vec<PathBuf>,
+        max_read_bytes: usize,
+    ) -> Self {
+        Self {
+            allowed_paths,
+            protected_paths,
             max_read_bytes,
         }
     }
@@ -38,6 +52,17 @@ impl ReadFile {
     pub fn from_config(config: &ReadToolConfig) -> Self {
         Self::new(
             config.allowed_paths.iter().map(PathBuf::from).collect(),
+            config.max_read_bytes,
+        )
+    }
+
+    pub fn from_config_with_protected_paths(
+        config: &ReadToolConfig,
+        protected_paths: Vec<PathBuf>,
+    ) -> Self {
+        Self::with_protected_paths(
+            config.allowed_paths.iter().map(PathBuf::from).collect(),
+            protected_paths,
             config.max_read_bytes,
         )
     }
@@ -114,8 +139,11 @@ impl ReadFile {
         Ok((normalized_roots, canonical_roots))
     }
 
-    fn path_is_explicitly_denied(path: &Path) -> bool {
+    fn path_is_explicitly_denied(path: &Path, protected_paths: &[PathBuf]) -> bool {
         path_is_protected(path)
+            || protected_paths
+                .iter()
+                .any(|protected| path == protected.as_path() || path.starts_with(protected))
             || path
                 .components()
                 .any(|component| {
@@ -182,6 +210,7 @@ impl ReadFile {
     fn read_file_inner(
         args: ReadFileArgs,
         allowed_paths: Vec<PathBuf>,
+        protected_paths: Vec<PathBuf>,
         max_read_bytes: usize,
     ) -> Result<String> {
         let ReadFileArgs {
@@ -199,8 +228,8 @@ impl ReadFile {
         let (normalized_allowed_roots, canonical_allowed_roots) =
             Self::resolve_allowed_roots(&allowed_paths)?;
 
-        if Self::path_is_explicitly_denied(&requested_path)
-            || Self::path_is_explicitly_denied(&normalized_requested)
+        if Self::path_is_explicitly_denied(&requested_path, &protected_paths)
+            || Self::path_is_explicitly_denied(&normalized_requested, &protected_paths)
             || !Self::is_within_allowed_root(&normalized_requested, &normalized_allowed_roots)
         {
             return Err(anyhow!("access denied: path is outside allowed roots"));
@@ -213,7 +242,7 @@ impl ReadFile {
         let canonical_requested = std::fs::canonicalize(&normalized_requested)
             .with_context(|| format!("failed to resolve {}", normalized_requested.display()))?;
 
-        if Self::path_is_explicitly_denied(&canonical_requested) {
+        if Self::path_is_explicitly_denied(&canonical_requested, &protected_paths) {
             return Err(anyhow!("access denied: protected path"));
         }
 
@@ -270,11 +299,12 @@ impl Tool for ReadFile {
     fn execute(&self, arguments: &str) -> ToolFuture<'_> {
         let arguments = arguments.to_string();
         let allowed_paths = self.allowed_paths.clone();
+        let protected_paths = self.protected_paths.clone();
         let max_read_bytes = self.max_read_bytes;
         Box::pin(async move {
             let args = Self::parse_args(&arguments)?;
             let output = tokio::task::spawn_blocking(move || {
-                Self::read_file_inner(args, allowed_paths, max_read_bytes)
+                Self::read_file_inner(args, allowed_paths, protected_paths, max_read_bytes)
             })
             .await
             .context("failed to join read_file blocking task")??;
@@ -337,6 +367,16 @@ mod tests {
             .expect("tool call should succeed")
     }
 
+    fn call_err(tool: &ReadFile, arguments: serde_json::Value) -> String {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build runtime")
+            .block_on(tool.execute(&arguments.to_string()))
+            .expect_err("tool call should fail")
+            .to_string()
+    }
+
     #[test]
     fn definition_describes_required_path_and_optional_line_bounds() {
         let tool = ReadFile::new(vec![PathBuf::from(".")], 64);
@@ -388,6 +428,19 @@ mod tests {
                 escaped_path(&path)
             )
         );
+    }
+
+    #[test]
+    fn protected_skills_directory_is_denied_even_under_allowed_root() {
+        let root = temp_root("protected_skills");
+        let skills_dir = root.join("skills");
+        let path = skills_dir.join("code-review.toml");
+        write_file(&path, "full prompt");
+
+        let tool = ReadFile::with_protected_paths(vec![root.clone()], vec![skills_dir.clone()], 64);
+        let error = call_err(&tool, json!({ "path": path.to_string_lossy() }));
+
+        assert!(error.contains("access denied"));
     }
 
     #[test]

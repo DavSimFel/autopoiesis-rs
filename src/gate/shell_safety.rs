@@ -1,10 +1,12 @@
 use serde_json::{Value, from_str};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use tracing::debug;
 
 use crate::config::ShellPolicy;
 use crate::gate::secret_patterns::{
-    command_writes_identity_template_path, simple_command_reads_protected_path,
+    command_writes_identity_template_path, command_writes_target_path,
+    simple_command_reads_protected_path, simple_command_reads_target_path,
 };
 use crate::gate::{Guard, GuardContext, GuardEvent, Severity, Verdict};
 use crate::llm::ToolCall;
@@ -24,6 +26,7 @@ const STANDING_APPROVAL_LOG_PREFIX: &str = "[standing-approval] command matched 
 pub struct ShellSafety {
     id: String,
     policy: ShellPolicy,
+    skills_dirs: Vec<PathBuf>,
     default_action: ShellDefaultAction,
     default_severity: Severity,
     standing_approvals: Vec<String>,
@@ -44,10 +47,18 @@ struct StandingApprovalMatch {
 
 impl ShellSafety {
     pub fn new() -> Self {
-        Self::with_policy(ShellPolicy::default())
+        Self::with_policy_and_skills_dirs(ShellPolicy::default(), vec![PathBuf::from("skills")])
     }
 
     pub fn with_policy(policy: ShellPolicy) -> Self {
+        Self::with_policy_and_skills_dirs(policy, vec![PathBuf::from("skills")])
+    }
+
+    pub fn with_policy_and_skills_dir(policy: ShellPolicy, skills_dir: PathBuf) -> Self {
+        Self::with_policy_and_skills_dirs(policy, vec![skills_dir])
+    }
+
+    pub fn with_policy_and_skills_dirs(policy: ShellPolicy, skills_dirs: Vec<PathBuf>) -> Self {
         let default_action = match policy.default.trim() {
             value if value.eq_ignore_ascii_case(SHELL_POLICY_ACTION_ALLOW) => {
                 ShellDefaultAction::Allow
@@ -68,6 +79,7 @@ impl ShellSafety {
         Self {
             id: SHELL_POLICY_GUARD_ID.to_string(),
             policy,
+            skills_dirs,
             default_action,
             default_severity,
             standing_approvals,
@@ -166,7 +178,10 @@ impl ShellSafety {
         }
 
         if let Some(argv) = Self::shell_words(command)
-            && simple_command_reads_protected_path(&argv)
+            && (simple_command_reads_protected_path(&argv)
+                || self.skills_dirs.iter().any(|skills_dir| {
+                    simple_command_reads_target_path(&argv, &skills_dir.to_string_lossy())
+                }))
         {
             return Verdict::Deny {
                 reason: format!("shell command reads protected credential path: `{command}`"),
@@ -174,11 +189,13 @@ impl ShellSafety {
             };
         }
 
-        if command_writes_identity_template_path(command) {
+        if command_writes_identity_template_path(command)
+            || self.skills_dirs.iter().any(|skills_dir| {
+                command_writes_target_path(command, &skills_dir.to_string_lossy())
+            })
+        {
             return Verdict::Deny {
-                reason: format!(
-                    "shell command writes protected identity template path: `{command}`"
-                ),
+                reason: format!("shell command writes protected prompt path: `{command}`"),
                 gate_id: self.id.clone(),
             };
         }
@@ -321,6 +338,36 @@ mod tests {
                 severity: Severity::Medium,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn custom_skills_directory_is_protected() {
+        let gate = ShellSafety::with_policy_and_skills_dir(
+            ShellPolicy::default(),
+            PathBuf::from("custom-skills"),
+        );
+        let call = make_tool_call("cp /tmp/source custom-skills/code-review.toml");
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn custom_skills_directory_reads_are_protected() {
+        let gate = ShellSafety::with_policy_and_skills_dir(
+            ShellPolicy::default(),
+            PathBuf::from("custom-skills"),
+        );
+        let call = make_tool_call("cat custom-skills/code-review.toml");
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Deny { .. }
         ));
     }
 
@@ -754,6 +801,7 @@ mod tests {
             "cp /tmp/x identity-templates/agents/silas/agent.md",
             "mv identity-templates/agents/silas/agent.md /tmp/x",
             "rm -rf identity-templates/agents/silas",
+            "touch skills/code-review.toml",
         ] {
             let call = make_tool_call(command);
             let mut event = make_event_tool(&call);
@@ -778,6 +826,7 @@ mod tests {
             "git restore identity-templates/constitution.md",
             "python -c \"open('identity-templates/context.md', 'w').write('x')\"",
             "python -c \"from pathlib import Path; Path('identity-templates/context.md').write_text('x')\"",
+            "cp /tmp/source skills/code-review.toml",
         ] {
             let call = make_tool_call(command);
             let mut event = make_event_tool(&call);
@@ -811,12 +860,16 @@ mod tests {
 
 #[cfg(test)]
 mod identity_template_shell_safety_tests {
-    use super::command_writes_identity_template_path;
+    use super::{command_writes_identity_template_path, command_writes_target_path};
 
     #[test]
     fn denies_wrapped_perl_inplace_edit() {
         assert!(command_writes_identity_template_path(
             r#"bash -c "perl -pi -e 's/foo/bar/' identity-templates/context.md""#,
+        ));
+        assert!(command_writes_target_path(
+            r#"bash -c "perl -pi -e 's/foo/bar/' custom-skills/code-review.toml""#,
+            "custom-skills"
         ));
     }
 

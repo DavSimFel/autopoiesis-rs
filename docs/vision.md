@@ -16,7 +16,7 @@ Not a framework (you don't import it). Not a platform (there's no multi-tenant).
 
 Shell is the only tool. The prompt teaches the agent what to do with it. Zero tool surface to secure, zero integrations to maintain. Same capability as any human at a terminal. PTY extends this to persistent interactive sessions — SSH, REPLs, monitoring.
 
-Skills provide reusable knowledge (API docs, auth patterns, example calls) that make shell effective for specific domains. The agent learns skills, doesn't import libraries.
+Skills are local TOML files under `skills/`. They provide reusable knowledge (API docs, auth patterns, example calls) that make shell effective for specific domains. The agent learns skills, doesn't import libraries.
 
 ### 2. Agent-controlled context
 

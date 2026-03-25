@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::identity;
 use crate::llm::{ChatMessage, ChatRole, MessageContent};
+use crate::skills::SkillSummary;
 use tracing::warn;
 
 /// Source for messages inserted into each turn before model invocation.
@@ -85,6 +86,51 @@ impl ContextSource for Identity {
             first.content.clear();
             first.content.push(replacement);
         }
+    }
+}
+
+/// Skill summary context for local discovery in T1/T2 turns.
+pub struct SkillContext {
+    summaries: Vec<SkillSummary>,
+}
+
+impl SkillContext {
+    pub fn new(summaries: Vec<SkillSummary>) -> Self {
+        Self { summaries }
+    }
+}
+
+impl ContextSource for SkillContext {
+    fn name(&self) -> &str {
+        "skills"
+    }
+
+    fn assemble(&self, messages: &mut Vec<ChatMessage>) {
+        if self.summaries.is_empty() {
+            return;
+        }
+
+        let rendered = format!(
+            "Available skills: {}",
+            self.summaries
+                .iter()
+                .map(|skill| format!("{} ({})", skill.name, skill.description))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        if messages.is_empty() {
+            messages.push(ChatMessage::system(rendered));
+            return;
+        }
+
+        let first = &mut messages[0];
+        if first.role != ChatRole::System {
+            messages.insert(0, ChatMessage::system(rendered));
+            return;
+        }
+
+        first.content.push(MessageContent::text(rendered));
     }
 }
 
@@ -303,6 +349,26 @@ mod tests {
             _ => panic!("expected text"),
         };
         assert_eq!(content, "model: gpt-4\n\ncwd: /tmp/proj\n\ntool: execute");
+    }
+
+    #[test]
+    fn skill_context_appends_summary_to_existing_system_message() {
+        let source = SkillContext::new(vec![SkillSummary {
+            name: "code-review".to_string(),
+            description: "Reviews code changes".to_string(),
+        }]);
+        let mut messages = vec![ChatMessage::system("base prompt")];
+
+        source.assemble(&mut messages);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, ChatRole::System);
+        assert!(
+            messages[0].content.iter().any(
+                |block| matches!(block, MessageContent::Text { text } if text == "base prompt")
+            )
+        );
+        assert!(messages[0].content.iter().any(|block| matches!(block, MessageContent::Text { text } if text == "Available skills: code-review (Reviews code changes)")));
     }
 
     #[test]

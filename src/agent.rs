@@ -1373,6 +1373,9 @@ mod tests {
             read: crate::config::ReadToolConfig::default(),
             queue: crate::config::QueueConfig::default(),
             identity_files: Vec::new(),
+            skills_dir: std::path::PathBuf::from("skills"),
+            skills_dir_resolved: std::path::PathBuf::from("skills"),
+            skills: crate::skills::SkillCatalog::default(),
             agents: crate::config::AgentsConfig::default(),
             models: {
                 let mut models = crate::config::ModelsConfig::default();
@@ -1511,6 +1514,9 @@ mod tests {
             read: crate::config::ReadToolConfig::default(),
             queue: crate::config::QueueConfig::default(),
             identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
+            skills_dir: std::path::PathBuf::from("skills"),
+            skills_dir_resolved: std::path::PathBuf::from("skills"),
+            skills: crate::skills::SkillCatalog::default(),
             agents: {
                 let mut agents = crate::config::AgentsConfig::default();
                 agents.entries.insert(
@@ -1655,6 +1661,9 @@ mod tests {
             read: crate::config::ReadToolConfig::default(),
             queue: crate::config::QueueConfig::default(),
             identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
+            skills_dir: std::path::PathBuf::from("skills"),
+            skills_dir_resolved: std::path::PathBuf::from("skills"),
+            skills: crate::skills::SkillCatalog::default(),
             agents: {
                 let mut agents = crate::config::AgentsConfig::default();
                 agents.entries.insert(
@@ -1830,6 +1839,9 @@ mod tests {
             read: crate::config::ReadToolConfig::default(),
             queue: crate::config::QueueConfig::default(),
             identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
+            skills_dir: std::path::PathBuf::from("skills"),
+            skills_dir_resolved: std::path::PathBuf::from("skills"),
+            skills: crate::skills::SkillCatalog::default(),
             agents: {
                 let mut agents = crate::config::AgentsConfig::default();
                 agents.entries.insert(
@@ -1955,6 +1967,9 @@ mod tests {
                 read: crate::config::ReadToolConfig::default(),
                 queue: crate::config::QueueConfig::default(),
                 identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
+                skills_dir: std::path::PathBuf::from("skills"),
+                skills_dir_resolved: std::path::PathBuf::from("skills"),
+                skills: crate::skills::SkillCatalog::default(),
                 agents: {
                     let mut agents = crate::config::AgentsConfig::default();
                     agents.entries.insert(
@@ -2052,6 +2067,9 @@ mod tests {
                 read: crate::config::ReadToolConfig::default(),
                 queue: crate::config::QueueConfig::default(),
                 identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
+                skills_dir: std::path::PathBuf::from("skills"),
+                skills_dir_resolved: std::path::PathBuf::from("skills"),
+                skills: crate::skills::SkillCatalog::default(),
                 agents: {
                     let mut agents = crate::config::AgentsConfig::default();
                     agents.entries.insert(

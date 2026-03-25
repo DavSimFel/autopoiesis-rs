@@ -271,6 +271,7 @@ fn build_turn_with_tool(
     tool: impl Tool + 'static,
     include_shell_guards: bool,
     include_delegation: bool,
+    include_skills: bool,
 ) -> Turn {
     let tool_definition = tool.definition();
     let vars = identity_vars_for_turn(config, std::slice::from_ref(&tool_definition));
@@ -279,13 +280,25 @@ fn build_turn_with_tool(
         crate::context::Identity::new(config.identity_files.clone(), vars, &config.system_prompt)
             .strict(),
     );
+    if include_skills {
+        turn = turn.context(crate::context::SkillContext::new(config.skills.browse()));
+    }
     turn = turn.tool(tool);
     turn = add_budget_guard(turn, config).guard(SecretRedactor::default_catalog());
 
     if include_shell_guards {
         turn = turn
-            .guard(ShellSafety::with_policy(config.shell_policy.clone()))
-            .guard(ExfilDetector::new());
+            .guard(ShellSafety::with_policy_and_skills_dirs(
+                config.shell_policy.clone(),
+                vec![
+                    config.skills_dir.clone(),
+                    config.skills_dir_resolved.clone(),
+                ],
+            ))
+            .guard(ExfilDetector::with_skills_dirs(vec![
+                config.skills_dir.clone(),
+                config.skills_dir_resolved.clone(),
+            ]));
     }
 
     if include_delegation
@@ -311,6 +324,7 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
         ),
         true,
         true,
+        true,
     )
 }
 
@@ -325,7 +339,19 @@ pub fn build_turn_for_config(config: &crate::config::Config) -> Turn {
 
 /// Build a T2 turn with structured reads only.
 pub fn build_t2_turn(config: &crate::config::Config) -> Turn {
-    build_turn_with_tool(config, ReadFile::from_config(&config.read), false, false)
+    build_turn_with_tool(
+        config,
+        ReadFile::from_config_with_protected_paths(
+            &config.read,
+            vec![
+                config.skills_dir.clone(),
+                config.skills_dir_resolved.clone(),
+            ],
+        ),
+        false,
+        false,
+        true,
+    )
 }
 
 /// Build a T3 turn with shell access but no delegation hint support.
@@ -337,6 +363,7 @@ pub fn build_t3_turn(config: &crate::config::Config) -> Turn {
             config.shell_policy.max_timeout_ms,
         ),
         true,
+        false,
         false,
     )
 }
@@ -350,9 +377,11 @@ mod tests {
     use crate::gate::{
         BudgetSnapshot, GuardContext, GuardEvent, SecretRedactor, Verdict as GuardResult,
     };
+    use crate::llm::MessageContent;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct RecordingGuard {
         id: &'static str,
@@ -620,6 +649,206 @@ mod tests {
                 .iter()
                 .any(|message| message.role == crate::llm::ChatRole::System)
         );
+    }
+
+    #[test]
+    fn default_turn_includes_skill_summaries_without_clobbering_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "autopoiesis_turn_skill_test_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let skills_dir = root.join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("code-review.toml"),
+            "[skill]\nname='code-review'\ndescription='Reviews code changes'\nrequired_caps=['code']\ntoken_estimate=500\ninstructions='full prompt'\n",
+        )
+        .unwrap();
+
+        let mut config = test_config(None);
+        config.skills_dir = skills_dir.clone();
+        config.skills = crate::skills::SkillCatalog::load_from_dir(&skills_dir).unwrap();
+
+        let turn = build_default_turn(&config);
+        let mut messages = Vec::new();
+        turn.assemble_context(&mut messages);
+
+        let system_text = messages
+            .iter()
+            .find(|message| message.role == crate::llm::ChatRole::System)
+            .map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        MessageContent::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+
+        assert!(system_text.contains("system"));
+        assert!(system_text.contains("Available skills: code-review (Reviews code changes)"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn t2_turn_includes_skill_summaries() {
+        let mut config = test_config_for_tier(Some("t2"), None);
+        config.skills = crate::skills::SkillCatalog::load_from_dir("skills").unwrap();
+
+        let turn = build_t2_turn(&config);
+        let mut messages = Vec::new();
+        turn.assemble_context(&mut messages);
+
+        let system_text = messages
+            .iter()
+            .find(|message| message.role == crate::llm::ChatRole::System)
+            .map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        MessageContent::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+
+        assert!(system_text.contains("Available skills: code-review"));
+    }
+
+    #[test]
+    fn t3_turn_does_not_include_skill_summaries() {
+        let mut config = test_config_for_tier(Some("t3"), None);
+        config.skills = crate::skills::SkillCatalog::load_from_dir("skills").unwrap();
+
+        let turn = build_t3_turn(&config);
+        let mut messages = Vec::new();
+        turn.assemble_context(&mut messages);
+
+        let system_text = messages
+            .iter()
+            .find(|message| message.role == crate::llm::ChatRole::System)
+            .map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        MessageContent::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+
+        assert!(!system_text.contains("Available skills:"));
+    }
+
+    #[tokio::test]
+    async fn provider_input_includes_skill_summaries() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct InspectingProvider {
+            observed_messages: Arc<Mutex<Option<Vec<ChatMessage>>>>,
+        }
+
+        impl crate::llm::LlmProvider for InspectingProvider {
+            async fn stream_completion(
+                &self,
+                messages: &[ChatMessage],
+                _tools: &[FunctionTool],
+                _on_token: &mut (dyn FnMut(String) + Send),
+            ) -> anyhow::Result<crate::llm::StreamedTurn> {
+                *self
+                    .observed_messages
+                    .lock()
+                    .expect("messages mutex poisoned") = Some(messages.to_vec());
+
+                Ok(crate::llm::StreamedTurn {
+                    assistant_message: ChatMessage::system("done"),
+                    tool_calls: vec![],
+                    meta: None,
+                    stop_reason: crate::llm::StopReason::Stop,
+                })
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "autopoiesis_turn_provider_input_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut session = crate::session::Session::new(&root).unwrap();
+        session.add_user_message("hello").unwrap();
+
+        let mut config = test_config(None);
+        config.skills = crate::skills::SkillCatalog::load_from_dir("skills").unwrap();
+        let turn = build_default_turn(&config);
+
+        let observed_messages = Arc::new(Mutex::new(None));
+        let mut make_provider = {
+            let provider = InspectingProvider {
+                observed_messages: observed_messages.clone(),
+            };
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler =
+            |_severity: &crate::gate::Severity, _reason: &str, _command: &str| true;
+
+        crate::agent::run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "continue".to_string(),
+            crate::principal::Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        let messages = observed_messages
+            .lock()
+            .expect("messages mutex poisoned")
+            .clone()
+            .expect("provider should observe messages");
+        let system_text = messages
+            .iter()
+            .find(|message| message.role == crate::llm::ChatRole::System)
+            .map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        MessageContent::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+
+        assert!(system_text.contains("Available skills: code-review"));
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -1038,6 +1267,9 @@ mod tests {
             read: crate::config::ReadToolConfig::default(),
             queue: crate::config::QueueConfig::default(),
             identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
+            skills_dir: std::path::PathBuf::from("skills"),
+            skills_dir_resolved: std::path::PathBuf::from("skills"),
+            skills: crate::skills::SkillCatalog::default(),
             agents: crate::config::AgentsConfig::default(),
             models: crate::config::ModelsConfig::default(),
             domains: crate::config::DomainsConfig::default(),
