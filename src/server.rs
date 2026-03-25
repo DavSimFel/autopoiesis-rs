@@ -397,7 +397,7 @@ async fn websocket_session(
         }
     }
 
-    let turn = turn::build_default_turn(&state.config);
+    let turn = turn::build_turn_for_config(&state.config);
     let mut approval_handler = WsApprovalHandler::new(tx.clone(), approval_rx);
 
     while let Some(content) = prompt_rx.recv().await {
@@ -537,7 +537,7 @@ fn principal_for_token(state: &ServerState, token: &str) -> Option<Principal> {
 
 fn spawn_http_queue_worker(state: ServerState, session_id: String) {
     tokio::spawn(async move {
-        let turn = turn::build_default_turn(&state.config);
+        let turn = turn::build_turn_for_config(&state.config);
         let mut provider_factory = {
             let client = state.http_client.clone();
             let config = state.config.clone();

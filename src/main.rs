@@ -433,7 +433,7 @@ async fn main() -> Result<()> {
             queue.create_session(&session_id, Some(r#"{"source":"cli"}"#))?;
 
             let provider_config = config.clone();
-            let turn = turn::build_default_turn(&provider_config);
+            let turn = turn::build_turn_for_config(&provider_config);
             let http_client = Client::new();
             let mut provider_factory = move || {
                 let provider_config = provider_config.clone();

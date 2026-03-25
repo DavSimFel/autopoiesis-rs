@@ -8,6 +8,7 @@ use crate::gate::{
     ShellSafety, Verdict,
 };
 use crate::llm::{ChatMessage, FunctionTool, ToolCall};
+use crate::read_tool::ReadFile;
 use crate::tool::Tool;
 use tracing::{debug, warn};
 
@@ -215,17 +216,31 @@ fn resolve_verdict(
     }
 }
 
-/// Build the default turn used by both CLI and server execution paths.
-pub fn build_default_turn(config: &crate::config::Config) -> Turn {
+enum TurnTier {
+    T1,
+    T2,
+    T3,
+}
+
+fn resolve_tier(config: &crate::config::Config) -> TurnTier {
+    match config
+        .active_agent_definition()
+        .and_then(|agent| agent.tier.as_deref())
+    {
+        Some("t2") => TurnTier::T2,
+        Some("t3") => TurnTier::T3,
+        _ => TurnTier::T1,
+    }
+}
+
+fn identity_vars_for_turn(
+    config: &crate::config::Config,
+    tools: &[FunctionTool],
+) -> HashMap<String, String> {
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|path| path.to_str().map(ToString::to_string))
         .unwrap_or_default();
-    let tool = crate::tool::Shell::with_limits(
-        config.shell_policy.max_output_bytes,
-        config.shell_policy.max_timeout_ms,
-    );
-    let tools = [tool.definition()];
     let tools_list = tools
         .iter()
         .map(|tool| tool.name.as_str())
@@ -236,27 +251,45 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
     vars.insert("model".to_string(), config.model.clone());
     vars.insert("cwd".to_string(), cwd);
     vars.insert("tools".to_string(), tools_list);
+    vars
+}
 
-    let mut turn = Turn::new()
-        .context(
-            crate::context::Identity::new(
-                config.identity_files.clone(),
-                vars,
-                &config.system_prompt,
-            )
-            .strict(),
-        )
-        .tool(tool);
-
+fn add_budget_guard(turn: Turn, config: &crate::config::Config) -> Turn {
     if let Some(budget) = &config.budget
         && (budget.max_tokens_per_turn.is_some()
             || budget.max_tokens_per_session.is_some()
             || budget.max_tokens_per_day.is_some())
     {
-        turn = turn.guard(BudgetGuard::new(budget.clone()));
+        return turn.guard(BudgetGuard::new(budget.clone()));
     }
 
-    if let Some(tier) = config.active_t1_config()
+    turn
+}
+
+fn build_turn_with_tool(
+    config: &crate::config::Config,
+    tool: impl Tool + 'static,
+    include_shell_guards: bool,
+    include_delegation: bool,
+) -> Turn {
+    let tool_definition = tool.definition();
+    let vars = identity_vars_for_turn(config, std::slice::from_ref(&tool_definition));
+
+    let mut turn = Turn::new().context(
+        crate::context::Identity::new(config.identity_files.clone(), vars, &config.system_prompt)
+            .strict(),
+    );
+    turn = turn.tool(tool);
+    turn = add_budget_guard(turn, config).guard(SecretRedactor::default_catalog());
+
+    if include_shell_guards {
+        turn = turn
+            .guard(ShellSafety::with_policy(config.shell_policy.clone()))
+            .guard(ExfilDetector::new());
+    }
+
+    if include_delegation
+        && let Some(tier) = config.active_t1_config()
         && (tier.delegation_token_threshold.is_some() || tier.delegation_tool_depth.is_some())
     {
         turn = turn.delegation(crate::delegation::DelegationConfig {
@@ -265,15 +298,53 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
         });
     }
 
-    turn.guard(SecretRedactor::default_catalog())
-        .guard(ShellSafety::with_policy(config.shell_policy.clone()))
-        .guard(ExfilDetector::new())
+    turn
+}
+
+/// Build the default turn used by both CLI and server execution paths.
+pub fn build_default_turn(config: &crate::config::Config) -> Turn {
+    build_turn_with_tool(
+        config,
+        crate::tool::Shell::with_limits(
+            config.shell_policy.max_output_bytes,
+            config.shell_policy.max_timeout_ms,
+        ),
+        true,
+        true,
+    )
+}
+
+/// Build the active tier turn using the config's resolved agent tier.
+pub fn build_turn_for_config(config: &crate::config::Config) -> Turn {
+    match resolve_tier(config) {
+        TurnTier::T1 => build_default_turn(config),
+        TurnTier::T2 => build_t2_turn(config),
+        TurnTier::T3 => build_t3_turn(config),
+    }
+}
+
+/// Build a T2 turn with structured reads only.
+pub fn build_t2_turn(config: &crate::config::Config) -> Turn {
+    build_turn_with_tool(config, ReadFile::from_config(&config.read), false, false)
+}
+
+/// Build a T3 turn with shell access but no delegation hint support.
+pub fn build_t3_turn(config: &crate::config::Config) -> Turn {
+    build_turn_with_tool(
+        config,
+        crate::tool::Shell::with_limits(
+            config.shell_policy.max_output_bytes,
+            config.shell_policy.max_timeout_ms,
+        ),
+        true,
+        false,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BudgetConfig, Config, ShellPolicy};
+    use crate::config::{AgentDefinition, AgentTierConfig, BudgetConfig, Config, ShellPolicy};
     use crate::context::{History, Identity};
     use crate::gate::secret_patterns::SECRET_PATTERNS;
     use crate::gate::{
@@ -725,6 +796,125 @@ mod tests {
         assert!(!matches!(result, GuardResult::Deny { .. }));
     }
 
+    #[test]
+    fn build_default_turn_remains_shell_backed() {
+        let turn = build_default_turn(&test_config(None));
+        let tool_names: Vec<_> = turn
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        assert_eq!(tool_names, vec!["execute".to_string()]);
+        assert!(turn.delegation_config().is_none());
+    }
+
+    #[test]
+    fn build_t2_turn_contains_only_read_file() {
+        let turn = build_t2_turn(&test_config_for_tier(Some("t2"), None));
+        let tool_names: Vec<_> = turn
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let guard_names: Vec<_> = turn.guards.iter().map(|guard| guard.name()).collect();
+
+        assert_eq!(tool_names, vec!["read_file".to_string()]);
+        assert_eq!(guard_names, vec!["secret-redactor".to_string()]);
+        assert!(turn.delegation_config().is_none());
+    }
+
+    #[tokio::test]
+    async fn build_t2_turn_missing_shell_tool_fails_closed() {
+        let turn = build_t2_turn(&test_config_for_tier(Some("t2"), None));
+
+        let err = turn
+            .execute_tool("execute", "{}")
+            .await
+            .expect_err("shell tool should not be available in T2");
+        assert!(err.to_string().contains("tool 'execute' not found"));
+    }
+
+    #[test]
+    fn build_t3_turn_contains_execute_and_full_shell_guards() {
+        let turn = build_t3_turn(&test_config_for_tier(
+            Some("t3"),
+            Some(BudgetConfig {
+                max_tokens_per_turn: Some(1),
+                max_tokens_per_session: None,
+                max_tokens_per_day: None,
+            }),
+        ));
+
+        let tool_names: Vec<_> = turn
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let guard_names: Vec<_> = turn.guards.iter().map(|guard| guard.name()).collect();
+
+        assert_eq!(tool_names, vec!["execute".to_string()]);
+        assert_eq!(
+            guard_names,
+            vec![
+                "budget".to_string(),
+                "secret-redactor".to_string(),
+                "shell-policy".to_string(),
+                "exfiltration-detector".to_string(),
+            ]
+        );
+        assert!(turn.delegation_config().is_none());
+    }
+
+    #[test]
+    fn build_turn_for_config_uses_t2_for_active_t2_agent() {
+        let turn = build_turn_for_config(&test_config_for_tier(Some("t2"), None));
+        let tool_names: Vec<_> = turn
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        assert_eq!(tool_names, vec!["read_file".to_string()]);
+    }
+
+    #[test]
+    fn build_turn_for_config_uses_t3_for_active_t3_agent() {
+        let turn = build_turn_for_config(&test_config_for_tier(Some("t3"), None));
+        let tool_names: Vec<_> = turn
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        assert_eq!(tool_names, vec!["execute".to_string()]);
+        assert!(turn.delegation_config().is_none());
+    }
+
+    #[test]
+    fn build_turn_for_config_defaults_to_t1_when_tier_unset() {
+        let turn = build_turn_for_config(&test_config_for_tier(None, None));
+        let tool_names: Vec<_> = turn
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        assert_eq!(tool_names, vec!["execute".to_string()]);
+    }
+
+    #[test]
+    fn build_turn_for_config_treats_unknown_tier_like_t1() {
+        let turn = build_turn_for_config(&test_config_for_tier(Some("weird"), None));
+        let tool_names: Vec<_> = turn
+            .tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        assert_eq!(tool_names, vec!["execute".to_string()]);
+    }
+
     fn make_tool_call(cmd: &str) -> ToolCall {
         ToolCall {
             id: "tool_call_1".to_string(),
@@ -767,6 +957,34 @@ mod tests {
             active_agent: None,
         }
     }
+
+    fn test_config_for_tier(tier: Option<&str>, budget: Option<BudgetConfig>) -> Config {
+        let mut config = test_config(budget);
+        let mut agents = crate::config::AgentsConfig::default();
+        agents.entries.insert(
+            "silas".to_string(),
+            AgentDefinition {
+                identity: Some("silas".to_string()),
+                tier: tier.map(ToString::to_string),
+                model: None,
+                base_url: None,
+                system_prompt: None,
+                session_name: None,
+                reasoning_effort: None,
+                t1: AgentTierConfig::default(),
+                t2: AgentTierConfig::default(),
+            },
+        );
+        config.active_agent = Some("silas".to_string());
+        config.agents = agents;
+        config.identity_files = if matches!(tier, Some("t2") | Some("t3")) {
+            crate::identity::t2_identity_files("identity-templates")
+        } else {
+            crate::identity::t1_identity_files("identity-templates", "silas")
+        };
+        config
+    }
+
     #[test]
     fn build_default_turn_carries_delegation_thresholds_into_turn_config() {
         let config = crate::config::Config::load("agents.toml").expect("config should load");

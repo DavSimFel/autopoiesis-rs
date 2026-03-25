@@ -30,7 +30,7 @@ gate/budget.rs (199L)       Per-turn/session/day token ceiling enforcement
 gate/output_cap.rs (215L)   Shell output cap + file-backed result storage
 gate/secret_patterns.rs (778L)  Shared secret pattern catalog + protected path detection + env wrapper stripping
 context.rs (383L)           ContextSource trait — Identity (prompt files), History (replay, not wired)
-turn.rs (723L)              Turn composition: ContextSource + Tool + Guard builder, taint via is_taint_source()
+turn.rs (723L)              Turn composition: tier-aware ContextSource + Tool + Guard builder, taint via is_taint_source()
 tool.rs (665L)              Shell tool: async exec, RLIMIT, process-group kill, bounded output drain
 store.rs (715L)             SQLite session registry + message queue + subscriptions table
 auth.rs (401L)              OAuth device flow, token storage/refresh
@@ -67,8 +67,8 @@ agent loop (run_agent_loop):
 
 ## Key design points
 
-### One tool
-Shell (`sh -lc`) is the only tool. All capabilities come from the prompt teaching the agent what shell commands to run. The tool surface never grows.
+### Tiered tools
+Shell (`sh -lc`) remains the execution tool for T1 and T3. T2 uses the structured `read_file` API only. Tool selection now happens in `turn.rs`, not in the agent loop or provider layers.
 
 ### Guard pipeline (gate/)
 Guards in order: BudgetGuard → SecretRedactor → ShellSafety → ExfilDetector.
@@ -100,7 +100,7 @@ All sources (CLI, HTTP, WS) enqueue to the same queue. CLI uses `agent::drain_qu
 Queue claims are atomic across SQLite processes via `UPDATE ... RETURNING`. Startup recovery only requeues `processing` rows whose `claimed_at` is older than the configured stale threshold.
 
 ### Two execution paths, one Turn
-CLI and server both use `build_default_turn()` (takes `Config` with shell policy). The Turn composes Identity (context source), Shell (tool), and the guard pipeline. Differences are only in TokenSink (stdout vs WS) and ApprovalHandler (stdin vs WS/reject).
+CLI and server both use `build_turn_for_config()` (which falls back to `build_default_turn()` for T1/backward compat). The Turn composes Identity, the tier-selected tool surface, and the guard pipeline. Differences are only in TokenSink (stdout vs WS) and ApprovalHandler (stdin vs WS/reject).
 
 ### Subscriptions
 Agent subscribes to files via CLI (`sub add <path>`). SQLite `subscriptions` table with unique (topic, path) index. Filters: Full (default), Lines, Regex, Head, Tail, Jq. Content loaded from disk, filtered, and token-estimated via tiktoken. `sub add/remove` print total token utilization. Effective timestamp = `max(activated_at, file_mtime)`. Not yet wired into context assembly (roadmap 2b).
@@ -116,4 +116,4 @@ Runtime identity is assembled from explicit file lists:
 
 T1 loads constitution + agent + context. T2/T3 load constitution + context only. Selected domain packs append to the identity file list when configured. Template variables resolved at runtime: `{{model}}`, `{{cwd}}`, `{{tools}}`.
 
-See [../specs/identity-v2.md](../specs/identity-v2.md) for the current stack and config shape.
+See [../specs/identity-v2.md](../specs/identity-v2.md) for the current stack and config shape. T2/T3 continue to load constitution + context only; T1 also loads `agent.md`.
