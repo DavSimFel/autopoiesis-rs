@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::identity;
@@ -214,6 +216,109 @@ impl History {
                 .len()
         }
     }
+
+    #[cfg(test)]
+    fn tool_call_ids(message: &ChatMessage) -> HashSet<&str> {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                MessageContent::ToolCall { call } => Some(call.id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn tool_result_call_id(message: &ChatMessage) -> Option<&str> {
+        message.content.iter().find_map(|block| match block {
+            MessageContent::ToolResult { result } => Some(result.tool_call_id.as_str()),
+            _ => None,
+        })
+    }
+
+    #[cfg(test)]
+    fn history_group_range(history: &[ChatMessage], index: usize) -> Option<(usize, usize)> {
+        match history.get(index)?.role {
+            ChatRole::System => None,
+            ChatRole::User => Some((index, index + 1)),
+            ChatRole::Assistant => {
+                let call_ids = Self::tool_call_ids(&history[index]);
+                let mut end = index + 1;
+
+                if !call_ids.is_empty() {
+                    while end < history.len() {
+                        match &history[end] {
+                            ChatMessage {
+                                role: ChatRole::Tool,
+                                content,
+                                ..
+                            } => {
+                                let matches_call = content.iter().any(|block| match block {
+                                    MessageContent::ToolResult { result } => {
+                                        call_ids.contains(result.tool_call_id.as_str())
+                                    }
+                                    _ => false,
+                                });
+                                if matches_call {
+                                    end += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+
+                Some((index, end))
+            }
+            ChatRole::Tool => {
+                let call_id = Self::tool_result_call_id(&history[index])?;
+                let mut start = index;
+
+                for candidate in (0..index).rev() {
+                    if history[candidate].role != ChatRole::Assistant {
+                        continue;
+                    }
+
+                    let call_ids = Self::tool_call_ids(&history[candidate]);
+                    if call_ids.contains(call_id) {
+                        start = candidate;
+                        break;
+                    }
+                }
+
+                let call_ids = Self::tool_call_ids(&history[start]);
+                let mut end = start + 1;
+
+                while end < history.len() {
+                    match &history[end] {
+                        ChatMessage {
+                            role: ChatRole::Tool,
+                            content,
+                            ..
+                        } => {
+                            let matches_call = content.iter().any(|block| match block {
+                                MessageContent::ToolResult { result } => {
+                                    call_ids.contains(result.tool_call_id.as_str())
+                                }
+                                _ => false,
+                            });
+                            if matches_call {
+                                end += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+
+                Some((start, end))
+            }
+        }
+    }
 }
 
 impl ContextSource for History {
@@ -255,9 +360,53 @@ impl ContextSource for History {
     }
 }
 
+impl History {
+    #[cfg(test)]
+    fn assemble_pair_aware(&self, messages: &mut Vec<ChatMessage>) {
+        if self.history.is_empty() {
+            return;
+        }
+
+        let mut current_tokens = messages
+            .iter()
+            .map(Self::estimate_message_tokens)
+            .sum::<usize>();
+        let mut selected = Vec::new();
+
+        let mut index = self.history.len();
+        while index > 0 {
+            index -= 1;
+
+            let Some((start, end)) = Self::history_group_range(&self.history, index) else {
+                continue;
+            };
+
+            let group_tokens = self.history[start..end]
+                .iter()
+                .map(Self::estimate_message_tokens)
+                .sum::<usize>();
+
+            if current_tokens + group_tokens > self.max_tokens {
+                break;
+            }
+
+            selected.splice(0..0, self.history[start..end].iter().cloned());
+            current_tokens += group_tokens;
+            index = start;
+        }
+
+        if selected.is_empty() {
+            return;
+        }
+
+        messages.extend(selected);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Principal;
     use std::{
         env, fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -526,6 +675,59 @@ mod tests {
     }
 
     #[test]
+    fn history_keeps_assistant_tool_roundtrip_when_budget_allows_group() {
+        let mut source = History::new(6);
+        let mut assistant =
+            ChatMessage::with_role_with_principal(ChatRole::Assistant, Some(Principal::Agent));
+        assistant.content.push(MessageContent::Text {
+            text: "alpha beta".to_string(),
+        });
+        assistant.content.push(MessageContent::ToolCall {
+            call: crate::llm::ToolCall {
+                id: "call-1".to_string(),
+                name: "execute".to_string(),
+                arguments: "{\"command\":\"echo hi\"}".to_string(),
+            },
+        });
+
+        let history = vec![
+            ChatMessage::user("very long old message that should be trimmed"),
+            assistant,
+            ChatMessage::tool_result_with_principal(
+                "call-1",
+                "execute",
+                "ok",
+                Some(Principal::System),
+            ),
+            ChatMessage::user("new"),
+        ];
+        source.set_history(&history);
+
+        let mut messages = Vec::new();
+        source.assemble_pair_aware(&mut messages);
+
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(messages[0].role, ChatRole::Assistant));
+        assert!(matches!(
+            &messages[0].content[..],
+            [
+                MessageContent::Text { text },
+                MessageContent::ToolCall { call },
+            ] if text == "alpha beta" && call.id == "call-1"
+        ));
+        assert!(matches!(messages[1].role, ChatRole::Tool));
+        assert!(matches!(
+            &messages[1].content[..],
+            [MessageContent::ToolResult { result }] if result.tool_call_id == "call-1"
+        ));
+        assert!(matches!(messages[2].role, ChatRole::User));
+        assert!(matches!(
+            &messages[2].content[..],
+            [MessageContent::Text { text }] if text == "new"
+        ));
+    }
+
+    #[test]
     fn history_skips_system_messages() {
         let mut source = History::new(1000);
         let history = vec![
@@ -563,6 +765,116 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(message_text(&messages[0]), "four five six");
         assert_eq!(message_text(&messages[1]), "seven eight nine");
+    }
+
+    #[test]
+    fn history_keeps_assistant_tool_roundtrip_intact() {
+        let mut source = History::new(2);
+        let mut assistant =
+            ChatMessage::with_role_with_principal(ChatRole::Assistant, Some(Principal::Agent));
+        assistant.content.push(MessageContent::Text {
+            text: "alpha beta".to_string(),
+        });
+        assistant.content.push(MessageContent::ToolCall {
+            call: crate::llm::ToolCall {
+                id: "call-1".to_string(),
+                name: "execute".to_string(),
+                arguments: "{\"command\":\"echo hi\"}".to_string(),
+            },
+        });
+        let assistant_tool_call_count = assistant
+            .content
+            .iter()
+            .filter(|block| matches!(**block, MessageContent::ToolCall { .. }))
+            .count();
+
+        let history = vec![
+            ChatMessage::user("old"),
+            assistant,
+            ChatMessage::tool_result_with_principal(
+                "call-1",
+                "execute",
+                "ok",
+                Some(Principal::System),
+            ),
+            ChatMessage::user("new"),
+        ];
+        source.set_history(&history);
+
+        let mut messages = Vec::new();
+        source.assemble_pair_aware(&mut messages);
+
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0].role, ChatRole::User));
+        assert!(matches!(
+            &messages[0].content[..],
+            [MessageContent::Text { text }] if text == "new"
+        ));
+        assert!(
+            messages
+                .iter()
+                .all(|message| !matches!(message.role, ChatRole::Assistant | ChatRole::Tool))
+        );
+        assert_eq!(assistant_tool_call_count, 1);
+    }
+
+    #[test]
+    fn history_keeps_multi_call_tool_roundtrip_intact() {
+        let mut source = History::new(3);
+        let mut assistant =
+            ChatMessage::with_role_with_principal(ChatRole::Assistant, Some(Principal::Agent));
+        assistant.content.push(MessageContent::Text {
+            text: "alpha beta".to_string(),
+        });
+        assistant.content.push(MessageContent::ToolCall {
+            call: crate::llm::ToolCall {
+                id: "call-1".to_string(),
+                name: "first".to_string(),
+                arguments: "{}".to_string(),
+            },
+        });
+        assistant.content.push(MessageContent::ToolCall {
+            call: crate::llm::ToolCall {
+                id: "call-2".to_string(),
+                name: "second".to_string(),
+                arguments: "{}".to_string(),
+            },
+        });
+        let assistant_tool_call_count = assistant
+            .content
+            .iter()
+            .filter(|block| matches!(**block, MessageContent::ToolCall { .. }))
+            .count();
+
+        let history = vec![
+            ChatMessage::user("old"),
+            assistant,
+            ChatMessage::tool_result_with_principal(
+                "call-1",
+                "first",
+                "ok-1",
+                Some(Principal::System),
+            ),
+            ChatMessage::tool_result_with_principal(
+                "call-2",
+                "second",
+                "ok-2",
+                Some(Principal::System),
+            ),
+            ChatMessage::user("new"),
+        ];
+        source.set_history(&history);
+
+        let mut messages = Vec::new();
+        source.assemble_pair_aware(&mut messages);
+
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0].role, ChatRole::User));
+        assert!(matches!(
+            &messages[0].content[..],
+            [MessageContent::Text { text }] if text == "new"
+        ));
+        assert_eq!(assistant_tool_call_count, 2);
     }
 
     fn message_text(message: &ChatMessage) -> &str {

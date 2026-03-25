@@ -349,6 +349,119 @@ fn finalize_output_item(
     upsert_tool_call(tool_calls, call_id, tool_name, arguments);
 }
 
+struct SseStreamState {
+    current_call_id: Option<String>,
+    pending_calls: HashMap<String, (Option<String>, String)>,
+    tool_calls: Vec<(String, String, String)>,
+    stop_reason: StopReason,
+    completion_meta: Option<TurnMeta>,
+    assistant_content: String,
+}
+
+impl SseStreamState {
+    fn new() -> Self {
+        Self {
+            current_call_id: None,
+            pending_calls: HashMap::new(),
+            tool_calls: Vec::new(),
+            stop_reason: StopReason::Stop,
+            completion_meta: None,
+            assistant_content: String::new(),
+        }
+    }
+}
+
+fn apply_sse_event(
+    event: SseEvent,
+    state: &mut SseStreamState,
+    on_token: &mut (dyn FnMut(String) + Send),
+) -> bool {
+    match event {
+        SseEvent::TextDelta(delta) => {
+            state.assistant_content.push_str(&delta);
+            on_token(delta);
+            false
+        }
+        SseEvent::FunctionCallArgumentsDelta {
+            call_id,
+            name,
+            delta,
+        } => {
+            let call_id = match call_id {
+                Some(id) => {
+                    state.current_call_id = Some(id.clone());
+                    id
+                }
+                None => match state.current_call_id.clone() {
+                    Some(id) => id,
+                    None => return false,
+                },
+            };
+
+            let entry = state
+                .pending_calls
+                .entry(call_id)
+                .or_insert((None, String::new()));
+            if let Some(tool_name) = name {
+                entry.0 = Some(tool_name);
+            }
+
+            if let Some(delta) = delta {
+                entry.1.push_str(&delta);
+            }
+            false
+        }
+        SseEvent::FunctionCallArgumentsDone {
+            call_id,
+            name,
+            arguments,
+        } => {
+            let previous_len = state.tool_calls.len();
+            finalize_function_call(
+                &mut state.pending_calls,
+                &mut state.tool_calls,
+                &state.current_call_id,
+                call_id,
+                name,
+                arguments,
+            );
+            if state.tool_calls.len() != previous_len {
+                state.stop_reason = StopReason::ToolCalls;
+            }
+            false
+        }
+        SseEvent::FunctionCallOutputItemDone {
+            call_id,
+            name,
+            arguments,
+        } => {
+            let previous_len = state.tool_calls.len();
+            finalize_output_item(
+                &mut state.pending_calls,
+                &mut state.tool_calls,
+                call_id,
+                name,
+                arguments,
+            );
+            if state.tool_calls.len() != previous_len {
+                state.stop_reason = StopReason::ToolCalls;
+            }
+            false
+        }
+        SseEvent::Completed { meta } => {
+            if let Some(meta) = meta {
+                state.completion_meta = Some(meta);
+            }
+
+            if state.tool_calls.is_empty() {
+                state.stop_reason = StopReason::Stop;
+            }
+            false
+        }
+        SseEvent::Done => true,
+    }
+}
+
 impl LlmProvider for OpenAIProvider {
     /// Stream a completion and parse SSE events from the OpenAI Responses API.
     ///
@@ -402,12 +515,7 @@ impl LlmProvider for OpenAIProvider {
             anyhow::bail!("API error {status}: {body}");
         }
 
-        let mut tool_calls: Vec<(String, String, String)> = Vec::new();
-        let mut pending_calls: HashMap<String, (Option<String>, String)> = HashMap::new();
-        let mut current_call_id: Option<String> = None;
-        let mut stop_reason = StopReason::Stop;
-        let mut completion_meta = None;
-        let mut assistant_content = String::new();
+        let mut state = SseStreamState::new();
         let mut stream_buffer = String::new();
         let mut done = false;
 
@@ -422,87 +530,11 @@ impl LlmProvider for OpenAIProvider {
                 let raw_line = stream_buffer[..line_end].to_string();
                 stream_buffer.drain(..line_end + 1);
                 trace!(line_len = raw_line.len(), "parsing sse line from stream");
-                match parse_sse_line(&raw_line) {
-                    Some(SseEvent::TextDelta(delta)) => {
-                        assistant_content.push_str(&delta);
-                        on_token(delta);
-                    }
-                    Some(SseEvent::FunctionCallArgumentsDelta {
-                        call_id,
-                        name,
-                        delta,
-                    }) => {
-                        let call_id = match call_id {
-                            Some(id) => {
-                                current_call_id = Some(id.clone());
-                                id
-                            }
-                            None => match current_call_id.clone() {
-                                Some(id) => id,
-                                None => continue,
-                            },
-                        };
-
-                        let entry = pending_calls
-                            .entry(call_id)
-                            .or_insert((None, String::new()));
-                        if let Some(tool_name) = name {
-                            entry.0 = Some(tool_name);
-                        }
-
-                        if let Some(delta) = delta {
-                            entry.1.push_str(&delta);
-                        }
-                    }
-                    Some(SseEvent::FunctionCallArgumentsDone {
-                        call_id,
-                        name,
-                        arguments,
-                    }) => {
-                        let previous_len = tool_calls.len();
-                        finalize_function_call(
-                            &mut pending_calls,
-                            &mut tool_calls,
-                            &current_call_id,
-                            call_id,
-                            name,
-                            arguments,
-                        );
-                        if tool_calls.len() != previous_len {
-                            stop_reason = StopReason::ToolCalls;
-                        }
-                    }
-                    Some(SseEvent::FunctionCallOutputItemDone {
-                        call_id,
-                        name,
-                        arguments,
-                    }) => {
-                        let previous_len = tool_calls.len();
-                        finalize_output_item(
-                            &mut pending_calls,
-                            &mut tool_calls,
-                            call_id,
-                            name,
-                            arguments,
-                        );
-                        if tool_calls.len() != previous_len {
-                            stop_reason = StopReason::ToolCalls;
-                        }
-                    }
-                    Some(SseEvent::Completed { meta }) => {
-                        if let Some(meta) = meta {
-                            completion_meta = Some(meta);
-                        }
-
-                        if tool_calls.is_empty() {
-                            stop_reason = StopReason::Stop;
-                        }
-                    }
-                    Some(SseEvent::Done) => {
-                        done = true;
-                        break;
-                    }
-                    None => {}
+                if let Some(event) = parse_sse_line(&raw_line)
+                    && apply_sse_event(event, &mut state, on_token)
+                {
+                    done = true;
+                    break;
                 }
             }
 
@@ -518,20 +550,11 @@ impl LlmProvider for OpenAIProvider {
                 buffer_len = stream_buffer.len(),
                 "parsing trailing sse buffer"
             );
-            match event {
-                SseEvent::TextDelta(delta) => {
-                    assistant_content.push_str(&delta);
-                    on_token(delta);
-                }
-                SseEvent::FunctionCallArgumentsDelta { .. }
-                | SseEvent::FunctionCallArgumentsDone { .. }
-                | SseEvent::FunctionCallOutputItemDone { .. }
-                | SseEvent::Completed { .. }
-                | SseEvent::Done => {}
-            }
+            let _ = apply_sse_event(event, &mut state, on_token);
         }
 
-        let tool_calls: Vec<ToolCall> = tool_calls
+        let tool_calls: Vec<ToolCall> = state
+            .tool_calls
             .into_iter()
             .map(|(id, name, arguments)| ToolCall {
                 id,
@@ -542,9 +565,9 @@ impl LlmProvider for OpenAIProvider {
 
         let mut assistant_msg =
             ChatMessage::with_role_with_principal(ChatRole::Assistant, Some(Principal::Agent));
-        if !assistant_content.is_empty() {
+        if !state.assistant_content.is_empty() {
             assistant_msg.content.push(MessageContent::Text {
-                text: assistant_content,
+                text: state.assistant_content,
             });
         }
         for tc in &tool_calls {
@@ -556,8 +579,8 @@ impl LlmProvider for OpenAIProvider {
         Ok(StreamedTurn {
             assistant_message: assistant_msg,
             tool_calls,
-            meta: completion_meta,
-            stop_reason,
+            meta: state.completion_meta,
+            stop_reason: state.stop_reason,
         })
     }
 }
@@ -597,6 +620,67 @@ mod tests {
         }
 
         (tokens, done)
+    }
+
+    fn collect_stream_from_sse_chunks(
+        chunks: &[&[u8]],
+    ) -> (
+        Vec<String>,
+        Vec<ToolCall>,
+        Option<TurnMeta>,
+        StopReason,
+        bool,
+    ) {
+        let mut buffer = String::new();
+        let mut tokens = Vec::new();
+        let mut state = SseStreamState::new();
+        let mut done = false;
+        let mut token_sink = |delta: String| tokens.push(delta);
+
+        for chunk in chunks {
+            let chunk = std::str::from_utf8(chunk).expect("mock SSE chunks should be valid utf-8");
+            buffer.push_str(chunk);
+
+            while let Some(line_end) = buffer.find('\n') {
+                let line = buffer[..line_end].to_string();
+                buffer.drain(..line_end + 1);
+
+                if let Some(event) = parse_sse_line(&line)
+                    && apply_sse_event(event, &mut state, &mut token_sink)
+                {
+                    done = true;
+                    break;
+                }
+            }
+
+            if done {
+                break;
+            }
+        }
+
+        if !buffer.is_empty()
+            && let Some(event) = parse_sse_line(buffer.trim_end())
+        {
+            let _ = apply_sse_event(event, &mut state, &mut token_sink);
+        }
+
+        let tool_calls = state
+            .tool_calls
+            .into_iter()
+            .map(|(id, name, arguments)| ToolCall {
+                id,
+                name,
+                arguments,
+            })
+            .collect();
+
+        (
+            tokens,
+            tool_calls,
+            state.completion_meta,
+            state.stop_reason,
+            done,
+        )
     }
 
     fn collect_tool_calls_from_events(events: Vec<SseEvent>) -> Vec<ToolCall> {
@@ -837,6 +921,37 @@ mod tests {
 
         assert!(done);
         assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn parse_sse_line_trailing_function_call_output_item_without_newline_is_parsed() {
+        let (_, tool_calls, meta, stop_reason, done) = collect_stream_from_sse_chunks(&[
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"execute\",\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}",
+        ]);
+
+        assert!(!done);
+        assert_eq!(stop_reason, StopReason::ToolCalls);
+        assert!(meta.is_none());
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].name, "execute");
+        assert_eq!(tool_calls[0].arguments, "{\"command\":\"echo hi\"}");
+    }
+
+    #[test]
+    fn parse_sse_line_trailing_completed_without_newline_retains_metadata() {
+        let (_, tool_calls, meta, stop_reason, done) = collect_stream_from_sse_chunks(&[
+            b"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.3-codex-spark\",\"usage\":{\"input_tokens\":100,\"output_tokens\":50,\"reasoning_tokens\":25}}}",
+        ]);
+
+        assert!(!done);
+        assert_eq!(stop_reason, StopReason::Stop);
+        assert!(tool_calls.is_empty());
+        let meta = meta.expect("completed event should include metadata");
+        assert_eq!(meta.model, Some("gpt-5.3-codex-spark".to_string()));
+        assert_eq!(meta.input_tokens, Some(100));
+        assert_eq!(meta.output_tokens, Some(50));
+        assert_eq!(meta.reasoning_tokens, Some(25));
     }
 
     #[test]

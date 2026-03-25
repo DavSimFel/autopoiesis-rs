@@ -38,7 +38,7 @@ async fn simple_prompt() -> Result<()> {
         .stream_completion(
             &[
                 ChatMessage::system("You are a helpful assistant."),
-                ChatMessage::user("Say hi in 3 words"),
+                ChatMessage::user("Reply briefly with a greeting."),
             ],
             &[],
             &mut on_token,
@@ -46,7 +46,19 @@ async fn simple_prompt() -> Result<()> {
         .await?;
 
     let response = tokens.concat();
-    assert!(!response.trim().is_empty());
+    let words = response
+        .split_whitespace()
+        .map(|word| word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    assert!(
+        !words.is_empty(),
+        "expected a word-like response, got {response:?}"
+    );
+    assert!(
+        response.chars().any(|ch| ch.is_ascii_alphabetic()),
+        "expected response to include actual words, got {response:?}"
+    );
     assert_eq!(turn.stop_reason, StopReason::Stop);
     Ok(())
 }
@@ -79,7 +91,13 @@ async fn invalid_model_returns_error() -> anyhow::Result<()> {
         )
         .await;
 
-    assert!(result.is_err());
+    let err = result.expect_err("invalid model should be rejected");
+    let err = err.to_string();
+    assert!(err.contains("API error"), "unexpected error: {err}");
+    assert!(
+        err.contains("nonexistent-model-xyz") || err.contains("model_not_found"),
+        "expected a model-specific rejection, got {err}"
+    );
     Ok(())
 }
 

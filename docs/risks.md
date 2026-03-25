@@ -19,13 +19,13 @@
 - Approval prompt displays the first text block in assembled context (usually system prompt/identity), not the actual user content being approved.
 - **Files:** `src/agent.rs` (approval handler call)
 
-### P1-4: SSE parser drops trailing events
-- If the stream ends without a trailing newline, final non-text events are parsed then ignored.
-- **Files:** `src/llm/openai.rs` (trailing-buffer handling)
+### ~~P1-4: SSE parser drops trailing events~~ (2026-03-25)
+- Fixed by running trailing-buffer events through the same SSE reducer as newline-terminated frames, so final non-text events are no longer ignored.
+- **Files:** `src/llm/openai.rs`
 
-### P1-5: Session replay silently drops unknown entries
-- Unknown roles mapped to `None` and discarded. Malformed tool entries dropped with only a warning. Corrupt history silently mutates replayed conversation.
-- **Files:** `src/session.rs` (message_from_entry)
+### ~~P1-5: Session replay silently drops unknown entries~~ (2026-03-25)
+- Fixed by warning on unknown roles during replay and keeping malformed tool-entry drops explicit instead of silent.
+- **Files:** `src/session.rs` (`message_from_entry`, replay tests)
 
 ### P1-6: History abstraction is unused and unsafe
 - `History` context source is tested but not wired into `build_default_turn()`. If used, its trimming logic splits tool-call/tool-result pairs.

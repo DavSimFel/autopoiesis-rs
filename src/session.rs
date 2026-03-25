@@ -223,7 +223,10 @@ impl Session {
                     Some(principal),
                 )),
             },
-            _ => None,
+            _ => {
+                warn!(role = %role, "warning: dropping session entry with unknown role");
+                None
+            }
         };
 
         (message, token_delta)
@@ -616,6 +619,22 @@ impl Session {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("writer lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn temp_sessions_dir(prefix: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -641,6 +660,25 @@ mod tests {
         for entry in entries {
             writeln!(file, "{}", serde_json::to_string(entry).unwrap()).unwrap();
         }
+    }
+
+    fn capture_warnings<F>(f: F) -> String
+    where
+        F: FnOnce(),
+    {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let output = output.clone();
+                move || SharedWriter(output.clone())
+            })
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        f();
+
+        String::from_utf8(output.lock().expect("writer lock").clone()).expect("utf8")
     }
 
     // --- Persistence ---
@@ -871,6 +909,79 @@ mod tests {
         let mut messages = history.to_vec();
         let _ = turn.check_inbound(&mut messages, None);
         assert!(turn.is_tainted());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_today_drops_unknown_role_entries_with_warning() {
+        let dir = temp_sessions_dir("load_unknown_role");
+        let path = dir.join("2026-03-19.jsonl");
+        write_entries(
+            &path,
+            &[
+                SessionEntry {
+                    role: "user".to_string(),
+                    content: "kept".to_string(),
+                    ts: "2026-03-19T00:00:00Z".to_string(),
+                    meta: None,
+                    principal: Some(Principal::User),
+                    call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                },
+                SessionEntry {
+                    role: "mystery".to_string(),
+                    content: "dropped".to_string(),
+                    ts: "2026-03-19T00:00:01Z".to_string(),
+                    meta: None,
+                    principal: None,
+                    call_id: None,
+                    tool_name: None,
+                    tool_calls: None,
+                },
+            ],
+        );
+
+        let mut session = Session::new(&dir).unwrap();
+        let warnings = capture_warnings(|| {
+            session.load_today().unwrap();
+        });
+
+        let history = session.history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, ChatRole::User);
+        assert!(warnings.contains("dropping session entry with unknown role"));
+        assert!(warnings.contains("mystery"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_today_drops_malformed_tool_entries_with_warning() {
+        let dir = temp_sessions_dir("load_bad_tool");
+        let path = dir.join("2026-03-19.jsonl");
+        write_entries(
+            &path,
+            &[SessionEntry {
+                role: "tool".to_string(),
+                content: "stdout:\nok".to_string(),
+                ts: "2026-03-19T00:00:00Z".to_string(),
+                meta: None,
+                principal: Some(Principal::System),
+                call_id: Some("call-1".to_string()),
+                tool_name: None,
+                tool_calls: None,
+            }],
+        );
+
+        let mut session = Session::new(&dir).unwrap();
+        let warnings = capture_warnings(|| {
+            session.load_today().unwrap();
+        });
+
+        assert!(session.history().is_empty());
+        assert!(warnings.contains("dropping tool entry with missing call_id or tool_name"));
 
         fs::remove_dir_all(&dir).unwrap();
     }
