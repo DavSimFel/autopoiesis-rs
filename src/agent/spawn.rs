@@ -61,14 +61,14 @@ where
     .await
 }
 
-pub(super) struct SpawnDrainContext<'a> {
+pub(crate) struct SpawnDrainContext<'a> {
     pub(crate) store: &'a mut Store,
     pub(crate) config: &'a crate::config::Config,
     pub(crate) session_dir: &'a Path,
     pub(crate) spawn_result: SpawnResult,
 }
 
-pub(super) async fn finish_spawned_child_drain<F, Fut, P, TS>(
+pub(crate) async fn finish_spawned_child_drain<F, Fut, P, TS>(
     context: SpawnDrainContext<'_>,
     metadata_json: &str,
     make_provider: &mut F,

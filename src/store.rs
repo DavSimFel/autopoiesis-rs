@@ -549,6 +549,13 @@ impl Store {
         &mut self,
         stale_after_secs: u64,
     ) -> Result<Option<PlanRun>> {
+        self.claim_pending_plan_run(stale_after_secs)
+    }
+
+    pub fn claim_next_runnable_plan_run(
+        &mut self,
+        stale_after_secs: u64,
+    ) -> Result<Option<PlanRun>> {
         let stale_after_secs = stale_after_secs.min(i64::MAX as u64) as i64;
         let stale_before = unix_timestamp().saturating_sub(stale_after_secs);
         let claimed_at = unix_timestamp();
@@ -561,13 +568,22 @@ impl Store {
                  WHERE id = (
                      SELECT id
                      FROM plan_runs
-                     WHERE status = 'pending'
-                       AND (claimed_at IS NULL OR claimed_at <= ?1)
-                     ORDER BY created_at ASC, id ASC
+                     WHERE (status = 'pending' AND (claimed_at IS NULL OR claimed_at <= ?1))
+                        OR (status = 'running' AND claimed_at <= ?1)
+                     ORDER BY
+                         CASE status
+                             WHEN 'pending' THEN 0
+                             WHEN 'running' THEN 1
+                             ELSE 2
+                         END,
+                         created_at ASC,
+                         id ASC
                      LIMIT 1
                  )
-                 AND status = 'pending'
-                 AND (claimed_at IS NULL OR claimed_at <= ?1)
+                 AND (
+                     (status = 'pending' AND (claimed_at IS NULL OR claimed_at <= ?1))
+                     OR (status = 'running' AND claimed_at <= ?1)
+                 )
                  RETURNING
                     id,
                     owner_session_id,
@@ -583,7 +599,7 @@ impl Store {
                     created_at,
                     updated_at",
             )
-            .context("failed to prepare plan run claim query")?;
+            .context("failed to prepare runnable plan run claim query")?;
 
         match statement.query_row(
             params![stale_before, claimed_at, updated_at],
@@ -591,7 +607,7 @@ impl Store {
         ) {
             Ok(plan_run) => Ok(Some(plan_run)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(error) => Err(error).context("failed to claim plan run"),
+            Err(error) => Err(error).context("failed to claim runnable plan run"),
         }
     }
 
@@ -673,18 +689,17 @@ impl Store {
         let stale_after_secs = stale_after_secs.min(i64::MAX as u64) as i64;
         let stale_before = unix_timestamp().saturating_sub(stale_after_secs);
         self.with_transaction(|tx| {
-            let running_count = tx
+            let pending_count = tx
                 .execute(
                     "UPDATE plan_runs
-                     SET status = 'waiting_t2',
-                         claimed_at = NULL,
+                     SET claimed_at = NULL,
                          updated_at = ?2
-                     WHERE status = 'running'
+                     WHERE status = 'pending'
                        AND claimed_at IS NOT NULL
                        AND claimed_at <= ?1",
                     params![stale_before, utc_timestamp()],
                 )
-                .context("failed to recover stale running plan runs")?;
+                .context("failed to recover stale pending plan runs")?;
             let leaked_count = tx
                 .execute(
                     "UPDATE plan_runs
@@ -696,7 +711,7 @@ impl Store {
                     params![stale_before, utc_timestamp()],
                 )
                 .context("failed to clear stale plan run claims")?;
-            Ok((running_count + leaked_count) as u64)
+            Ok((pending_count + leaked_count) as u64)
         })
     }
 
@@ -787,6 +802,168 @@ impl Store {
             ));
         }
         Ok(())
+    }
+
+    pub fn update_step_attempt_child_session(
+        &mut self,
+        attempt_id: i64,
+        child_session_id: Option<&str>,
+    ) -> Result<()> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE plan_step_attempts
+                 SET child_session_id = ?2
+                 WHERE id = ?1
+                   AND status = 'running'
+                   AND finished_at IS NULL",
+                params![attempt_id, child_session_id],
+            )
+            .context("failed to update plan step attempt child session")?;
+        if changed == 0 {
+            return Err(anyhow::anyhow!(
+                "failed to update plan step attempt child session: attempt not found or already finalized"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn finalize_step_attempt(
+        &mut self,
+        attempt_id: i64,
+        status: &str,
+        finished_at: &str,
+        summary_json: &str,
+        checks_json: &str,
+    ) -> Result<()> {
+        validate_step_attempt_terminal_status(status)?;
+        if finished_at.is_empty() {
+            return Err(anyhow::anyhow!(
+                "invalid plan step attempt finished_at: finished_at must not be empty"
+            ));
+        }
+        if summary_json.is_empty() {
+            return Err(anyhow::anyhow!(
+                "invalid plan step attempt summary_json: summary_json must not be empty"
+            ));
+        }
+        if checks_json.is_empty() {
+            return Err(anyhow::anyhow!(
+                "invalid plan step attempt checks_json: checks_json must not be empty"
+            ));
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE plan_step_attempts
+                 SET status = ?2,
+                     summary_json = ?3,
+                     checks_json = ?4,
+                     finished_at = ?5
+                 WHERE id = ?1
+                   AND status = 'running'
+                   AND finished_at IS NULL",
+                params![attempt_id, status, summary_json, checks_json, finished_at],
+            )
+            .context("failed to finalize plan step attempt")?;
+        if changed == 0 {
+            return Err(anyhow::anyhow!(
+                "failed to finalize plan step attempt: attempt not found or already finalized"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn finalize_stale_step_attempts(
+        &mut self,
+        plan_run_id: &str,
+        revision: i64,
+    ) -> Result<u64> {
+        let attempts = {
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT id, summary_json, checks_json
+                     FROM plan_step_attempts
+                     WHERE plan_run_id = ?1
+                       AND revision = ?2
+                       AND status = 'running'
+                       AND finished_at IS NULL",
+                )
+                .context("failed to prepare stale step attempt recovery query")?;
+            statement
+                .query_map(params![plan_run_id, revision], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .context("failed to query stale step attempts")?
+                .collect::<Result<Vec<_>, _>>()
+                .context("failed to read stale step attempts")?
+        };
+
+        let mut finalized = 0;
+        for attempt in attempts {
+            let (attempt_id, summary_json, checks_json) = attempt;
+            self.finalize_step_attempt(
+                attempt_id,
+                "crashed",
+                &utc_timestamp(),
+                &summary_json,
+                &checks_json,
+            )?;
+            finalized += 1;
+        }
+        Ok(finalized)
+    }
+
+    fn claim_pending_plan_run(&mut self, stale_after_secs: u64) -> Result<Option<PlanRun>> {
+        let stale_after_secs = stale_after_secs.min(i64::MAX as u64) as i64;
+        let stale_before = unix_timestamp().saturating_sub(stale_after_secs);
+        let claimed_at = unix_timestamp();
+        let updated_at = utc_timestamp();
+        let mut statement = self
+            .conn
+            .prepare(
+                "UPDATE plan_runs
+                 SET status = 'running', claimed_at = ?2, updated_at = ?3
+                 WHERE id = (
+                     SELECT id
+                     FROM plan_runs
+                     WHERE status = 'pending'
+                       AND (claimed_at IS NULL OR claimed_at <= ?1)
+                     ORDER BY created_at ASC, id ASC
+                     LIMIT 1
+                 )
+                 AND status = 'pending'
+                 AND (claimed_at IS NULL OR claimed_at <= ?1)
+                 RETURNING
+                    id,
+                    owner_session_id,
+                    topic,
+                    trigger_source,
+                    status,
+                    revision,
+                    current_step_index,
+                    active_child_session_id,
+                    definition_json,
+                    last_failure_json,
+                    claimed_at,
+                    created_at,
+                    updated_at",
+            )
+            .context("failed to prepare plan run claim query")?;
+
+        match statement.query_row(
+            params![stale_before, claimed_at, updated_at],
+            plan_run_from_row,
+        ) {
+            Ok(plan_run) => Ok(Some(plan_run)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error).context("failed to claim plan run"),
+        }
     }
 
     pub fn get_step_attempts(
@@ -2009,6 +2186,111 @@ mod tests {
     }
 
     #[test]
+    fn claim_next_runnable_plan_run_skips_running_row_after_recovery_leaves_claimable() {
+        let path = temp_db_path("plan_run_claim_runnable");
+        let mut store = Store::new(&path).unwrap();
+        store.create_session("owner", None).unwrap();
+        store
+            .create_plan_run("plan-1", "owner", "{}", Some("topic"), Some("cli"))
+            .unwrap();
+        store.claim_next_pending_plan_run(300).unwrap().unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE plan_runs SET claimed_at = ?1 WHERE id = ?2",
+                params![unix_timestamp() - 301, "plan-1"],
+            )
+            .unwrap();
+
+        store.recover_stale_plan_runs(300).unwrap();
+        let recovered_run = store.get_plan_run("plan-1").unwrap().unwrap();
+        assert_eq!(recovered_run.status, "running");
+        assert!(recovered_run.claimed_at.is_some());
+
+        let claimed = store.claim_next_runnable_plan_run(300).unwrap();
+        assert_eq!(
+            claimed.as_ref().map(|plan_run| plan_run.id.as_str()),
+            Some("plan-1")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claim_next_runnable_plan_run_claims_stale_running_row() {
+        let path = temp_db_path("plan_run_claim_runnable_running");
+        let mut store = Store::new(&path).unwrap();
+        store.create_session("owner", None).unwrap();
+        store
+            .create_plan_run("plan-running", "owner", "{}", Some("topic"), Some("cli"))
+            .unwrap();
+        store
+            .update_plan_run_status("plan-running", "running", PlanRunUpdateFields::default())
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE plan_runs SET claimed_at = ?1 WHERE id = ?2",
+                params![unix_timestamp() - 301, "plan-running"],
+            )
+            .unwrap();
+
+        let claimed = store.claim_next_runnable_plan_run(300).unwrap().unwrap();
+        assert_eq!(claimed.id, "plan-running");
+        assert_eq!(claimed.status, "running");
+        assert!(claimed.claimed_at.is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claim_next_runnable_plan_run_skips_running_rows() {
+        let path = temp_db_path("plan_run_claim_runnable_priority");
+        let mut store = Store::new(&path).unwrap();
+        store.create_session("owner", None).unwrap();
+        store
+            .create_plan_run("plan-pending", "owner", "{}", Some("topic"), Some("cli"))
+            .unwrap();
+        let claimed = store.claim_next_runnable_plan_run(300).unwrap().unwrap();
+        assert_eq!(claimed.id, "plan-pending");
+        assert_eq!(claimed.status, "running");
+        assert!(claimed.claimed_at.is_some());
+
+        let second = store.claim_next_runnable_plan_run(300).unwrap();
+        assert!(second.is_none(), "fresh running rows are not claimable");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claim_next_runnable_plan_run_prioritizes_pending_rows_over_running_rows() {
+        let path = temp_db_path("plan_run_claim_runnable_order");
+        let mut store = Store::new(&path).unwrap();
+        store.create_session("owner", None).unwrap();
+        store
+            .create_plan_run("plan-pending", "owner", "{}", Some("topic"), Some("cli"))
+            .unwrap();
+        store
+            .create_plan_run("plan-running", "owner", "{}", Some("topic"), Some("cli"))
+            .unwrap();
+        store
+            .update_plan_run_status("plan-running", "running", PlanRunUpdateFields::default())
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE plan_runs SET claimed_at = ?1 WHERE id IN (?2, ?3)",
+                params![unix_timestamp() - 301, "plan-pending", "plan-running"],
+            )
+            .unwrap();
+
+        let claimed = store.claim_next_runnable_plan_run(300).unwrap().unwrap();
+        assert_eq!(claimed.id, "plan-pending");
+        assert_eq!(claimed.status, "running");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn release_plan_run_claim_clears_claim_without_losing_state() {
         let path = temp_db_path("plan_run_release");
         let mut store = Store::new(&path).unwrap();
@@ -2059,38 +2341,45 @@ mod tests {
         let mut store = Store::new(&path).unwrap();
         store.create_session("owner", None).unwrap();
         store
-            .create_plan_run("plan-stale", "owner", "{}", Some("topic"), Some("cli"))
+            .create_plan_run("plan-pending", "owner", "{}", Some("topic"), Some("cli"))
             .unwrap();
         store
-            .create_plan_run("plan-fresh", "owner", "{}", Some("topic"), Some("cli"))
+            .create_plan_run("plan-running", "owner", "{}", Some("topic"), Some("cli"))
             .unwrap();
 
-        store.claim_next_pending_plan_run(300).unwrap().unwrap();
-        store.claim_next_pending_plan_run(300).unwrap().unwrap();
         store
             .conn
             .execute(
                 "UPDATE plan_runs SET claimed_at = ?1 WHERE id = ?2",
-                params![unix_timestamp() - 301, "plan-stale"],
+                params![unix_timestamp() - 301, "plan-pending"],
+            )
+            .unwrap();
+        store
+            .update_plan_run_status("plan-running", "running", PlanRunUpdateFields::default())
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE plan_runs SET claimed_at = ?1 WHERE id = ?2",
+                params![unix_timestamp() - 301, "plan-running"],
             )
             .unwrap();
 
-        std::thread::sleep(Duration::from_secs(1));
         let recovered = store.recover_stale_plan_runs(300).unwrap();
         assert_eq!(recovered, 1);
 
-        let stale = store.get_plan_run("plan-stale").unwrap().unwrap();
-        let fresh = store.get_plan_run("plan-fresh").unwrap().unwrap();
-        assert_eq!(stale.status, "waiting_t2");
-        assert_eq!(stale.claimed_at, None);
-        assert_eq!(fresh.status, "running");
-        assert!(fresh.claimed_at.is_some());
+        let pending = store.get_plan_run("plan-pending").unwrap().unwrap();
+        let running = store.get_plan_run("plan-running").unwrap().unwrap();
+        assert_eq!(pending.status, "pending");
+        assert_eq!(pending.claimed_at, None);
+        assert_eq!(running.status, "running");
+        assert!(running.claimed_at.is_some());
 
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn recover_stale_plan_runs_moves_stale_running_rows_to_waiting_t2() {
+    fn recover_stale_plan_runs_leaves_stale_running_rows_claimable() {
         let path = temp_db_path("plan_run_recover_running");
         let mut store = Store::new(&path).unwrap();
         store.create_session("owner", None).unwrap();
@@ -2106,13 +2395,12 @@ mod tests {
             )
             .unwrap();
 
-        std::thread::sleep(Duration::from_secs(1));
         let recovered = store.recover_stale_plan_runs(300).unwrap();
-        assert_eq!(recovered, 1);
+        assert_eq!(recovered, 0);
 
         let recovered_run = store.get_plan_run("plan-1").unwrap().unwrap();
-        assert_eq!(recovered_run.status, "waiting_t2");
-        assert_eq!(recovered_run.claimed_at, None);
+        assert_eq!(recovered_run.status, "running");
+        assert!(recovered_run.claimed_at.is_some());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2123,6 +2411,7 @@ mod tests {
         let mut store = Store::new(&path).unwrap();
         store.create_session("owner", None).unwrap();
         for (id, status) in [
+            ("plan-pending", "pending"),
             ("plan-waiting", "waiting_t2"),
             ("plan-completed", "completed"),
             ("plan-failed", "failed"),
@@ -2144,9 +2433,10 @@ mod tests {
 
         std::thread::sleep(Duration::from_secs(1));
         let recovered = store.recover_stale_plan_runs(300).unwrap();
-        assert_eq!(recovered, 3);
+        assert_eq!(recovered, 4);
 
         for (id, status) in [
+            ("plan-pending", "pending"),
             ("plan-waiting", "waiting_t2"),
             ("plan-completed", "completed"),
             ("plan-failed", "failed"),
@@ -2160,7 +2450,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_stale_plan_runs_leaves_stale_pending_rows_for_claim_path() {
+    fn recover_stale_plan_runs_clears_stale_pending_claim_without_changing_status() {
         let path = temp_db_path("plan_run_recover_pending");
         let mut store = Store::new(&path).unwrap();
         store.create_session("owner", None).unwrap();
@@ -2176,13 +2466,13 @@ mod tests {
             .unwrap();
 
         let recovered = store.recover_stale_plan_runs(300).unwrap();
-        assert_eq!(recovered, 0);
+        assert_eq!(recovered, 1);
         let pending = store.get_plan_run("plan-1").unwrap().unwrap();
         assert_eq!(pending.status, "pending");
-        assert!(pending.claimed_at.is_some());
+        assert_eq!(pending.claimed_at, None);
 
         let claimed = store
-            .claim_next_pending_plan_run(300)
+            .claim_next_runnable_plan_run(300)
             .unwrap()
             .expect("stale pending row should be claimable");
         assert_eq!(claimed.id, "plan-1");
@@ -2526,6 +2816,174 @@ mod tests {
             step_one_attempts[0].finished_at.as_deref(),
             Some(second_finished_at.as_str())
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn finalize_step_attempt_updates_payloads_and_finished_at_atomically() {
+        let path = temp_db_path("step_attempt_finalize");
+        let mut store = Store::new(&path).unwrap();
+        store.create_session("owner", None).unwrap();
+        store
+            .create_plan_run("plan-1", "owner", "{}", Some("topic"), Some("cli"))
+            .unwrap();
+        let attempt_id = store
+            .record_step_attempt(StepAttemptRecord {
+                plan_run_id: "plan-1".to_string(),
+                revision: 1,
+                step_index: 0,
+                step_id: "step-a".to_string(),
+                attempt: 0,
+                status: "running".to_string(),
+                child_session_id: None,
+                summary_json: "{}".to_string(),
+                checks_json: "[]".to_string(),
+            })
+            .unwrap();
+
+        let finished_at = utc_timestamp();
+        store
+            .finalize_step_attempt(
+                attempt_id,
+                "passed",
+                &finished_at,
+                r#"{"kind":"shell","stdout":"ok"}"#,
+                r#"[{"check_id":"c1","verdict":"pass"}]"#,
+            )
+            .unwrap();
+
+        let attempts = store.get_step_attempts("plan-1", 0).unwrap();
+        assert_eq!(attempts[0].status, "passed");
+        assert_eq!(
+            attempts[0].finished_at.as_deref(),
+            Some(finished_at.as_str())
+        );
+        assert_eq!(
+            attempts[0].summary_json,
+            r#"{"kind":"shell","stdout":"ok"}"#
+        );
+        assert_eq!(
+            attempts[0].checks_json,
+            r#"[{"check_id":"c1","verdict":"pass"}]"#
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn finalize_step_attempt_rejects_second_finalization() {
+        let path = temp_db_path("step_attempt_finalize_twice");
+        let mut store = Store::new(&path).unwrap();
+        store.create_session("owner", None).unwrap();
+        store
+            .create_plan_run("plan-1", "owner", "{}", Some("topic"), Some("cli"))
+            .unwrap();
+        let attempt_id = store
+            .record_step_attempt(StepAttemptRecord {
+                plan_run_id: "plan-1".to_string(),
+                revision: 1,
+                step_index: 0,
+                step_id: "step-a".to_string(),
+                attempt: 0,
+                status: "running".to_string(),
+                child_session_id: None,
+                summary_json: "{}".to_string(),
+                checks_json: "[]".to_string(),
+            })
+            .unwrap();
+
+        let first_finished_at = utc_timestamp();
+        store
+            .finalize_step_attempt(attempt_id, "passed", &first_finished_at, "{}", "[]")
+            .unwrap();
+        let err = store
+            .finalize_step_attempt(attempt_id, "failed", &utc_timestamp(), "{}", "[]")
+            .expect_err("attempt should not finalize twice");
+        assert!(err.to_string().contains("already finalized"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn finalize_stale_step_attempts_crashes_running_attempts() {
+        let path = temp_db_path("step_attempt_finalize_stale");
+        let mut store = Store::new(&path).unwrap();
+        store.create_session("owner", None).unwrap();
+        store
+            .create_plan_run("plan-1", "owner", "{}", Some("topic"), Some("cli"))
+            .unwrap();
+        let first_attempt_id = store
+            .record_step_attempt(StepAttemptRecord {
+                plan_run_id: "plan-1".to_string(),
+                revision: 1,
+                step_index: 0,
+                step_id: "step-a".to_string(),
+                attempt: 0,
+                status: "running".to_string(),
+                child_session_id: None,
+                summary_json: "{}".to_string(),
+                checks_json: "[]".to_string(),
+            })
+            .unwrap();
+        let second_attempt_id = store
+            .record_step_attempt(StepAttemptRecord {
+                plan_run_id: "plan-1".to_string(),
+                revision: 1,
+                step_index: 1,
+                step_id: "step-b".to_string(),
+                attempt: 0,
+                status: "running".to_string(),
+                child_session_id: None,
+                summary_json: "{}".to_string(),
+                checks_json: "[]".to_string(),
+            })
+            .unwrap();
+
+        let finalized = store.finalize_stale_step_attempts("plan-1", 1).unwrap();
+        assert_eq!(finalized, 2);
+
+        let first_attempts = store.get_step_attempts("plan-1", 0).unwrap();
+        assert_eq!(first_attempts[0].id, first_attempt_id);
+        assert_eq!(first_attempts[0].status, "crashed");
+        assert!(first_attempts[0].finished_at.is_some());
+
+        let second_attempts = store.get_step_attempts("plan-1", 1).unwrap();
+        assert_eq!(second_attempts[0].id, second_attempt_id);
+        assert_eq!(second_attempts[0].status, "crashed");
+        assert!(second_attempts[0].finished_at.is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_step_attempt_child_session_sets_child_id_on_running_attempt() {
+        let path = temp_db_path("step_attempt_child_session");
+        let mut store = Store::new(&path).unwrap();
+        store.create_session("owner", None).unwrap();
+        store
+            .create_plan_run("plan-1", "owner", "{}", Some("topic"), Some("cli"))
+            .unwrap();
+        let attempt_id = store
+            .record_step_attempt(StepAttemptRecord {
+                plan_run_id: "plan-1".to_string(),
+                revision: 1,
+                step_index: 0,
+                step_id: "step-a".to_string(),
+                attempt: 0,
+                status: "running".to_string(),
+                child_session_id: None,
+                summary_json: "{}".to_string(),
+                checks_json: "[]".to_string(),
+            })
+            .unwrap();
+
+        store
+            .update_step_attempt_child_session(attempt_id, Some("child-1"))
+            .unwrap();
+
+        let attempts = store.get_step_attempts("plan-1", 0).unwrap();
+        assert_eq!(attempts[0].child_session_id.as_deref(), Some("child-1"));
 
         let _ = std::fs::remove_file(&path);
     }

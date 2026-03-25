@@ -3,6 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub(crate) mod executor;
+pub mod runner;
+
+pub use runner::{
+    CheckOutcome, CheckVerdict, ObservedOutput, StepOutcome, run_plan_step, tick_plan_runner,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanAction {

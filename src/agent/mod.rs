@@ -19,6 +19,7 @@ mod spawn;
 pub use loop_impl::{QueueOutcome, TurnVerdict, format_denial_message, run_agent_loop};
 pub use queue::drain_queue;
 pub use spawn::spawn_and_drain;
+pub(crate) use spawn::{SpawnDrainContext, finish_spawned_child_drain};
 
 /// Receiver of streaming tokens emitted by the model during completion.
 pub trait TokenSink {
