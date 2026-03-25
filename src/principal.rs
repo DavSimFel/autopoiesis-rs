@@ -31,6 +31,10 @@ impl Principal {
             return Self::Operator;
         }
 
+        if source.starts_with("agent-") {
+            return Self::Agent;
+        }
+
         if source.ends_with("-operator") {
             return Self::Operator;
         }
@@ -71,6 +75,7 @@ mod tests {
         assert_eq!(Principal::from_source("cli"), Principal::Operator);
         assert_eq!(Principal::from_source("http-operator"), Principal::Operator);
         assert_eq!(Principal::from_source("ws-user"), Principal::User);
+        assert_eq!(Principal::from_source("agent-child-123"), Principal::Agent);
         assert_eq!(Principal::from_source("webhook"), Principal::System);
     }
 

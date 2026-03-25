@@ -9,6 +9,7 @@ pub mod llm;
 pub mod principal;
 pub mod server;
 pub mod session;
+pub mod spawn;
 pub mod store;
 pub mod subscription;
 pub mod template;

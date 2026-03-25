@@ -7,6 +7,7 @@ use crate::gate::{GuardContext, Severity, Verdict};
 use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall, TurnMeta};
 use crate::principal::Principal;
 use crate::session::Session;
+pub use crate::spawn::{SpawnRequest, SpawnResult};
 use crate::store::{QueuedMessage, Store};
 use crate::turn::Turn;
 use crate::util::utc_timestamp;
@@ -40,6 +41,15 @@ where
     fn request_approval(&mut self, severity: &Severity, reason: &str, command: &str) -> bool {
         self(severity, reason, command)
     }
+}
+
+/// Convenience wrapper for spawning a child session through the shared spawn module.
+pub fn spawn_child(
+    store: &mut Store,
+    config: &crate::config::Config,
+    request: SpawnRequest,
+) -> Result<SpawnResult> {
+    crate::spawn::spawn_child(store, config, request)
 }
 
 pub enum TurnVerdict {
@@ -544,7 +554,9 @@ where
     P: LlmProvider,
 {
     info!(%session_id, "draining queue");
+    let mut processed_any = false;
     while let Some(message) = store.dequeue_next_message(session_id)? {
+        processed_any = true;
         let outcome = process_message(
             &message,
             session,
@@ -585,6 +597,10 @@ where
                 return Err(error);
             }
         }
+    }
+
+    if crate::spawn::should_enqueue_child_completion(processed_any) {
+        let _ = crate::spawn::enqueue_child_completion(store, session_id, session)?;
     }
 
     Ok(None)
@@ -1017,6 +1033,157 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "failed");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_queue_does_not_enqueue_completion_when_no_messages_were_processed() {
+        let root = temp_queue_root("empty_queue");
+        let queue_path = root.join("queue.sqlite");
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let mut store = Store::new(&queue_path).unwrap();
+        store.create_session("parent", None).unwrap();
+        store
+            .create_child_session("parent", "child", Some(r#"{"task":"noop"}"#))
+            .unwrap();
+
+        let mut session = Session::new(&sessions_dir).unwrap();
+        let turn = Turn::new();
+        let mut provider_factory = || async {
+            Ok::<_, anyhow::Error>(StaticProvider {
+                turn: StreamedTurn {
+                    assistant_message: ChatMessage {
+                        role: crate::llm::ChatRole::Assistant,
+                        principal: Principal::Agent,
+                        content: vec![MessageContent::text("unused")],
+                    },
+                    tool_calls: vec![],
+                    meta: None,
+                    stop_reason: StopReason::Stop,
+                },
+            })
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        assert!(
+            drain_queue(
+                &mut store,
+                "child",
+                &mut session,
+                &turn,
+                &mut provider_factory,
+                &mut token_sink,
+                &mut approval_handler,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let conn = Connection::open(&queue_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = 'parent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_child_wrapper_enqueues_parent_completion_after_child_drain() {
+        let root = temp_queue_root("child_completion");
+        let queue_path = root.join("queue.sqlite");
+        let sessions_dir = root.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let mut store = Store::new(&queue_path).unwrap();
+        store.create_session("parent", None).unwrap();
+
+        let config = crate::config::Config {
+            model: "gpt-test".to_string(),
+            system_prompt: "system".to_string(),
+            base_url: "https://example.test/api".to_string(),
+            reasoning_effort: Some("medium".to_string()),
+            session_name: None,
+            operator_key: None,
+            shell_policy: crate::config::ShellPolicy::default(),
+            budget: None,
+            queue: crate::config::QueueConfig::default(),
+            identity_files: Vec::new(),
+            agents: crate::config::AgentsConfig::default(),
+            models: Default::default(),
+            domains: Default::default(),
+            active_agent: Some("silas".to_string()),
+        };
+
+        let spawn_result = spawn_child(
+            &mut store,
+            &config,
+            SpawnRequest {
+                parent_session_id: "parent".to_string(),
+                task: "child task".to_string(),
+                model_override: Some("gpt-child".to_string()),
+                reasoning_override: Some("low".to_string()),
+            },
+        )
+        .unwrap();
+
+        let mut session = Session::new(sessions_dir.join(&spawn_result.child_session_id)).unwrap();
+        let turn = Turn::new();
+        let mut provider_factory = || async {
+            Ok::<_, anyhow::Error>(StaticProvider {
+                turn: StreamedTurn {
+                    assistant_message: ChatMessage {
+                        role: crate::llm::ChatRole::Assistant,
+                        principal: Principal::Agent,
+                        content: vec![MessageContent::text("child finished")],
+                    },
+                    tool_calls: vec![],
+                    meta: Some(crate::llm::TurnMeta {
+                        model: None,
+                        input_tokens: None,
+                        output_tokens: Some(1),
+                        reasoning_tokens: None,
+                        reasoning_trace: None,
+                    }),
+                    stop_reason: StopReason::Stop,
+                },
+            })
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        assert!(
+            drain_queue(
+                &mut store,
+                &spawn_result.child_session_id,
+                &mut session,
+                &turn,
+                &mut provider_factory,
+                &mut token_sink,
+                &mut approval_handler,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let completion = store.dequeue_next_message("parent").unwrap().unwrap();
+        assert_eq!(completion.role, "user");
+        assert_eq!(
+            completion.source,
+            format!("agent-{}", spawn_result.child_session_id)
+        );
+        assert!(completion.content.contains("Child session"));
+        assert!(completion.content.contains("child finished"));
 
         std::fs::remove_dir_all(&root).unwrap();
     }

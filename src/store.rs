@@ -52,7 +52,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
-                metadata TEXT NOT NULL
+                metadata TEXT NOT NULL,
+                parent_session_id TEXT REFERENCES sessions(id)
             );
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,6 +83,13 @@ impl Store {
             "#,
         )
         .context("failed to initialize sqlite schema")?;
+        ensure_sessions_parent_session_id_column(&conn)?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_parent_session_id_created_at
+             ON sessions(parent_session_id, created_at, id)",
+            [],
+        )
+        .context("failed to initialize parent session index")?;
         ensure_messages_claimed_at_column(&conn)?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_status_claimed_at
@@ -104,6 +112,48 @@ impl Store {
         Ok(())
     }
 
+    /// Insert a child session that records its parent session id.
+    pub fn create_child_session(
+        &mut self,
+        parent_id: &str,
+        child_id: &str,
+        metadata: Option<&str>,
+    ) -> Result<()> {
+        let metadata = metadata.unwrap_or("{}");
+        self.conn
+            .execute(
+                "INSERT INTO sessions (id, created_at, metadata, parent_session_id) VALUES (?1, ?2, ?3, ?4)",
+                params![child_id, utc_timestamp(), metadata, parent_id],
+            )
+            .context("failed to create child session")?;
+        Ok(())
+    }
+
+    /// Insert a child session and queue its initial task atomically.
+    pub fn create_child_session_with_task(
+        &mut self,
+        parent_id: &str,
+        child_id: &str,
+        metadata: Option<&str>,
+        task: &str,
+        source: &str,
+    ) -> Result<()> {
+        let metadata = metadata.unwrap_or("{}");
+        self.with_transaction(|tx| {
+            tx.execute(
+                "INSERT INTO sessions (id, created_at, metadata, parent_session_id) VALUES (?1, ?2, ?3, ?4)",
+                params![child_id, utc_timestamp(), metadata, parent_id],
+            )
+            .context("failed to create child session")?;
+            tx.execute(
+                "INSERT INTO messages (session_id, role, content, source, status, created_at) VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+                params![child_id, "user", task, source, utc_timestamp()],
+            )
+            .context("failed to enqueue child task")?;
+            Ok(())
+        })
+    }
+
     pub fn list_sessions(&self) -> Result<Vec<String>> {
         let mut statement = self
             .conn
@@ -116,6 +166,50 @@ impl Store {
             .context("failed to collect sessions")?;
 
         Ok(sessions)
+    }
+
+    /// Return the parent session id for a child session, if one exists.
+    pub fn get_parent_session(&self, child_id: &str) -> Result<Option<String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT parent_session_id FROM sessions WHERE id = ?1")
+            .context("failed to prepare get_parent_session query")?;
+        match statement.query_row(params![child_id], |row| row.get::<_, Option<String>>(0)) {
+            Ok(parent_id) => Ok(parent_id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error).context("failed to read parent session"),
+        }
+    }
+
+    /// Return child session ids ordered by creation time.
+    pub fn list_child_sessions(&self, parent_id: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT id FROM sessions WHERE parent_session_id = ?1 ORDER BY created_at ASC, id ASC",
+            )
+            .context("failed to prepare list_child_sessions query")?;
+        let sessions = statement
+            .query_map(params![parent_id], |row| row.get::<_, String>(0))
+            .context("failed to query child sessions")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to collect child sessions")?;
+
+        Ok(sessions)
+    }
+
+    /// Run a SQLite transaction and commit only if the closure succeeds.
+    pub fn with_transaction<T, F>(&mut self, f: F) -> Result<T>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    {
+        let tx = self
+            .conn
+            .transaction()
+            .context("failed to start sqlite transaction")?;
+        let result = f(&tx)?;
+        tx.commit().context("failed to commit sqlite transaction")?;
+        Ok(result)
     }
 
     pub fn enqueue_message(
@@ -383,6 +477,22 @@ fn ensure_messages_claimed_at_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_sessions_parent_session_id_column(conn: &Connection) -> Result<()> {
+    if has_column(conn, "sessions", "parent_session_id")? {
+        return Ok(());
+    }
+
+    if let Err(error) = conn.execute(
+        "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT REFERENCES sessions(id)",
+        [],
+    ) && !has_column(conn, "sessions", "parent_session_id")?
+    {
+        return Err(error).context("failed to migrate sessions.parent_session_id column");
+    }
+
+    Ok(())
+}
+
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut statement = conn
         .prepare(&format!("PRAGMA table_info({table})"))
@@ -468,6 +578,67 @@ mod tests {
 
         let sessions = store.list_sessions().unwrap();
         assert_eq!(sessions, vec!["s1", "s2"]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn create_child_session_records_parent_and_lists_children() {
+        let path = temp_db_path("child_session");
+        let mut store = Store::new(&path).unwrap();
+
+        store
+            .create_session("parent", Some(r#"{"kind":"root"}"#))
+            .unwrap();
+        store
+            .create_child_session("parent", "child-a", Some(r#"{"kind":"child-a"}"#))
+            .unwrap();
+        store
+            .create_child_session("parent", "child-b", Some(r#"{"kind":"child-b"}"#))
+            .unwrap();
+
+        assert_eq!(
+            store.get_parent_session("child-a").unwrap(),
+            Some("parent".to_string())
+        );
+        assert_eq!(store.get_parent_session("parent").unwrap(), None);
+        assert_eq!(
+            store.list_child_sessions("parent").unwrap(),
+            vec!["child-a".to_string(), "child-b".to_string()]
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn create_child_session_rejects_missing_parent() {
+        let path = temp_db_path("missing_parent");
+        let mut store = Store::new(&path).unwrap();
+
+        let err = store
+            .create_child_session("missing", "child", None)
+            .expect_err("missing parent should fail");
+        assert!(err.to_string().contains("failed to create child session"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn with_transaction_rolls_back_on_error() {
+        let path = temp_db_path("transaction_rollback");
+        let mut store = Store::new(&path).unwrap();
+
+        let err = store
+            .with_transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO sessions (id, created_at, metadata, parent_session_id) VALUES (?1, ?2, ?3, ?4)",
+                    params!["parent", utc_timestamp(), "{}", Option::<String>::None],
+                )?;
+                Err::<(), anyhow::Error>(anyhow::anyhow!("boom"))
+            })
+            .expect_err("transaction should fail");
+        assert!(err.to_string().contains("boom"));
+        assert!(store.list_sessions().unwrap().is_empty());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -709,6 +880,48 @@ mod tests {
             )
             .unwrap();
         assert!(claimed_at.is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn store_new_migrates_missing_parent_session_id_column() {
+        let path = temp_db_path("migrate_parent_session_id");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                metadata TEXT NOT NULL
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = Store::new(&path).unwrap();
+        let has_parent = has_column(&store.conn, "sessions", "parent_session_id").unwrap();
+        assert!(has_parent);
+
+        store.create_session("parent", None).unwrap();
+        store
+            .create_child_session("parent", "child", Some(r#"{"linked":true}"#))
+            .unwrap();
+        assert_eq!(
+            store.get_parent_session("child").unwrap(),
+            Some("parent".to_string())
+        );
 
         let _ = std::fs::remove_file(&path);
     }

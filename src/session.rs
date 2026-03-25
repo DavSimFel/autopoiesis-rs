@@ -301,7 +301,6 @@ impl Session {
         self.message_tokens.push(token_delta);
         self.total_tokens += token_delta;
         self.session_total_tokens += token_delta;
-
         Self::append_entry_to_file(&self.today_path(), &entry)?;
 
         if should_trim && self.total_tokens > self.max_context_tokens {

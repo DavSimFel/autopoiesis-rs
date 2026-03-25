@@ -153,11 +153,11 @@ where
         lock: Arc::downgrade(&session_lock),
     };
     let _session_guard = session_lock.lock().await;
+    let mut processed_any = false;
 
     let mut history = session::Session::new(state.sessions_dir.join(&session_id))
         .with_context(|| format!("failed to open session {session_id}"))?;
     history.load_today()?;
-
     loop {
         let message = {
             let mut store = state.store.lock().await;
@@ -167,6 +167,7 @@ where
         let Some(message) = message else {
             break;
         };
+        processed_any = true;
 
         let outcome = agent::process_queued_message(
             &message,
@@ -214,6 +215,11 @@ where
                 return Err(error);
             }
         }
+    }
+
+    if crate::spawn::should_enqueue_child_completion(processed_any) {
+        let mut store = state.store.lock().await;
+        let _ = crate::spawn::enqueue_child_completion(&mut store, &session_id, &history)?;
     }
 
     Ok(None)
@@ -1187,6 +1193,213 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "processed");
+    }
+
+    #[tokio::test]
+    async fn drain_queue_enqueues_child_completion_message_for_parent_session() {
+        let (state, queue_path) = test_state();
+        let parent_session_id = "parent-session";
+        let child_session_id = "child-session";
+        {
+            let mut store = state.store.lock().await;
+            store.create_session(parent_session_id, None).unwrap();
+            store
+                .create_child_session(parent_session_id, child_session_id, None)
+                .unwrap();
+            store
+                .enqueue_message(
+                    child_session_id,
+                    "user",
+                    "run child task",
+                    "agent-parent-session",
+                )
+                .unwrap();
+        }
+
+        let turn = turn::Turn::new();
+        let mut provider_factory = || async {
+            Ok::<_, anyhow::Error>(StaticProvider {
+                turn: StreamedTurn {
+                    assistant_message: ChatMessage {
+                        role: llm::ChatRole::Assistant,
+                        principal: Principal::Agent,
+                        content: vec![llm::MessageContent::text("child finished")],
+                    },
+                    tool_calls: vec![],
+                    meta: Some(llm::TurnMeta {
+                        model: None,
+                        input_tokens: None,
+                        output_tokens: Some(1),
+                        reasoning_tokens: None,
+                        reasoning_trace: None,
+                    }),
+                    stop_reason: StopReason::Stop,
+                },
+            })
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        assert!(
+            drain_session_queue(
+                state.clone(),
+                child_session_id.to_string(),
+                &turn,
+                &mut provider_factory,
+                &mut token_sink,
+                &mut approval_handler,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let conn = rusqlite::Connection::open(queue_path).unwrap();
+        let (role, content, source): (String, String, String) = conn
+            .query_row(
+                "SELECT role, content, source FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                [parent_session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(role, "user");
+        assert_eq!(source, "agent-child-session");
+        assert!(content.contains("Child session child-session completed."));
+        assert!(content.contains("child finished"));
+    }
+
+    #[tokio::test]
+    async fn drain_queue_does_not_enqueue_completion_for_empty_child_queue() {
+        let (state, queue_path) = test_state();
+        let parent_session_id = "parent-empty";
+        let child_session_id = "child-empty";
+        {
+            let mut store = state.store.lock().await;
+            store.create_session(parent_session_id, None).unwrap();
+            store
+                .create_child_session(parent_session_id, child_session_id, None)
+                .unwrap();
+        }
+
+        let turn = turn::Turn::new();
+        let mut provider_factory = || async {
+            Ok::<_, anyhow::Error>(StaticProvider {
+                turn: StreamedTurn {
+                    assistant_message: ChatMessage {
+                        role: llm::ChatRole::Assistant,
+                        principal: Principal::Agent,
+                        content: vec![llm::MessageContent::text("unused")],
+                    },
+                    tool_calls: vec![],
+                    meta: None,
+                    stop_reason: StopReason::Stop,
+                },
+            })
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        assert!(
+            drain_session_queue(
+                state.clone(),
+                child_session_id.to_string(),
+                &turn,
+                &mut provider_factory,
+                &mut token_sink,
+                &mut approval_handler,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let conn = rusqlite::Connection::open(queue_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                [parent_session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn drain_queue_enqueues_completion_when_persisted_history_exists_but_new_assistant_response_is_empty()
+     {
+        let (state, queue_path) = test_state();
+        let parent_session_id = "parent-persisted";
+        let child_session_id = "child-persisted";
+        {
+            let mut store = state.store.lock().await;
+            store.create_session(parent_session_id, None).unwrap();
+            store
+                .create_child_session(parent_session_id, child_session_id, None)
+                .unwrap();
+            store
+                .enqueue_message(
+                    child_session_id,
+                    "user",
+                    "run child task",
+                    "agent-parent-persisted",
+                )
+                .unwrap();
+        }
+
+        let mut history = session::Session::new(state.sessions_dir.join(child_session_id)).unwrap();
+        history
+            .append(
+                ChatMessage {
+                    role: llm::ChatRole::Assistant,
+                    principal: Principal::Agent,
+                    content: vec![llm::MessageContent::text("old answer")],
+                },
+                None,
+            )
+            .unwrap();
+
+        let turn = turn::Turn::new();
+        let mut provider_factory = || async {
+            Ok::<_, anyhow::Error>(StaticProvider {
+                turn: StreamedTurn {
+                    assistant_message: ChatMessage {
+                        role: llm::ChatRole::Assistant,
+                        principal: Principal::Agent,
+                        content: vec![llm::MessageContent::text("")],
+                    },
+                    tool_calls: vec![],
+                    meta: None,
+                    stop_reason: StopReason::Stop,
+                },
+            })
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        assert!(
+            drain_session_queue(
+                state.clone(),
+                child_session_id.to_string(),
+                &turn,
+                &mut provider_factory,
+                &mut token_sink,
+                &mut approval_handler,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let conn = rusqlite::Connection::open(queue_path).unwrap();
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                [parent_session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(content.contains("Child session child-persisted completed."));
+        assert!(!content.contains("old answer"));
     }
 
     #[tokio::test]
