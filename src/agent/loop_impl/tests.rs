@@ -1457,6 +1457,127 @@ async fn tool_output_is_redacted_before_persist() {
 }
 
 #[tokio::test]
+async fn execute_tool_approval_prompts_once_and_persists_result() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = temp_sessions_dir("execute_approval");
+    let provider = SequenceProvider::new(vec![
+        streamed_turn_with_tool_call(None, "echo approval", "call-1"),
+        StreamedTurn {
+            assistant_message: ChatMessage {
+                role: crate::llm::ChatRole::Assistant,
+                principal: Principal::Agent,
+                content: vec![MessageContent::text("done")],
+            },
+            tool_calls: vec![],
+            meta: None,
+            stop_reason: StopReason::Stop,
+        },
+    ]);
+    let mut session = crate::session::Session::new(&dir).unwrap();
+    let turn = Turn::new()
+        .tool(Shell::new())
+        .guard(ShellSafety::with_policy(shell_policy(
+            "approve",
+            &[],
+            &[],
+            &[],
+            "medium",
+        )));
+    let approvals = Arc::new(AtomicUsize::new(0));
+    let approvals_seen = approvals.clone();
+    let mut make_provider = {
+        let provider = provider.clone();
+        move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        }
+    };
+    let mut token_sink = |_token: String| {};
+    let mut approval_handler = move |_severity: &Severity, _reason: &str, command: &str| {
+        assert_eq!(command, "echo approval");
+        approvals_seen.fetch_add(1, Ordering::SeqCst);
+        true
+    };
+
+    let verdict = run_agent_loop(
+        &mut make_provider,
+        &mut session,
+        "run execute approval".to_string(),
+        Principal::Operator,
+        &turn,
+        &mut token_sink,
+        &mut approval_handler,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(verdict, TurnVerdict::Approved { ref tool_calls } if tool_calls.len() == 1));
+    assert_eq!(approvals.load(Ordering::SeqCst), 1);
+
+    let stored = session.history();
+    assert_eq!(stored[1].role, crate::llm::ChatRole::Assistant);
+    assert_eq!(stored[2].role, crate::llm::ChatRole::Tool);
+    assert!(session.sessions_dir().join("results").exists());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn execute_tool_approval_rejection_leaves_no_result_file() {
+    let dir = temp_sessions_dir("execute_denied");
+    let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
+        None,
+        "echo denied",
+        "call-1",
+    )]);
+    let mut session = crate::session::Session::new(&dir).unwrap();
+    let turn = Turn::new()
+        .tool(Shell::new())
+        .guard(ShellSafety::with_policy(shell_policy(
+            "approve",
+            &[],
+            &[],
+            &[],
+            "medium",
+        )));
+    let mut make_provider = {
+        let provider = provider.clone();
+        move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        }
+    };
+    let mut token_sink = |_token: String| {};
+    let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| false;
+
+    let verdict = run_agent_loop(
+        &mut make_provider,
+        &mut session,
+        "deny execute approval".to_string(),
+        Principal::Operator,
+        &turn,
+        &mut token_sink,
+        &mut approval_handler,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        verdict,
+        TurnVerdict::Denied { gate_id, .. } if gate_id == "shell-policy"
+    ));
+    assert_eq!(session.history().len(), 3);
+    assert_eq!(session.history()[1].role, crate::llm::ChatRole::Assistant);
+    assert_eq!(session.history()[2].role, crate::llm::ChatRole::Assistant);
+    assert_eq!(session.history()[2].principal, Principal::System);
+    assert!(!session.sessions_dir().join("results").exists());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn replayed_tool_result_marks_followup_turn_tainted() {
     let dir = temp_sessions_dir("replayed_tool_taint");
     let mut session = crate::session::Session::new(&dir).unwrap();

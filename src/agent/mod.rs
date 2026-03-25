@@ -13,6 +13,7 @@ pub use crate::spawn::{SpawnDrainResult, SpawnRequest, SpawnResult};
 
 mod loop_impl;
 mod queue;
+pub(crate) mod shell_execute;
 mod spawn;
 
 pub use loop_impl::{QueueOutcome, TurnVerdict, format_denial_message, run_agent_loop};

@@ -163,3 +163,6 @@ packs append to the identity file list when configured. Template variables resol
 
 See [../specs/identity-v2.md](../specs/identity-v2.md) for the current stack and config shape.
 T2/T3 continue to load constitution + context only; T1 also loads `agent.md`.
+## Guarded Shell Executor
+
+The guarded shell execution sequence is centralized in `src/agent/shell_execute.rs` and documented in `docs/architecture/guarded-shell-executor.md`.

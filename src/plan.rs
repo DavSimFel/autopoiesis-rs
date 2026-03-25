@@ -2,6 +2,8 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+pub(crate) mod executor;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanAction {
     pub kind: PlanActionKind,

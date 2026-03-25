@@ -417,17 +417,25 @@ where
 
                 for call in &tool_calls {
                     debug!(call_id = %call.id, tool_name = %call.name, "executing tool");
-                    let result = match turn.execute_tool(&call.name, &call.arguments).await {
-                        Ok(output) => output,
-                        Err(err) => format!(r#"{{"error": "{err}"}}"#),
+                    let result = if call.name == "execute" {
+                        crate::agent::shell_execute::guarded_shell_execute_prechecked(
+                            turn, call, session,
+                        )
+                        .await?
+                        .output
+                    } else {
+                        let result = match turn.execute_tool(&call.name, &call.arguments).await {
+                            Ok(output) => output,
+                            Err(err) => format!(r#"{{"error": "{err}"}}"#),
+                        };
+                        let result = crate::gate::guard_text_output(turn, result);
+                        crate::gate::cap_tool_output(
+                            session.sessions_dir(),
+                            &call.id,
+                            result,
+                            crate::gate::DEFAULT_OUTPUT_CAP_BYTES,
+                        )?
                     };
-                    let result = crate::gate::guard_text_output(turn, result);
-                    let result = crate::gate::cap_tool_output(
-                        session.sessions_dir(),
-                        &call.id,
-                        result,
-                        crate::gate::DEFAULT_OUTPUT_CAP_BYTES,
-                    )?;
 
                     session.append(
                         ChatMessage::tool_result_with_principal(
