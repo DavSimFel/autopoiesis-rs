@@ -16,6 +16,7 @@ pub struct Turn {
     context: Vec<Box<dyn ContextSource>>,
     tools: Vec<Box<dyn Tool>>,
     guards: Vec<Box<dyn Guard>>,
+    delegation: Option<crate::delegation::DelegationConfig>,
     tainted: AtomicBool,
 }
 
@@ -25,6 +26,7 @@ impl Turn {
             context: Vec::new(),
             tools: Vec::new(),
             guards: Vec::new(),
+            delegation: None,
             tainted: AtomicBool::new(false),
         }
     }
@@ -44,6 +46,11 @@ impl Turn {
         self
     }
 
+    pub fn delegation(mut self, delegation: crate::delegation::DelegationConfig) -> Self {
+        self.delegation = Some(delegation);
+        self
+    }
+
     pub fn tool_definitions(&self) -> Vec<FunctionTool> {
         self.tools.iter().map(|tool| tool.definition()).collect()
     }
@@ -60,6 +67,10 @@ impl Turn {
 
     pub fn has_guard(&self, name: &str) -> bool {
         self.guards.iter().any(|guard| guard.name() == name)
+    }
+
+    pub fn delegation_config(&self) -> Option<&crate::delegation::DelegationConfig> {
+        self.delegation.as_ref()
     }
 
     pub fn needs_budget_context(&self) -> bool {
@@ -243,6 +254,15 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
             || budget.max_tokens_per_day.is_some())
     {
         turn = turn.guard(BudgetGuard::new(budget.clone()));
+    }
+
+    if let Some(tier) = config.active_t1_config()
+        && (tier.delegation_token_threshold.is_some() || tier.delegation_tool_depth.is_some())
+    {
+        turn = turn.delegation(crate::delegation::DelegationConfig {
+            token_threshold: tier.delegation_token_threshold,
+            tool_depth_threshold: tier.delegation_tool_depth,
+        });
     }
 
     turn.guard(SecretRedactor::default_catalog())
@@ -745,5 +765,16 @@ mod tests {
             domains: crate::config::DomainsConfig::default(),
             active_agent: None,
         }
+    }
+    #[test]
+    fn build_default_turn_carries_delegation_thresholds_into_turn_config() {
+        let config = crate::config::Config::load("agents.toml").expect("config should load");
+        let turn = build_default_turn(&config);
+        let delegation = turn
+            .delegation_config()
+            .expect("delegation config should be present");
+
+        assert_eq!(delegation.token_threshold, Some(12_000));
+        assert_eq!(delegation.tool_depth_threshold, Some(3));
     }
 }

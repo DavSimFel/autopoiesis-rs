@@ -295,7 +295,7 @@ mod tests {
     fn loads_new_agents_silas_config_with_models_and_domains() {
         let path = temp_toml_path(
             "agents_v2",
-            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nbase_url='https://example.test/api'\nsystem_prompt='legacy defaults'\nsession_name='legacy-session'\nmodel='gpt-5.4-mini'\nreasoning='medium'\n[agents.silas.t2]\nmodel='o3'\nreasoning='xhigh'\n[models]\ndefault='gpt5_mini'\n[models.catalog.gpt5_mini]\nprovider='openai'\nmodel='gpt-5.4-mini'\ncaps=['fast','cheap','reasoning']\ncontext_window=128000\ncost_tier='cheap'\ncost_unit=1\nenabled=true\n[models.routes.code_review]\nrequires=['code']\nprefer=['gpt5_mini']\n[domains]\nselected=['fitness']\n[domains.fitness]\ncontext_extend='identity-templates/domains/fitness.md'\n",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nbase_url='https://example.test/api'\nsystem_prompt='legacy defaults'\nsession_name='legacy-session'\nmodel='gpt-5.4-mini'\nreasoning='medium'\ndelegation_token_threshold=12000\ndelegation_tool_depth=3\n[agents.silas.t2]\nmodel='o3'\nreasoning='xhigh'\n[models]\ndefault='gpt5_mini'\n[models.catalog.gpt5_mini]\nprovider='openai'\nmodel='gpt-5.4-mini'\ncaps=['fast','cheap','reasoning']\ncontext_window=128000\ncost_tier='cheap'\ncost_unit=1\nenabled=true\n[models.routes.code_review]\nrequires=['code']\nprefer=['gpt5_mini']\n[domains]\nselected=['fitness']\n[domains.fitness]\ncontext_extend='identity-templates/domains/fitness.md'\n",
         );
 
         let config = Config::load(&path).expect("expected config to load");
@@ -314,6 +314,18 @@ mod tests {
         assert_eq!(config.base_url, "https://example.test/api");
         assert_eq!(config.system_prompt, "legacy defaults");
         assert_eq!(config.session_name, Some("legacy-session".to_string()));
+        assert_eq!(
+            config
+                .active_t1_config()
+                .map(|tier| tier.delegation_token_threshold),
+            Some(Some(12_000))
+        );
+        assert_eq!(
+            config
+                .active_t1_config()
+                .map(|tier| tier.delegation_tool_depth),
+            Some(Some(3))
+        );
         assert_eq!(config.models.default, Some("gpt5_mini".to_string()));
         let catalog = config
             .models
@@ -772,6 +784,10 @@ pub struct AgentTierConfig {
     pub reasoning: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub delegation_token_threshold: Option<u64>,
+    #[serde(default)]
+    pub delegation_tool_depth: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -953,5 +969,18 @@ impl Default for QueueConfig {
         Self {
             stale_processing_timeout_secs: default_stale_processing_timeout_secs(),
         }
+    }
+}
+
+impl Config {
+    /// Resolve the active agent definition, if v2 config loaded successfully.
+    pub fn active_agent_definition(&self) -> Option<&AgentDefinition> {
+        let active_name = self.active_agent.as_ref()?;
+        self.agents.entries.get(active_name)
+    }
+
+    /// Resolve the active T1 tier config for the current brain, if available.
+    pub fn active_t1_config(&self) -> Option<&AgentTierConfig> {
+        self.active_agent_definition().map(|agent| &agent.t1)
     }
 }

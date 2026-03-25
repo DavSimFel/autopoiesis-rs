@@ -4,6 +4,8 @@ identity = "silas"
 [agents.silas.t1]
 model = "gpt-5.4-mini"
 reasoning = "medium"
+delegation_token_threshold = 12000
+delegation_tool_depth = 3
 
 [agents.silas.t2]
 model = "gpt-5.4-mini"

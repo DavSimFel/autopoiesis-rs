@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, from_str};
 
+use crate::delegation::{self, DelegationAdvice};
 use crate::gate::{GuardContext, Severity, Verdict};
 use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall, TurnMeta};
 use crate::principal::Principal;
@@ -152,6 +153,24 @@ fn inbound_verdict_name(verdict: &Verdict) -> &'static str {
     }
 }
 
+fn maybe_queue_delegation_hint(
+    session: &Session,
+    turn: &Turn,
+    tool_call_count: usize,
+) -> Result<()> {
+    if !delegation::delegation_enabled(turn.delegation_config()) {
+        return Ok(());
+    }
+
+    let advice = delegation::check_delegation(session, tool_call_count, turn.delegation_config());
+    if let DelegationAdvice::SuggestDelegation { reason } = &advice {
+        debug!(%reason, "delegation advised");
+        session.queue_delegation_hint(delegation::DELEGATION_HINT)?;
+    }
+
+    Ok(())
+}
+
 #[tracing::instrument(level = "debug", skip(message, session, turn, make_provider, token_sink, approval_handler), fields(message_id = message.id, session_id = %message.session_id, role = %message.role))]
 pub(crate) async fn process_queued_message<F, Fut, P, TS, AH>(
     message: &QueuedMessage,
@@ -232,6 +251,7 @@ where
     let mut executed: Vec<ToolCall> = Vec::new();
     let mut had_user_approval = false;
     let mut denial_count = 0usize;
+    let mut turn_tool_call_count = 0usize;
     info!("starting agent turn");
 
     let denied_turn = 'agent_turn: loop {
@@ -345,6 +365,20 @@ where
 
         if messages.is_empty() {
             continue;
+        }
+
+        if delegation::delegation_enabled(turn.delegation_config()) {
+            match session.delegation_hint() {
+                Ok(Some(delegation_hint)) => {
+                    messages.push(ChatMessage::system(delegation_hint));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(error = %err, "failed to load delegation hint");
+                }
+            }
+        } else if let Err(err) = session.clear_delegation_hint() {
+            warn!(error = %err, "failed to clear stale delegation hint");
         }
 
         let provider = make_provider().await?;
@@ -464,7 +498,7 @@ where
                 }
 
                 crate::gate::guard_message_output(turn, &mut turn_reply.assistant_message);
-                session.append(turn_reply.assistant_message, turn_meta)?;
+                session.append(turn_reply.assistant_message, turn_meta.clone())?;
 
                 for call in &tool_calls {
                     debug!(call_id = %call.id, tool_name = %call.name, "executing tool");
@@ -491,10 +525,17 @@ where
                     )?;
                     executed.push(call.clone());
                 }
+                turn_tool_call_count += tool_calls.len();
             }
 
             StopReason::Stop => {
-                session.append(turn_reply.assistant_message, turn_meta)?;
+                session.append(turn_reply.assistant_message, turn_meta.clone())?;
+                if let Err(err) = session.clear_delegation_hint() {
+                    warn!(error = %err, "failed to clear delegation hint");
+                }
+                if let Err(err) = maybe_queue_delegation_hint(session, turn, turn_tool_call_count) {
+                    warn!(error = %err, "failed to persist delegation hint");
+                }
                 token_sink.on_complete();
                 if had_user_approval {
                     info!(
@@ -1276,6 +1317,446 @@ mod tests {
             observed.first().cloned().is_some_and(|count| count <= 3),
             "expected pre-call trimming to run before stream completion"
         );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delegation_hint_is_appended_after_successful_turn() {
+        let dir = temp_sessions_dir("delegation_hint");
+        let (provider, _observed_message_counts) = InspectingProvider::new();
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        session
+            .append(
+                ChatMessage::user("seed delegation context"),
+                Some(crate::llm::TurnMeta {
+                    input_tokens: Some(8),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+
+        let turn = Turn::new().delegation(crate::delegation::DelegationConfig {
+            token_threshold: Some(0),
+            tool_depth_threshold: None,
+        });
+        let mut make_provider = {
+            let provider = provider.clone();
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        let verdict = run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "please keep this short".to_string(),
+            Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(verdict, TurnVerdict::Executed(_)));
+        assert_eq!(
+            session.delegation_hint().unwrap().as_deref(),
+            Some(crate::delegation::DELEGATION_HINT)
+        );
+        let reloaded_session = crate::session::Session::new(&dir).unwrap();
+        assert_eq!(
+            reloaded_session.delegation_hint().unwrap().as_deref(),
+            Some(crate::delegation::DELEGATION_HINT)
+        );
+        assert!(!session.history().iter().any(|message| {
+            matches!(message.role, crate::llm::ChatRole::System)
+                && message.content.iter().any(|block| matches!(block, MessageContent::Text { text } if text == crate::delegation::DELEGATION_HINT))
+        }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delegation_hint_is_retained_when_provider_fails() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = temp_sessions_dir("delegation_hint_failed_provider");
+        let observed_hint = Arc::new(Mutex::new(false));
+
+        #[derive(Clone)]
+        struct FailingProvider {
+            observed_hint: Arc<Mutex<bool>>,
+        }
+
+        impl crate::llm::LlmProvider for FailingProvider {
+            async fn stream_completion(
+                &self,
+                messages: &[ChatMessage],
+                _tools: &[FunctionTool],
+                _on_token: &mut (dyn FnMut(String) + Send),
+            ) -> Result<StreamedTurn> {
+                let saw_hint = messages.iter().any(|message| {
+                    matches!(message.role, crate::llm::ChatRole::System)
+                        && message.content.iter().any(|block| matches!(block, MessageContent::Text { text } if text == crate::delegation::DELEGATION_HINT))
+                });
+                *self
+                    .observed_hint
+                    .lock()
+                    .expect("hint mutex should not be poisoned") = saw_hint;
+
+                Err(anyhow::anyhow!("provider failure"))
+            }
+        }
+
+        let turn = Turn::new().delegation(crate::delegation::DelegationConfig {
+            token_threshold: Some(u64::MAX),
+            tool_depth_threshold: None,
+        });
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        session
+            .queue_delegation_hint(crate::delegation::DELEGATION_HINT)
+            .unwrap();
+        let mut make_provider = {
+            let provider = FailingProvider {
+                observed_hint: observed_hint.clone(),
+            };
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        let error = match run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "keep going".to_string(),
+            Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        {
+            Ok(_) => panic!("provider failure should bubble up"),
+            Err(err) => err,
+        };
+
+        assert!(
+            *observed_hint
+                .lock()
+                .expect("hint mutex should not be poisoned")
+        );
+        assert_eq!(
+            session.delegation_hint().unwrap().as_deref(),
+            Some(crate::delegation::DELEGATION_HINT)
+        );
+        assert!(error.to_string().contains("provider failure"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delegation_hint_is_ignored_when_delegation_is_disabled() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = temp_sessions_dir("delegation_hint_disabled");
+        let observed_hint = Arc::new(Mutex::new(false));
+
+        #[derive(Clone)]
+        struct HintObservingProvider {
+            observed_hint: Arc<Mutex<bool>>,
+        }
+
+        impl crate::llm::LlmProvider for HintObservingProvider {
+            async fn stream_completion(
+                &self,
+                messages: &[ChatMessage],
+                _tools: &[FunctionTool],
+                _on_token: &mut (dyn FnMut(String) + Send),
+            ) -> Result<StreamedTurn> {
+                let saw_hint = messages.iter().any(|message| {
+                    matches!(message.role, crate::llm::ChatRole::System)
+                        && message.content.iter().any(|block| matches!(block, MessageContent::Text { text } if text == crate::delegation::DELEGATION_HINT))
+                });
+                *self
+                    .observed_hint
+                    .lock()
+                    .expect("hint mutex should not be poisoned") = saw_hint;
+
+                Ok(StreamedTurn {
+                    assistant_message: ChatMessage::system("ok"),
+                    tool_calls: vec![],
+                    meta: None,
+                    stop_reason: StopReason::Stop,
+                })
+            }
+        }
+
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        session
+            .queue_delegation_hint(crate::delegation::DELEGATION_HINT)
+            .unwrap();
+        let turn = Turn::new();
+        let mut make_provider = {
+            let provider = HintObservingProvider {
+                observed_hint: observed_hint.clone(),
+            };
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "keep going".to_string(),
+            Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !*observed_hint
+                .lock()
+                .expect("hint mutex should not be poisoned")
+        );
+        assert!(session.delegation_hint().unwrap().is_none());
+        let reloaded_session = crate::session::Session::new(&dir).unwrap();
+        assert!(reloaded_session.delegation_hint().unwrap().is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delegation_hint_is_cleared_after_successful_turn_without_new_advice() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = temp_sessions_dir("delegation_hint_cleared");
+        let observed_hint = Arc::new(Mutex::new(false));
+
+        #[derive(Clone)]
+        struct HintObservingProvider {
+            observed_hint: Arc<Mutex<bool>>,
+        }
+
+        impl crate::llm::LlmProvider for HintObservingProvider {
+            async fn stream_completion(
+                &self,
+                messages: &[ChatMessage],
+                _tools: &[FunctionTool],
+                _on_token: &mut (dyn FnMut(String) + Send),
+            ) -> Result<StreamedTurn> {
+                let saw_hint = messages.iter().any(|message| {
+                    matches!(message.role, crate::llm::ChatRole::System)
+                        && message.content.iter().any(|block| matches!(block, MessageContent::Text { text } if text == crate::delegation::DELEGATION_HINT))
+                });
+                *self
+                    .observed_hint
+                    .lock()
+                    .expect("hint mutex should not be poisoned") = saw_hint;
+
+                Ok(StreamedTurn {
+                    assistant_message: ChatMessage::system("ok"),
+                    tool_calls: vec![],
+                    meta: None,
+                    stop_reason: StopReason::Stop,
+                })
+            }
+        }
+
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        session
+            .queue_delegation_hint(crate::delegation::DELEGATION_HINT)
+            .unwrap();
+        let turn = Turn::new().delegation(crate::delegation::DelegationConfig {
+            token_threshold: Some(u64::MAX),
+            tool_depth_threshold: None,
+        });
+        let mut make_provider = {
+            let provider = HintObservingProvider {
+                observed_hint: observed_hint.clone(),
+            };
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "keep going".to_string(),
+            Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            *observed_hint
+                .lock()
+                .expect("hint mutex should not be poisoned")
+        );
+        assert!(session.delegation_hint().unwrap().is_none());
+        let reloaded_session = crate::session::Session::new(&dir).unwrap();
+        assert!(reloaded_session.delegation_hint().unwrap().is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delegation_hint_accumulates_tool_calls_across_batches() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = temp_sessions_dir("delegation_tool_batches");
+        let observed_hints = Arc::new(Mutex::new(Vec::new()));
+
+        #[derive(Clone)]
+        struct HintObservingSequenceProvider {
+            observed_hints: Arc<Mutex<Vec<bool>>>,
+            call_index: Arc<Mutex<usize>>,
+        }
+
+        impl crate::llm::LlmProvider for HintObservingSequenceProvider {
+            async fn stream_completion(
+                &self,
+                messages: &[ChatMessage],
+                _tools: &[FunctionTool],
+                _on_token: &mut (dyn FnMut(String) + Send),
+            ) -> Result<StreamedTurn> {
+                let saw_hint = messages.iter().any(|message| {
+                    matches!(message.role, crate::llm::ChatRole::System)
+                        && message.content.iter().any(|block| matches!(block, MessageContent::Text { text } if text == crate::delegation::DELEGATION_HINT))
+                });
+                self.observed_hints
+                    .lock()
+                    .expect("hint mutex should not be poisoned")
+                    .push(saw_hint);
+
+                let mut call_index = self
+                    .call_index
+                    .lock()
+                    .expect("call index mutex should not be poisoned");
+                let turn = match *call_index {
+                    0 => StreamedTurn {
+                        assistant_message: ChatMessage::system("batch one"),
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "call-1".to_string(),
+                                name: "execute".to_string(),
+                                arguments: r#"{"command":"true"}"#.to_string(),
+                            },
+                            ToolCall {
+                                id: "call-2".to_string(),
+                                name: "execute".to_string(),
+                                arguments: r#"{"command":"true"}"#.to_string(),
+                            },
+                        ],
+                        meta: None,
+                        stop_reason: StopReason::ToolCalls,
+                    },
+                    1 => StreamedTurn {
+                        assistant_message: ChatMessage::system("batch two"),
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "call-3".to_string(),
+                                name: "execute".to_string(),
+                                arguments: r#"{"command":"true"}"#.to_string(),
+                            },
+                            ToolCall {
+                                id: "call-4".to_string(),
+                                name: "execute".to_string(),
+                                arguments: r#"{"command":"true"}"#.to_string(),
+                            },
+                        ],
+                        meta: None,
+                        stop_reason: StopReason::ToolCalls,
+                    },
+                    _ => StreamedTurn {
+                        assistant_message: ChatMessage::system("done"),
+                        tool_calls: vec![],
+                        meta: None,
+                        stop_reason: StopReason::Stop,
+                    },
+                };
+                *call_index += 1;
+                Ok(turn)
+            }
+        }
+
+        let mut session = crate::session::Session::new(&dir).unwrap();
+        session
+            .queue_delegation_hint(crate::delegation::DELEGATION_HINT)
+            .unwrap();
+
+        let turn = Turn::new()
+            .tool(Shell::new())
+            .delegation(crate::delegation::DelegationConfig {
+                token_threshold: None,
+                tool_depth_threshold: Some(3),
+            });
+        let mut make_provider = {
+            let provider = HintObservingSequenceProvider {
+                observed_hints: observed_hints.clone(),
+                call_index: Arc::new(Mutex::new(0)),
+            };
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        let verdict = run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "run the tools".to_string(),
+            Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(verdict, TurnVerdict::Executed(_)));
+        assert_eq!(
+            observed_hints
+                .lock()
+                .expect("hint mutex should not be poisoned")
+                .as_slice(),
+            &[true, true, true]
+        );
+        assert_eq!(
+            session.delegation_hint().unwrap().as_deref(),
+            Some(crate::delegation::DELEGATION_HINT)
+        );
+        let reloaded_session = crate::session::Session::new(&dir).unwrap();
+        assert_eq!(
+            reloaded_session.delegation_hint().unwrap().as_deref(),
+            Some(crate::delegation::DELEGATION_HINT)
+        );
+        assert!(!session.history().iter().any(|message| {
+            matches!(message.role, crate::llm::ChatRole::System)
+                && message.content.iter().any(|block| matches!(block, MessageContent::Text { text } if text == crate::delegation::DELEGATION_HINT))
+        }));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
