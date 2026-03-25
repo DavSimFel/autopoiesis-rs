@@ -8,6 +8,7 @@ pub mod gate;
 pub mod identity;
 pub mod llm;
 pub mod model_selection;
+pub mod plan;
 pub mod principal;
 pub mod read_tool;
 pub mod server;
