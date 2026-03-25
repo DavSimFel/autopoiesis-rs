@@ -5,7 +5,7 @@
 
 ## Overview
 
-27 source files, ~14.3K lines, 231 tests (230 run, 1 ignored).
+29 source files, ~17.8K lines, 288 tests (287 run, 1 ignored).
 
 ## Module map
 
@@ -19,6 +19,7 @@ session.rs (1296L)          JSONL persistence, token tracking, context trimming,
 subscription.rs (592L)      Subscription data layer: filters, path normalization, content loading, token utilization
 llm/openai.rs (1016L)       OpenAI Responses API, SSE streaming, incremental parsing
 llm/mod.rs (215L)           LlmProvider trait, message types, tool call structs
+model_selection.rs          Fail-closed model catalog/routing selection
 gate/mod.rs (324L)          Guard trait, Verdict/Severity enums, guard_text_output/guard_message_output
 gate/shell_safety.rs (718L) Policy-driven shell allow/deny, standing approvals (taint-gated),
                             compound command detection, protected credential path denial
@@ -34,6 +35,7 @@ tool.rs (665L)              Shell tool: async exec, RLIMIT, process-group kill, 
 store.rs (715L)             SQLite session registry + message queue + subscriptions table
 auth.rs (401L)              OAuth device flow, token storage/refresh
 config.rs                    agents.toml loading, ShellPolicy, BudgetConfig, resolved identity file lists
+spawn.rs                     Child-session creation, model resolution, budget preflight, completion enqueueing
 identity.rs                  Loads explicit identity file lists and template helpers
 principal.rs (92L)          Principal enum (Operator/User/System/Agent), trust/taint source mapping
 cli.rs (116L)               CLI display helpers, denial formatting
@@ -76,6 +78,11 @@ Guards check inbound messages, tool calls, and outbound text.
 ShellSafety uses a configurable policy (`[shell]` in agents.toml) with allow/deny patterns, standing approvals (skipped when tainted), and a default action.
 `GuardContext` carries `tainted: bool` + `BudgetSnapshot`. Taint is set when any message in history has a `User` or `System` principal (via `Principal::is_taint_source()`). Agent-authored messages do not taint.
 **Note:** these are heuristics, not a security boundary. See [../risks.md](../risks.md).
+
+### Model routing
+Model selection is config-only in this phase. `models.catalog` stores the enabled provider/model definitions, `models.routes` maps task kinds to preferred catalog keys, and `models.default` is the fail-closed fallback. Unknown task kinds do not invent a model; if routing does not produce an enabled catalog entry, spawn fails. `spawn_child()` resolves the final catalog key before persistence and stores the resolved name in child metadata for later runtime wiring.
+
+Pre-spawn budget validation happens before the child session is created. It checks the live `BudgetSnapshot` against session/day ceilings only; the per-turn ceiling remains part of the agent loop guard pipeline, not child spawn preflight.
 
 ### Shell output cap
 Every shell result is saved to `sessions/{id}/results/call_<sanitized_call_id>.txt` (call_id is sanitized for filesystem safety).

@@ -6,6 +6,7 @@ pub mod context;
 pub mod gate;
 pub mod identity;
 pub mod llm;
+pub mod model_selection;
 pub mod principal;
 pub mod server;
 pub mod session;

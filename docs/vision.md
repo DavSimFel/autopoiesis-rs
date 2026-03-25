@@ -105,7 +105,7 @@ Skills compose from existing primitives: subscriptions + topic context + standin
 T3 models chosen from a catalog in `agents.toml`:
 
 - **Catalog** — available models with provider, capabilities, cost, context window
-- **Routes** — task kinds mapped to required capabilities + preference order
+- **Routes** — task kinds listed in `requires`, then mapped to preference order
 - **Default** — fallback when no route matches
 - **Selection** — fail-closed: explicit override → route match → default → reject
 

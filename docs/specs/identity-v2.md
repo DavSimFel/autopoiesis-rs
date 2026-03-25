@@ -146,22 +146,22 @@ enabled = true
 ```
 
 ### Routes
-Task kinds mapped to required capabilities + preference order:
+Task kinds mapped to route requirements + preference order:
 ```toml
 [models.routes.code_review]
-requires = ["code"]
+requires = ["code_review"]
 prefer = ["gpt5_codex", "gpt5_mini"]
 ```
 
 ### Selection (fail-closed)
-1. Explicit model override → use if enabled, capable, in budget
-2. Route match by task kind → first valid in preference list
-3. Default model → only if it satisfies requirements
+1. Explicit model override → use if enabled and present in the catalog
+2. Route match by `requires` containing the task kind → first valid in preference list
+3. Default model → only if enabled and present in the catalog
 4. Nothing → reject spawn (`model_unavailable` or `budget_exceeded`)
 
 ### Rules
 - **One model per T3 lifetime.** No mid-task switching.
-- **Budget checked before spawn.** Never silently exceeds.
+- **Budget checked before spawn.** Session/day ceilings are enforced before spawn.
 - **Fallback degrades, never upgrades** cost class without explicit allowance.
 
 ---

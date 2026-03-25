@@ -22,7 +22,7 @@ cost_unit = 1
 enabled = true
 
 [models.routes.code_review]
-requires = ["code"]
+requires = ["code_review"]
 prefer = ["gpt5_mini"]
 
 [shell]

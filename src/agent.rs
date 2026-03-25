@@ -47,9 +47,10 @@ where
 pub fn spawn_child(
     store: &mut Store,
     config: &crate::config::Config,
+    parent_budget: crate::gate::BudgetSnapshot,
     request: SpawnRequest,
 ) -> Result<SpawnResult> {
-    crate::spawn::spawn_child(store, config, request)
+    crate::spawn::spawn_child(store, config, parent_budget, request)
 }
 
 pub enum TurnVerdict {
@@ -1119,22 +1120,65 @@ mod tests {
             queue: crate::config::QueueConfig::default(),
             identity_files: Vec::new(),
             agents: crate::config::AgentsConfig::default(),
-            models: Default::default(),
+            models: {
+                let mut models = crate::config::ModelsConfig::default();
+                models.default = Some("gpt-default".to_string());
+                models.catalog.insert(
+                    "gpt-default".to_string(),
+                    crate::config::ModelDefinition {
+                        provider: "openai".to_string(),
+                        model: "gpt-default".to_string(),
+                        caps: vec!["reasoning".to_string()],
+                        context_window: Some(128_000),
+                        cost_tier: Some("cheap".to_string()),
+                        cost_unit: Some(1),
+                        enabled: Some(true),
+                    },
+                );
+                models.catalog.insert(
+                    "gpt-child".to_string(),
+                    crate::config::ModelDefinition {
+                        provider: "openai".to_string(),
+                        model: "gpt-child".to_string(),
+                        caps: vec!["code_review".to_string()],
+                        context_window: Some(128_000),
+                        cost_tier: Some("medium".to_string()),
+                        cost_unit: Some(2),
+                        enabled: Some(true),
+                    },
+                );
+                models.routes.insert(
+                    "code_review".to_string(),
+                    crate::config::ModelRoute {
+                        requires: vec!["code_review".to_string()],
+                        prefer: vec!["gpt-child".to_string()],
+                    },
+                );
+                models
+            },
             domains: Default::default(),
             active_agent: Some("silas".to_string()),
         };
 
+        let parent_session = Session::new(sessions_dir.join("parent")).expect("parent session");
+        let parent_budget = parent_session
+            .budget_snapshot()
+            .expect("parent budget snapshot");
+
         let spawn_result = spawn_child(
             &mut store,
             &config,
+            parent_budget,
             SpawnRequest {
                 parent_session_id: "parent".to_string(),
                 task: "child task".to_string(),
+                task_kind: Some("code_review".to_string()),
                 model_override: Some("gpt-child".to_string()),
                 reasoning_override: Some("low".to_string()),
             },
         )
         .unwrap();
+        assert_eq!(spawn_result.resolved_model, "gpt-child");
 
         let mut session = Session::new(sessions_dir.join(&spawn_result.child_session_id)).unwrap();
         let turn = Turn::new();
