@@ -1,10 +1,12 @@
 //! Configuration loading for runtime defaults and optional `agents.toml` overrides.
 
 use std::collections::HashMap;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
+use thiserror::Error;
 
 use crate::identity;
 use crate::skills::SkillCatalog;
@@ -48,6 +50,53 @@ pub struct Config {
     pub skills: SkillCatalog,
     /// Selected named brain, if v2 config is active.
     pub active_agent: Option<String>,
+}
+
+/// Typed boundary error for config loading and spawned-child runtime reconstruction.
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("failed to read config file {path}: {source}")]
+    ReadFile {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to parse agents.toml: {source}")]
+    ParseAgents {
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("invalid child tier: {tier}")]
+    InvalidSpawnTier { tier: String },
+    #[error("spawned child config requires an active agent")]
+    MissingActiveAgent,
+    #[error("spawned child config missing active agent entry")]
+    MissingActiveAgentEntry,
+    #[error("spawned child config missing active agent definition")]
+    MissingActiveAgentDefinition,
+    #[error("{message}: {source}")]
+    Validation {
+        message: String,
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
+impl ConfigError {
+    fn validation(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self::Validation {
+            source: anyhow!(message.clone()),
+            message,
+        }
+    }
+
+    fn validation_with_source(message: impl Into<String>, source: anyhow::Error) -> Self {
+        Self::Validation {
+            message: message.into(),
+            source,
+        }
+    }
 }
 
 /// Optional budget ceilings loaded from `[budget]` in `agents.toml`.
@@ -99,6 +148,23 @@ pub(crate) const fn default_stale_processing_timeout_secs() -> u64 {
 impl Config {
     /// Load configuration from a file, falling back to sensible defaults.
     pub fn load(config_path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_typed(config_path).map_err(anyhow::Error::new)
+    }
+
+    /// Typed variant of [`Config::load`].
+    pub fn load_typed(config_path: impl AsRef<Path>) -> std::result::Result<Self, ConfigError> {
+        Self::from_file_typed(config_path)
+    }
+
+    /// Compatibility wrapper for callers that prefer the older name.
+    pub fn from_file(config_path: impl AsRef<Path>) -> Result<Self> {
+        Self::from_file_typed(config_path).map_err(anyhow::Error::new)
+    }
+
+    /// Typed variant of [`Config::from_file`].
+    pub fn from_file_typed(
+        config_path: impl AsRef<Path>,
+    ) -> std::result::Result<Self, ConfigError> {
         let mut config = Self {
             model: "gpt-5.4".to_string(),
             system_prompt: "You are a direct and capable coding agent. Execute tasks efficiently."
@@ -127,31 +193,40 @@ impl Config {
         let contents = match std::fs::read_to_string(config_path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                config.skills = SkillCatalog::load_from_dir(&config.skills_dir)
-                    .context("failed to load skills catalog")?;
+                config.skills =
+                    SkillCatalog::load_from_dir(&config.skills_dir).map_err(|source| {
+                        ConfigError::validation_with_source("failed to load skills catalog", source)
+                    })?;
                 return Ok(config);
             }
             Err(error) => {
-                return Err(anyhow!("failed to read config file: {error}"));
+                return Err(ConfigError::ReadFile {
+                    path: config_path.to_path_buf(),
+                    source: error,
+                });
             }
         };
 
-        let file_config: RuntimeFileConfig = toml::from_str(&contents)
-            .map_err(|error| anyhow!("failed to parse agents.toml: {error}"))?;
+        let file_config: RuntimeFileConfig =
+            toml::from_str(&contents).map_err(|source| ConfigError::ParseAgents { source })?;
 
         if file_config.agents.is_none() {
-            return Err(anyhow!(
-                "agents.toml must define at least one [agents.*] table"
+            return Err(ConfigError::validation(
+                "agents.toml must define at least one [agents.*] table",
             ));
         }
 
         config.models = file_config.models;
         config.domains = file_config.domains;
-        validate_read_tool_config(&file_config.read)?;
+        validate_read_tool_config(&file_config.read).map_err(|source| {
+            ConfigError::validation_with_source("invalid [read] config", source)
+        })?;
         config.read = file_config.read;
 
         if let Some(agents) = file_config.agents {
-            let (active_name, active_agent) = select_active_agent(&agents)?;
+            let (active_name, active_agent) = select_active_agent(&agents).map_err(|source| {
+                ConfigError::validation_with_source("invalid active agent selection", source)
+            })?;
             config.active_agent = Some(active_name.clone());
             config.agents = agents;
 
@@ -165,7 +240,9 @@ impl Config {
                 .identity
                 .clone()
                 .unwrap_or_else(|| active_name.clone());
-            validate_agent_identity(&selected_identity)?;
+            validate_agent_identity(&selected_identity).map_err(|source| {
+                ConfigError::validation_with_source("invalid active agent identity", source)
+            })?;
 
             config.identity_files = if use_t2_files {
                 identity::t2_identity_files("identity-templates")
@@ -173,22 +250,24 @@ impl Config {
                 identity::t1_identity_files("identity-templates", &selected_identity)
             };
             if !config.domains.entries.is_empty() && config.domains.selected.is_empty() {
-                return Err(anyhow!(
-                    "domains config must select at least one context pack"
+                return Err(ConfigError::validation(
+                    "domains config must select at least one context pack",
                 ));
             }
             for domain_name in &config.domains.selected {
                 let Some(domain) = config.domains.entries.get(domain_name) else {
-                    return Err(anyhow!(
+                    return Err(ConfigError::validation(format!(
                         "selected domain pack is missing from [domains]: {domain_name}"
-                    ));
+                    )));
                 };
                 let Some(path) = domain.context_extend.as_ref() else {
-                    return Err(anyhow!(
+                    return Err(ConfigError::validation(format!(
                         "selected domain pack is missing context_extend: {domain_name}"
-                    ));
+                    )));
                 };
-                validate_domain_context_extend(path)?;
+                validate_domain_context_extend(path).map_err(|source| {
+                    ConfigError::validation_with_source("invalid domain context_extend", source)
+                })?;
                 config.identity_files.push(PathBuf::from(path));
             }
             if let Some(model) = selected_tier
@@ -250,12 +329,148 @@ impl Config {
         };
         config.skills_dir = skills_dir;
         config.skills_dir_resolved = resolved_skills_dir.clone();
-        config.skills = SkillCatalog::load_from_dir(&config.skills_dir_resolved)
-            .context("failed to load skills catalog")?;
+        config.skills =
+            SkillCatalog::load_from_dir(&config.skills_dir_resolved).map_err(|source| {
+                ConfigError::validation_with_source("failed to load skills catalog", source)
+            })?;
 
         if let Ok(operator_key) = std::env::var("AUTOPOIESIS_OPERATOR_KEY") {
             config.operator_key = Some(operator_key);
         }
+
+        Ok(config)
+    }
+
+    /// Clone the current runtime config and retarget it for a spawned child session.
+    pub fn with_spawned_child_runtime(
+        &self,
+        tier: &str,
+        provider_model: &str,
+        reasoning_override: Option<&str>,
+    ) -> Result<Self> {
+        self.with_spawned_child_runtime_typed(tier, provider_model, reasoning_override)
+            .map_err(anyhow::Error::new)
+    }
+
+    /// Typed variant of [`Config::with_spawned_child_runtime`].
+    pub fn with_spawned_child_runtime_typed(
+        &self,
+        tier: &str,
+        provider_model: &str,
+        reasoning_override: Option<&str>,
+    ) -> std::result::Result<Self, ConfigError> {
+        let mut config = self.clone();
+        validate_spawn_tier(tier).map_err(|_| ConfigError::InvalidSpawnTier {
+            tier: tier.to_string(),
+        })?;
+
+        let parent_reasoning_effort = config.reasoning_effort.clone();
+        let parent_session_name = config.session_name.clone();
+        let active_name = config
+            .active_agent
+            .clone()
+            .ok_or(ConfigError::MissingActiveAgent)?;
+
+        let selected_identity = {
+            let agent = config
+                .agents
+                .entries
+                .get_mut(&active_name)
+                .ok_or(ConfigError::MissingActiveAgentEntry)?;
+            agent.tier = Some(tier.to_string());
+            agent
+                .identity
+                .clone()
+                .unwrap_or_else(|| active_name.clone())
+        };
+
+        config.identity_files = if matches!(tier, "t2" | "t3") {
+            identity::t2_identity_files("identity-templates")
+        } else {
+            identity::t1_identity_files("identity-templates", &selected_identity)
+        };
+        if !config.domains.entries.is_empty() && config.domains.selected.is_empty() {
+            return Err(ConfigError::validation(
+                "domains config must select at least one context pack",
+            ));
+        }
+        for domain_name in &config.domains.selected {
+            let Some(domain) = config.domains.entries.get(domain_name) else {
+                return Err(ConfigError::validation(format!(
+                    "selected domain pack is missing from [domains]: {domain_name}"
+                )));
+            };
+            let Some(path) = domain.context_extend.as_ref() else {
+                return Err(ConfigError::validation(format!(
+                    "selected domain pack is missing context_extend: {domain_name}"
+                )));
+            };
+            validate_domain_context_extend(path).map_err(|source| {
+                ConfigError::validation_with_source("invalid domain context_extend", source)
+            })?;
+            config.identity_files.push(PathBuf::from(path));
+        }
+
+        config.model = provider_model.to_string();
+        config.reasoning_effort = reasoning_override.map(ToString::to_string).or_else(|| {
+            let agent = config.active_agent_definition()?;
+            let tier_config = if matches!(tier, "t2" | "t3") {
+                &agent.t2
+            } else {
+                &agent.t1
+            };
+            tier_config
+                .reasoning
+                .clone()
+                .or_else(|| tier_config.reasoning_effort.clone())
+                .or_else(|| agent.reasoning_effort.clone())
+                .or(parent_reasoning_effort.clone())
+        });
+        config.base_url = {
+            let agent = config
+                .active_agent_definition()
+                .ok_or(ConfigError::MissingActiveAgentDefinition)?;
+            let tier_config = if matches!(tier, "t2" | "t3") {
+                &agent.t2
+            } else {
+                &agent.t1
+            };
+            tier_config
+                .base_url
+                .clone()
+                .or_else(|| agent.base_url.clone())
+                .unwrap_or_else(|| config.base_url.clone())
+        };
+        config.system_prompt = {
+            let agent = config
+                .active_agent_definition()
+                .ok_or(ConfigError::MissingActiveAgentDefinition)?;
+            let tier_config = if matches!(tier, "t2" | "t3") {
+                &agent.t2
+            } else {
+                &agent.t1
+            };
+            tier_config
+                .system_prompt
+                .clone()
+                .or_else(|| agent.system_prompt.clone())
+                .unwrap_or_else(|| config.system_prompt.clone())
+        };
+        config.session_name = {
+            let agent = config
+                .active_agent_definition()
+                .ok_or(ConfigError::MissingActiveAgentDefinition)?;
+            let tier_config = if matches!(tier, "t2" | "t3") {
+                &agent.t2
+            } else {
+                &agent.t1
+            };
+            tier_config
+                .session_name
+                .clone()
+                .or_else(|| agent.session_name.clone())
+                .or(parent_session_name.clone())
+        };
 
         Ok(config)
     }
@@ -1020,13 +1235,13 @@ struct RuntimeFileConfig {
     queue: QueueConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 pub struct AgentsConfig {
     #[serde(flatten, default)]
     pub entries: HashMap<String, AgentDefinition>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 pub struct AgentDefinition {
     pub identity: Option<String>,
     #[serde(default)]
@@ -1047,7 +1262,7 @@ pub struct AgentDefinition {
     pub t2: AgentTierConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 pub struct AgentTierConfig {
     #[serde(default)]
     pub model: Option<String>,
@@ -1067,7 +1282,7 @@ pub struct AgentTierConfig {
     pub delegation_tool_depth: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 pub struct ModelsConfig {
     #[serde(default)]
     pub default: Option<String>,
@@ -1101,7 +1316,7 @@ pub struct ModelRoute {
     pub prefer: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 pub struct DomainsConfig {
     #[serde(default)]
     pub selected: Vec<String>,
@@ -1109,7 +1324,7 @@ pub struct DomainsConfig {
     pub entries: HashMap<String, DomainConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 pub struct DomainConfig {
     pub context_extend: Option<String>,
 }
@@ -1203,6 +1418,174 @@ mod domain_context_extend_tests {
                 .contains("domain context_extend must stay under identity-templates/")
         );
     }
+
+    #[test]
+    fn typed_load_matches_wrapper_for_valid_config() {
+        let path = temp_toml_path(
+            "typed_load",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-5.4-mini'\n",
+        );
+
+        let typed = Config::load_typed(&path).expect("typed load should succeed");
+        let wrapped = Config::load(&path).expect("wrapper load should succeed");
+
+        assert_eq!(typed.model, wrapped.model);
+        assert_eq!(typed.system_prompt, wrapped.system_prompt);
+        assert_eq!(typed.reasoning_effort, wrapped.reasoning_effort);
+        assert_eq!(typed.base_url, wrapped.base_url);
+        assert_eq!(typed.session_name, wrapped.session_name);
+        assert_eq!(typed.active_agent, wrapped.active_agent);
+        assert_eq!(typed.agents, wrapped.agents);
+        assert_eq!(typed.models, wrapped.models);
+        assert_eq!(typed.domains, wrapped.domains);
+        assert_eq!(typed.read, wrapped.read);
+        assert_eq!(typed.skills_dir, wrapped.skills_dir);
+        assert_eq!(typed.skills_dir_resolved, wrapped.skills_dir_resolved);
+        assert_eq!(typed.operator_key, wrapped.operator_key);
+        assert_eq!(typed.identity_files, wrapped.identity_files);
+    }
+
+    #[test]
+    fn typed_spawned_child_runtime_matches_wrapper_for_valid_config() {
+        let path = temp_toml_path(
+            "typed_spawned_child",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nbase_url='https://example.test/api'\nsystem_prompt='legacy defaults'\nsession_name='legacy-session'\nmodel='gpt-5.4-mini'\nreasoning='medium'\n[agents.silas.t2]\nmodel='o3'\nreasoning='xhigh'\n",
+        );
+
+        let config = Config::load(&path).expect("expected config to load");
+        let typed = config
+            .with_spawned_child_runtime_typed("t1", "gpt-5.4-mini", None)
+            .expect("typed child runtime should succeed");
+        let wrapped = config
+            .with_spawned_child_runtime("t1", "gpt-5.4-mini", None)
+            .expect("wrapper child runtime should succeed");
+
+        assert_eq!(typed.model, wrapped.model);
+        assert_eq!(typed.base_url, wrapped.base_url);
+        assert_eq!(typed.session_name, wrapped.session_name);
+        assert_eq!(typed.system_prompt, wrapped.system_prompt);
+        assert_eq!(typed.reasoning_effort, wrapped.reasoning_effort);
+        assert_eq!(typed.active_agent, wrapped.active_agent);
+        assert_eq!(typed.agents, wrapped.agents);
+        assert_eq!(typed.models, wrapped.models);
+        assert_eq!(typed.domains, wrapped.domains);
+        assert_eq!(typed.read, wrapped.read);
+        assert_eq!(typed.skills_dir, wrapped.skills_dir);
+        assert_eq!(typed.skills_dir_resolved, wrapped.skills_dir_resolved);
+        assert_eq!(typed.operator_key, wrapped.operator_key);
+        assert_eq!(typed.identity_files, wrapped.identity_files);
+    }
+
+    #[test]
+    fn typed_load_reports_parse_errors_with_structured_variant() {
+        let path = temp_toml_path("typed_load_parse_error", "this is not valid toml = [");
+
+        let error = Config::load_typed(&path).expect_err("typed load should fail");
+        assert!(matches!(error, ConfigError::ParseAgents { .. }));
+    }
+
+    #[test]
+    fn typed_load_reports_read_errors_with_structured_variant() {
+        let path = std::env::temp_dir().join(format!(
+            "autopoiesis-typed-load-read-error-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after UNIX_EPOCH")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).expect("expected temp directory to be creatable");
+
+        let error = Config::load_typed(&path).expect_err("typed load should fail");
+        assert!(matches!(error, ConfigError::ReadFile { .. }));
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn typed_load_reports_validation_errors_with_structured_variant() {
+        let path = temp_toml_path(
+            "typed_load_validation_error",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-5.4-mini'\n[domains.foo]\ncontext_extend='skills/readme.md'\n",
+        );
+
+        let error = Config::load_typed(&path).expect_err("typed load should fail");
+        assert!(matches!(error, ConfigError::Validation { .. }));
+    }
+
+    #[test]
+    fn typed_spawned_child_runtime_reports_missing_active_agent_structurally() {
+        let path = temp_toml_path(
+            "typed_spawned_child_missing_active_agent",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-5.4-mini'\n",
+        );
+        let mut config = Config::load(&path).expect("expected config to load");
+        config.active_agent = None;
+
+        let error = config
+            .with_spawned_child_runtime_typed("t1", "gpt-5.4-mini", None)
+            .expect_err("typed child runtime should fail");
+        assert!(matches!(error, ConfigError::MissingActiveAgent));
+    }
+
+    #[test]
+    fn load_wrapper_reports_parse_error_message() {
+        let path = temp_toml_path("load_wrapper_parse_error", "this is not valid toml = [");
+
+        let error = Config::load(&path).expect_err("wrapper load should fail");
+        assert!(error.to_string().contains("failed to parse agents.toml"));
+    }
+
+    #[test]
+    fn load_wrapper_reports_read_error_message() {
+        let path = std::env::temp_dir().join(format!(
+            "autopoiesis-load-wrapper-read-error-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after UNIX_EPOCH")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).expect("expected temp directory to be creatable");
+
+        let error = Config::load(&path).expect_err("wrapper load should fail");
+        assert!(error.to_string().contains("failed to read config file"));
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn load_wrapper_reports_validation_error_message() {
+        let path = temp_toml_path("load_wrapper_validation_error", "[shell]\n");
+
+        let error = Config::load(&path).expect_err("wrapper load should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("agents.toml must define at least one [agents.*] table")
+        );
+    }
+
+    #[test]
+    fn spawned_child_wrapper_reports_missing_active_agent_message() {
+        let path = temp_toml_path(
+            "spawned_child_wrapper_missing_active_agent",
+            "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-5.4-mini'\n",
+        );
+        let mut config = Config::load(&path).expect("expected config to load");
+        config.active_agent = None;
+
+        let error = config
+            .with_spawned_child_runtime("t1", "gpt-5.4-mini", None)
+            .expect_err("wrapper child runtime should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("spawned child config requires an active agent")
+        );
+    }
 }
 
 /// Shell execution policy loaded from `[shell]` in `agents.toml`.
@@ -1268,125 +1651,6 @@ impl Config {
     /// Resolve the active T1 tier config for the current brain, if available.
     pub fn active_t1_config(&self) -> Option<&AgentTierConfig> {
         self.active_agent_definition().map(|agent| &agent.t1)
-    }
-
-    /// Clone the current runtime config and retarget it for a spawned child session.
-    pub fn with_spawned_child_runtime(
-        &self,
-        tier: &str,
-        provider_model: &str,
-        reasoning_override: Option<&str>,
-    ) -> Result<Self> {
-        validate_spawn_tier(tier)?;
-
-        let mut config = self.clone();
-        let parent_reasoning_effort = config.reasoning_effort.clone();
-        let parent_session_name = config.session_name.clone();
-        let active_name = config
-            .active_agent
-            .clone()
-            .ok_or_else(|| anyhow!("spawned child config requires an active agent"))?;
-
-        let selected_identity = {
-            let agent = config
-                .agents
-                .entries
-                .get_mut(&active_name)
-                .ok_or_else(|| anyhow!("spawned child config missing active agent entry"))?;
-            agent.tier = Some(tier.to_string());
-            agent
-                .identity
-                .clone()
-                .unwrap_or_else(|| active_name.clone())
-        };
-
-        config.identity_files = if matches!(tier, "t2" | "t3") {
-            identity::t2_identity_files("identity-templates")
-        } else {
-            identity::t1_identity_files("identity-templates", &selected_identity)
-        };
-        if !config.domains.entries.is_empty() && config.domains.selected.is_empty() {
-            return Err(anyhow!(
-                "domains config must select at least one context pack"
-            ));
-        }
-        for domain_name in &config.domains.selected {
-            let Some(domain) = config.domains.entries.get(domain_name) else {
-                return Err(anyhow!(
-                    "selected domain pack is missing from [domains]: {domain_name}"
-                ));
-            };
-            let Some(path) = domain.context_extend.as_ref() else {
-                return Err(anyhow!(
-                    "selected domain pack is missing context_extend: {domain_name}"
-                ));
-            };
-            validate_domain_context_extend(path)?;
-            config.identity_files.push(PathBuf::from(path));
-        }
-
-        config.model = provider_model.to_string();
-        config.reasoning_effort = reasoning_override.map(ToString::to_string).or_else(|| {
-            let agent = config.active_agent_definition()?;
-            let tier_config = if matches!(tier, "t2" | "t3") {
-                &agent.t2
-            } else {
-                &agent.t1
-            };
-            tier_config
-                .reasoning
-                .clone()
-                .or_else(|| tier_config.reasoning_effort.clone())
-                .or_else(|| agent.reasoning_effort.clone())
-                .or(parent_reasoning_effort.clone())
-        });
-        config.base_url = {
-            let agent = config
-                .active_agent_definition()
-                .ok_or_else(|| anyhow!("spawned child config missing active agent definition"))?;
-            let tier_config = if matches!(tier, "t2" | "t3") {
-                &agent.t2
-            } else {
-                &agent.t1
-            };
-            tier_config
-                .base_url
-                .clone()
-                .or_else(|| agent.base_url.clone())
-                .unwrap_or_else(|| config.base_url.clone())
-        };
-        config.system_prompt = {
-            let agent = config
-                .active_agent_definition()
-                .ok_or_else(|| anyhow!("spawned child config missing active agent definition"))?;
-            let tier_config = if matches!(tier, "t2" | "t3") {
-                &agent.t2
-            } else {
-                &agent.t1
-            };
-            tier_config
-                .system_prompt
-                .clone()
-                .or_else(|| agent.system_prompt.clone())
-                .unwrap_or_else(|| config.system_prompt.clone())
-        };
-        config.session_name = {
-            let agent = config
-                .active_agent_definition()
-                .ok_or_else(|| anyhow!("spawned child config missing active agent definition"))?;
-            let tier_config = if matches!(tier, "t2" | "t3") {
-                &agent.t2
-            } else {
-                &agent.t1
-            };
-            tier_config
-                .session_name
-                .clone()
-                .or_else(|| agent.session_name.clone())
-                .or(parent_session_name.clone())
-        };
-
-        Ok(config)
     }
 }
 

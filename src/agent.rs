@@ -14,6 +14,7 @@ use crate::store::{QueuedMessage, Store};
 use crate::turn::Turn;
 use crate::util::utc_timestamp;
 use tracing::{debug, info, warn};
+
 const MAX_DENIALS_PER_TURN: usize = 2;
 
 /// Receiver of streaming tokens emitted by the model during completion.

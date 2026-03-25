@@ -22,11 +22,13 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
 
+use crate::auth as root_auth;
 use crate::principal::Principal;
-use crate::{agent, auth, config, llm, session, store, turn};
-use tracing::{info, warn};
+use crate::{agent, config, llm, session, store, turn};
+use tracing::{error, info, warn};
 
 const API_KEY_HEADER: &str = "x-api-key";
 
@@ -93,6 +95,62 @@ struct WsApprovalRequest {
 struct WsApprovalDecision {
     request_id: u64,
     approved: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum HttpError {
+    #[error("{0}")]
+    BadRequest(&'static str),
+    #[error("{0}")]
+    Unauthorized(&'static str),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+impl HttpError {
+    pub fn bad_request(message: &'static str) -> Self {
+        Self::BadRequest(message)
+    }
+
+    pub fn unauthorized(message: &'static str) -> Self {
+        Self::Unauthorized(message)
+    }
+}
+
+#[derive(Serialize)]
+struct ErrorBody {
+    error: String,
+}
+
+impl IntoResponse for HttpError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::BadRequest(message) => (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: message.to_string(),
+                }),
+            )
+                .into_response(),
+            Self::Unauthorized(message) => (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorBody {
+                    error: message.to_string(),
+                }),
+            )
+                .into_response(),
+            Self::Internal(error) => {
+                error!(%error, "internal server error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorBody {
+                        error: "internal server error".to_string(),
+                    }),
+                )
+                    .into_response()
+            }
+        }
+    }
 }
 
 impl ServerState {
@@ -285,23 +343,23 @@ async fn health_check() -> Json<HealthResponse> {
 async fn create_session(
     State(state): State<ServerState>,
     Json(payload): Json<CreateSessionRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, HttpError> {
     let session_id = generate_session_id();
     let metadata = payload.metadata.unwrap_or_else(|| json!({})).to_string();
 
     let mut store = state.store.lock().await;
     match store.create_session(&session_id, Some(&metadata)) {
-        Ok(()) => (StatusCode::OK, Json(CreateSessionResponse { session_id })).into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Ok(()) => Ok((StatusCode::OK, Json(CreateSessionResponse { session_id }))),
+        Err(error) => Err(HttpError::Internal(error)),
     }
 }
 
 #[tracing::instrument(level = "debug", skip(state))]
-async fn list_sessions(State(state): State<ServerState>) -> impl IntoResponse {
+async fn list_sessions(State(state): State<ServerState>) -> Result<impl IntoResponse, HttpError> {
     let store = state.store.lock().await;
     match store.list_sessions() {
-        Ok(sessions) => Json(SessionListResponse { sessions }).into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Ok(sessions) => Ok(Json(SessionListResponse { sessions })),
+        Err(error) => Err(HttpError::Internal(error)),
     }
 }
 
@@ -311,14 +369,14 @@ async fn enqueue_message(
     Extension(principal): Extension<Principal>,
     Path(session_id): Path<String>,
     Json(payload): Json<EnqueueMessageRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, HttpError> {
     if !validate_session_id(&session_id) {
-        return (StatusCode::BAD_REQUEST, "invalid session id").into_response();
+        return Err(HttpError::bad_request("invalid session id"));
     }
 
     let mut store = state.store.lock().await;
     if let Err(error) = store.create_session(&session_id, None) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        return Err(HttpError::Internal(error));
     }
 
     let role = principal.role_for_request(payload.role.as_deref());
@@ -327,9 +385,9 @@ async fn enqueue_message(
         Ok(message_id) => {
             drop(store);
             spawn_http_queue_worker(state.clone(), session_id.clone());
-            (StatusCode::OK, Json(EnqueueMessageResponse { message_id })).into_response()
+            Ok((StatusCode::OK, Json(EnqueueMessageResponse { message_id })))
         }
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => Err(HttpError::Internal(error)),
     }
 }
 
@@ -339,12 +397,11 @@ async fn ws_session(
     Extension(principal): Extension<Principal>,
     Path(session_id): Path<String>,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, HttpError> {
     if !validate_session_id(&session_id) {
-        return (StatusCode::BAD_REQUEST, "invalid session id").into_response();
+        return Err(HttpError::bad_request("invalid session id"));
     }
-    ws.on_upgrade(move |socket| websocket_session(state, session_id, principal, socket))
-        .into_response()
+    Ok(ws.on_upgrade(move |socket| websocket_session(state, session_id, principal, socket)))
 }
 
 #[tracing::instrument(level = "debug", skip(state, socket), fields(session_id = %session_id, principal = ?principal))]
@@ -424,7 +481,7 @@ async fn websocket_session(
                 let client = client.clone();
                 let config = config.clone();
                 async move {
-                    let api_key = auth::get_valid_token().await?;
+                    let api_key = root_auth::get_valid_token().await?;
                     Ok::<llm::openai::OpenAIProvider, anyhow::Error>(
                         llm::openai::OpenAIProvider::with_client(
                             client,
@@ -520,7 +577,7 @@ async fn authenticate(
         }
     }
 
-    (StatusCode::UNAUTHORIZED, "missing or invalid api key").into_response()
+    HttpError::unauthorized("missing or invalid api key").into_response()
 }
 
 fn principal_for_token(state: &ServerState, token: &str) -> Option<Principal> {
@@ -545,7 +602,7 @@ fn spawn_http_queue_worker(state: ServerState, session_id: String) {
                 let client = client.clone();
                 let config = config.clone();
                 async move {
-                    let api_key = auth::get_valid_token().await?;
+                    let api_key = root_auth::get_valid_token().await?;
                     Ok::<llm::openai::OpenAIProvider, anyhow::Error>(
                         llm::openai::OpenAIProvider::with_client(
                             client,
@@ -1806,5 +1863,44 @@ mod tests {
         }
 
         assert!(matches!(frame_rx.recv().await.unwrap(), WsFrame::Done));
+    }
+
+    #[tokio::test]
+    async fn http_error_bad_request_maps_to_400_with_json_body() {
+        let response = HttpError::bad_request("invalid session id").into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            r#"{"error":"invalid session id"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn http_error_unauthorized_maps_to_401_with_json_body() {
+        let response = HttpError::unauthorized("missing or invalid api key").into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            r#"{"error":"missing or invalid api key"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn http_error_internal_maps_to_500_with_json_body() {
+        let response = HttpError::from(anyhow::anyhow!("boom")).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            r#"{"error":"internal server error"}"#
+        );
     }
 }
