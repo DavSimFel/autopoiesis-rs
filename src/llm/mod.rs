@@ -28,6 +28,7 @@ pub struct TurnMeta {
     pub reasoning_trace: Option<String>,
 }
 
+pub mod history_groups;
 pub mod openai;
 
 /// Role of a chat message in the message history.

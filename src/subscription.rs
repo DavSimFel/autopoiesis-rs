@@ -4,7 +4,6 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tiktoken_rs::cl100k_base_singleton;
 
 use crate::store::SubscriptionRow;
 
@@ -287,11 +286,7 @@ pub fn ensure_readable_subscription_path(path: impl AsRef<Path>) -> Result<()> {
 }
 
 pub fn estimate_tokens(text: &str) -> usize {
-    if text.is_empty() {
-        0
-    } else {
-        cl100k_base_singleton().encode_ordinary(text).len()
-    }
+    crate::llm::history_groups::estimate_text_tokens(text)
 }
 
 fn normalize_lexical_path(path: &Path) -> PathBuf {
