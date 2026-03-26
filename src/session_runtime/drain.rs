@@ -44,7 +44,7 @@ pub(crate) struct StoreDrainBackend<'a> {
 }
 
 impl<'a> StoreDrainBackend<'a> {
-    pub fn new(store: &'a mut Store) -> Self {
+    pub(crate) fn new(store: &'a mut Store) -> Self {
         Self { store }
     }
 }
@@ -95,7 +95,7 @@ pub(crate) struct SharedStoreDrainBackend {
 }
 
 impl SharedStoreDrainBackend {
-    pub fn new(store: Arc<Mutex<Store>>) -> Self {
+    pub(crate) fn new(store: Arc<Mutex<Store>>) -> Self {
         Self { store }
     }
 }
@@ -400,6 +400,62 @@ where
         session_id,
         session,
         FreshTurnProcessor::new(turn_builder, make_provider, token_sink, approval_handler),
+    )
+    .await
+}
+
+pub async fn drain_queue_with_store<F, Fut, P, TB>(
+    store: &mut Store,
+    session_id: &str,
+    session: &mut Session,
+    turn_builder: &mut TB,
+    make_provider: &mut F,
+    token_sink: &mut (dyn TokenSink + Send),
+    approval_handler: &mut (dyn ApprovalHandler + Send),
+) -> Result<(Option<TurnVerdict>, bool, Option<String>)>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: Future<Output = Result<P>> + Send,
+    P: LlmProvider + Send,
+    TB: FnMut() -> Result<Turn> + Send,
+{
+    let mut backend = StoreDrainBackend::new(store);
+    drain_queue_with_stats_fresh_turns(
+        &mut backend,
+        session_id,
+        session,
+        turn_builder,
+        make_provider,
+        token_sink,
+        approval_handler,
+    )
+    .await
+}
+
+pub async fn drain_queue_with_shared_store<F, Fut, P, TB>(
+    store: Arc<Mutex<Store>>,
+    session_id: &str,
+    session: &mut Session,
+    turn_builder: &mut TB,
+    make_provider: &mut F,
+    token_sink: &mut (dyn TokenSink + Send),
+    approval_handler: &mut (dyn ApprovalHandler + Send),
+) -> Result<(Option<TurnVerdict>, bool, Option<String>)>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: Future<Output = Result<P>> + Send,
+    P: LlmProvider + Send,
+    TB: FnMut() -> Result<Turn> + Send,
+{
+    let mut backend = SharedStoreDrainBackend::new(store);
+    drain_queue_with_stats_fresh_turns(
+        &mut backend,
+        session_id,
+        session,
+        turn_builder,
+        make_provider,
+        token_sink,
+        approval_handler,
     )
     .await
 }

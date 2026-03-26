@@ -4,7 +4,7 @@ Basis for this plan: `AGENTS.md`, `agents.toml`, `Cargo.toml`, `docs/architectur
 
 Counting note: `prod` means code outside `#[cfg(test)]` modules and dedicated test-only files. `test` means inline `#[cfg(test)]` code plus dedicated test-only files. `src/` totals: `15,754 prod / 20,353 test / 36,107 total`.
 
-Historical note: this document captures the pre-split module layout as the basis for the restructuring work. The `src/context.rs` and `src/turn.rs` references below are migration anchors, not the current module roots.
+Working note: this document tracks the restructuring work and uses the file names below as current-state anchors where the split has already landed.
 
 ## 1. Current State
 
@@ -13,7 +13,7 @@ Historical note: this document captures the pre-split module layout as the basis
 | Path | Prod | Test | What it actually does today |
 | --- | ---: | ---: | --- |
 | `src/auth.rs` | 364 | 49 | Runs local OpenAI device-code auth, token refresh, token persistence, and auth HTTP helpers. |
-| `src/cli.rs` | 118 | 64 | Implements terminal token streaming, approval prompts, and denial formatting; it is terminal UI, not CLI argument parsing. |
+| `src/terminal_ui.rs` | 118 | 64 | Implements terminal token streaming, approval prompts, and denial formatting; it is terminal UI, not CLI argument parsing. |
 | `src/config/mod.rs` | split | split | Facade reexports for the split config module. |
 | `src/context.rs` | 555 | 791 | Defines context providers for identity, skills, subscriptions, and history, and also contains token-bounded history replay logic. |
 | `src/delegation.rs` | 60 | 129 | Holds delegation thresholds and the logic that decides when to suggest T2 delegation. |
@@ -32,7 +32,7 @@ Historical note: this document captures the pre-split module layout as the basis
 | `src/template.rs` | 13 | 73 | Performs simple `{{var}}` template substitution. |
 | `src/tool.rs` | 491 | 222 | Defines the `Tool` trait and the shell `execute` tool with timeouts, RLIMITs, process-group kill, and bounded output capture. |
 | `src/turn.rs` | 436 | 1160 | Defines the `Turn` runtime object, guard precedence, taint handling, and all T1/T2/T3 turn builders. |
-| `src/util.rs` | 99 | 95 | Mixes tracing formatter/output-target helpers with UTC timestamp generation. |
+| `src/logging.rs` | 99 | 95 | Tracing formatter/output-target helpers. UTC timestamp generation now lives in `src/time.rs`. |
 
 ### `src/agent/`
 
@@ -137,7 +137,7 @@ Historical note: this document captures the pre-split module layout as the basis
 
 - **`src/main.rs` is a binary god-object.**
   - Clap types, tracing, auth commands, plan commands, subscription commands, server launch, REPL, and one-shot prompt execution are all in one file.
-  - `src/cli.rs` is misnamed because it is not the CLI parser; it is terminal I/O.
+  - `src/terminal_ui.rs` is terminal I/O; the CLI parser lives in `src/app/args.rs`.
 
 - **`src/server/queue.rs` owns three unrelated responsibilities.**
   - Server-side per-session locking: `src/server/queue.rs:12-40`
@@ -166,13 +166,13 @@ Historical note: this document captures the pre-split module layout as the basis
 
 - **Naming problems hide responsibilities.**
   - `src/spawn.rs` and `src/agent/spawn.rs` do different jobs but share the same module name.
-  - `src/cli.rs` is terminal UI; the actual CLI is in `src/main.rs`.
+  - `src/terminal_ui.rs` is terminal UI; the actual CLI parser is in `src/app/args.rs` and the entrypoint wiring is in `src/main.rs`.
   - `src/context.rs::Identity` is a context source, not the identity loader.
-  - `src/util.rs` is not “misc”; it contains logging and time utilities.
+  - `src/logging.rs` contains the tracing formatter and user-output targets; `src/util.rs` now only holds time helpers.
 
 - **Small but real shared helpers are duplicated instead of centralized.**
-  - Denial formatting is duplicated in `src/agent/loop_impl.rs:120-122` and `src/cli.rs:117-119`
-  - UTC formatting logic is duplicated between `src/util.rs:55-92` and `src/store.rs:1936-2015`
+  - Denial formatting is duplicated in `src/agent/loop_impl.rs:120-122` and `src/terminal_ui.rs:95-100`
+  - UTC formatting logic is duplicated between `src/time.rs:1-32` and `src/store.rs:1936-2015`
 
 - **Large inline test blocks still dominate several production files.**
   - Biggest offenders: `src/store.rs`, `src/config/mod.rs`, `src/context.rs`, `src/session.rs`, `src/turn.rs`, `src/plan/runner.rs`
@@ -316,7 +316,7 @@ src/
 | `src/app/plan_commands.rs` | Owns plan CLI helpers and handlers. | `plan_run_retries`, `resolve_plan_run_for_status`, `format_plan_run_summary`, and `handle_plan_command()` from `src/main.rs:300-420`. |
 | `src/app/subscription_commands.rs` | Owns subscription CLI helpers and handlers. | `default_subscription_topic`, `subscription_filter`, rendering helpers, and `handle_subscription_command()` from `src/main.rs:184-299` and `src/main.rs:422-500`. |
 | `src/app/session_run.rs` | Runs the interactive REPL and one-shot CLI session path. | The no-subcommand branch from `src/main.rs:560-700`, after it starts using `session_runtime::factory`. |
-| `src/terminal_ui.rs` | Terminal token output, approval prompting, and denial rendering. | Rename/move current `src/cli.rs`. |
+| `src/terminal_ui.rs` | Terminal token output, approval prompting, and denial rendering. | Current terminal UI module. |
 | `src/logging.rs` | Tracing formatter and user-output tracing targets. | `PlainMessageFormatter`, `STDOUT_USER_OUTPUT_TARGET`, and `STDERR_USER_OUTPUT_TARGET` from `src/util.rs`. |
 | `src/time.rs` | UTC timestamp formatting helpers shared by store/session/plan. | `utc_timestamp()` from `src/util.rs` and `format_system_time()` from `src/store.rs`. |
 | `src/config/mod.rs` | Public config facade and reexports. | Public API surface currently split across `src/config/{runtime,load,spawn_runtime,agents,models,domains,policy,file_schema}.rs`. |
@@ -459,7 +459,7 @@ Each step below is intended to keep the crate green after `cargo build --release
 
 9. **Shrink the entrypoints and server orchestration.**
    - Split `src/main.rs` into `app/{args,tracing,plan_commands,subscription_commands,session_run}.rs`.
-   - Rename `src/cli.rs` to `src/terminal_ui.rs`.
+   - Terminal UI now lives in `src/terminal_ui.rs`.
    - Split `src/server/mod.rs` into `state.rs`, `session_lock.rs`, and `queue_worker.rs`.
    - Safe independently: yes.
    - Depends on: steps 6 and 8.

@@ -1,73 +1,41 @@
-use std::sync::Arc;
-
-use anyhow::{Context, Result};
-use tokio::sync::Mutex;
-use tracing::warn;
-
-use crate::session_runtime::drain::{self, SharedStoreDrainBackend};
-use crate::session_runtime::factory;
-use crate::{agent, llm, session, turn};
-
 use super::ServerState;
 
-impl ServerState {
-    fn session_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
-        let mut locks = self
-            .session_locks
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        locks
-            .entry(session_id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    }
-}
-
-struct SessionLockLease {
-    state: ServerState,
-    session_id: String,
-    lock: std::sync::Weak<Mutex<()>>,
-}
-
-impl Drop for SessionLockLease {
-    fn drop(&mut self) {
-        let mut locks = self
-            .state
-            .session_locks
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(current) = locks.get(&self.session_id)
-            && Arc::as_ptr(current) == self.lock.as_ptr()
-            && Arc::strong_count(current) == 2
-        {
-            locks.remove(&self.session_id);
-        }
-    }
-}
+#[cfg(test)]
+use super::session_lock::SessionLockLease;
+#[cfg(test)]
+use crate::session;
+#[cfg(test)]
+use crate::session_runtime::drain::{self, SharedStoreDrainBackend};
+#[cfg(test)]
+use anyhow::Context;
+#[cfg(test)]
+use anyhow::Result;
+#[cfg(test)]
+use std::sync::Arc;
 
 #[cfg(test)]
 #[tracing::instrument(level = "debug", skip(state, turn, make_provider, token_sink, approval_handler), fields(session_id = %session_id))]
 pub(super) async fn drain_session_queue<F, Fut, P, TS, AH>(
     state: ServerState,
     session_id: String,
-    turn: &turn::Turn,
+    turn: &crate::turn::Turn,
     make_provider: &mut F,
     token_sink: &mut TS,
     approval_handler: &mut AH,
-) -> Result<Option<agent::TurnVerdict>>
+) -> Result<Option<crate::agent::TurnVerdict>>
 where
     F: FnMut() -> Fut + Send,
     Fut: std::future::Future<Output = Result<P>> + Send,
-    P: llm::LlmProvider + Send,
-    TS: agent::TokenSink + Send,
-    AH: agent::ApprovalHandler + Send,
+    P: crate::llm::LlmProvider + Send,
+    TS: crate::agent::TokenSink + Send,
+    AH: crate::agent::ApprovalHandler + Send,
 {
     let session_lock = state.session_lock(&session_id);
-    let _session_lock_lease = SessionLockLease {
-        state: state.clone(),
-        session_id: session_id.clone(),
-        lock: Arc::downgrade(&session_lock),
-    };
+    let _session_lock_lease = SessionLockLease::new(
+        state.clone(),
+        session_id.clone(),
+        Arc::downgrade(&session_lock),
+    );
     let _session_guard = session_lock.lock().await;
 
     let mut history = session::Session::new(state.sessions_dir.join(&session_id))
@@ -86,6 +54,7 @@ where
     .await
 }
 
+#[cfg(test)]
 #[tracing::instrument(level = "debug", skip(state, turn_builder, make_provider, token_sink, approval_handler), fields(session_id = %session_id))]
 pub(super) async fn drain_session_queue_with_turn_builder<F, Fut, P, TS, AH, TB>(
     state: ServerState,
@@ -94,99 +63,28 @@ pub(super) async fn drain_session_queue_with_turn_builder<F, Fut, P, TS, AH, TB>
     make_provider: &mut F,
     token_sink: &mut TS,
     approval_handler: &mut AH,
-) -> Result<Option<agent::TurnVerdict>>
+) -> Result<Option<crate::agent::TurnVerdict>>
 where
     F: FnMut() -> Fut + Send,
     Fut: std::future::Future<Output = Result<P>> + Send,
-    P: llm::LlmProvider + Send,
-    TS: agent::TokenSink + Send,
-    AH: agent::ApprovalHandler + Send,
-    TB: FnMut() -> Result<turn::Turn> + Send,
+    P: crate::llm::LlmProvider + Send,
+    TS: crate::agent::TokenSink + Send,
+    AH: crate::agent::ApprovalHandler + Send,
+    TB: FnMut() -> Result<crate::turn::Turn> + Send,
 {
-    let session_lock = state.session_lock(&session_id);
-    let _session_lock_lease = SessionLockLease {
-        state: state.clone(),
-        session_id: session_id.clone(),
-        lock: Arc::downgrade(&session_lock),
-    };
-    let _session_guard = session_lock.lock().await;
-
-    let mut history = session::Session::new(state.sessions_dir.join(&session_id))
-        .with_context(|| format!("failed to open session {session_id}"))?;
-    history.load_today()?;
-    let mut backend = SharedStoreDrainBackend::new(state.store.clone());
-    let (verdict, _, _) = drain::drain_queue_with_stats_fresh_turns(
-        &mut backend,
-        &session_id,
-        &mut history,
+    super::queue_worker::drain_session_queue_with_turn_builder(
+        state,
+        session_id,
         turn_builder,
         make_provider,
         token_sink,
         approval_handler,
     )
-    .await?;
-    Ok(verdict)
+    .await
 }
 
 pub(super) fn spawn_http_queue_worker(state: ServerState, session_id: String) {
-    tokio::spawn(async move {
-        let subscriptions = {
-            let mut store = state.store.lock().await;
-            match factory::load_subscriptions_for_session(&mut store, &session_id) {
-                Ok(subscriptions) => subscriptions,
-                Err(error) => {
-                    warn!(%session_id, %error, "failed to load subscriptions for queue turn");
-                    return;
-                }
-            }
-        };
-        let mut turn_builder =
-            factory::build_turn_builder_for_subscriptions(state.config.clone(), subscriptions);
-        let mut provider_factory =
-            factory::build_openai_provider_factory(state.http_client.clone(), state.config.clone());
-        let mut token_sink = NoopTokenSink;
-        let mut approval_handler = RejectApprovalHandler;
-        match drain_session_queue_with_turn_builder(
-            state.clone(),
-            session_id.clone(),
-            &mut turn_builder,
-            &mut provider_factory,
-            &mut token_sink,
-            &mut approval_handler,
-        )
-        .await
-        {
-            Ok(Some(verdict)) => match verdict {
-                agent::TurnVerdict::Denied { reason: _, gate_id } => {
-                    warn!(%gate_id, "http turn denied");
-                }
-                _ => unreachable!("drain_queue only returns denial verdicts"),
-            },
-            Ok(None) => {}
-            Err(error) => {
-                warn!(%session_id, %error, "failed to drain queued HTTP messages");
-            }
-        }
-    });
-}
-
-struct NoopTokenSink;
-
-impl agent::TokenSink for NoopTokenSink {
-    fn on_token(&mut self, _token: String) {}
-}
-
-struct RejectApprovalHandler;
-
-impl agent::ApprovalHandler for RejectApprovalHandler {
-    fn request_approval(
-        &mut self,
-        _severity: &crate::gate::Severity,
-        _reason: &str,
-        _command: &str,
-    ) -> bool {
-        false
-    }
+    super::queue_worker::spawn_background_queue_worker(state, session_id)
 }
 
 #[cfg(test)]

@@ -1,9 +1,6 @@
 //! HTTP and WebSocket server for queue-driven agent execution.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -12,7 +9,6 @@ use axum::{
     routing::{get, post},
 };
 use reqwest::Client;
-use tokio::sync::Mutex;
 
 use crate::{config, plan, store};
 use tracing::{info, warn};
@@ -20,20 +16,13 @@ use tracing::{info, warn};
 mod auth;
 mod http;
 mod queue;
+pub(crate) mod queue_worker;
+pub(crate) mod session_lock;
+pub(crate) mod state;
 mod ws;
 
 pub use http::HttpError;
-
-#[derive(Clone)]
-pub struct ServerState {
-    store: Arc<Mutex<store::Store>>,
-    session_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
-    sessions_dir: PathBuf,
-    api_key: String,
-    operator_key: Option<String>,
-    config: config::Config,
-    http_client: Client,
-}
+pub(crate) use state::ServerState;
 
 pub async fn run(port: u16) -> Result<()> {
     let config = config::Config::load("agents.toml").context("failed to load configuration")?;
@@ -60,15 +49,15 @@ pub async fn run(port: u16) -> Result<()> {
             warn!(%error, "failed to recover crashed plan runs");
         }
     }
-    let state = ServerState {
-        store: Arc::new(Mutex::new(store)),
-        session_locks: Arc::new(StdMutex::new(HashMap::new())),
-        sessions_dir: PathBuf::from("sessions"),
+    let state = ServerState::new(
+        std::sync::Arc::new(tokio::sync::Mutex::new(store)),
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        std::path::PathBuf::from("sessions"),
         api_key,
-        operator_key: config.operator_key.clone(),
+        config.operator_key.clone(),
         config,
-        http_client: Client::new(),
-    };
+        Client::new(),
+    );
 
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port)))
@@ -80,7 +69,7 @@ pub async fn run(port: u16) -> Result<()> {
         .context("server exited unexpectedly")
 }
 
-pub fn router(state: ServerState) -> Router {
+pub(crate) fn router(state: ServerState) -> Router {
     let middleware_state = state.clone();
     Router::new()
         .route("/api/health", get(http::health_check))

@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
-use crate::util::{STDERR_USER_OUTPUT_TARGET, STDOUT_USER_OUTPUT_TARGET};
+use crate::logging::{STDERR_USER_OUTPUT_TARGET, STDOUT_USER_OUTPUT_TARGET};
 use anyhow::{Context, Result, anyhow};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};

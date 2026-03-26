@@ -15,9 +15,8 @@ use tracing::warn;
 use crate::agent;
 use crate::gate::Severity;
 use crate::principal::Principal;
-use crate::session_runtime::factory;
 
-use super::{HttpError, ServerState, queue, validate_session_id};
+use super::{HttpError, ServerState, queue_worker, validate_session_id};
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -123,30 +122,10 @@ async fn websocket_session(
             }
         }
 
-        let subscriptions = {
-            let mut store = state.store.lock().await;
-            match factory::load_subscriptions_for_session(&mut store, &session_id) {
-                Ok(subscriptions) => subscriptions,
-                Err(error) => {
-                    let _ = tx.send(WsFrame::Error {
-                        data: format!("failed to load websocket subscriptions: {error}"),
-                    });
-                    let _ = tx.send(WsFrame::Done);
-                    continue;
-                }
-            }
-        };
-        let mut turn_builder =
-            factory::build_turn_builder_for_subscriptions(state.config.clone(), subscriptions);
         let mut token_sink = WsTokenSink::new(tx.clone());
-        let mut provider_factory =
-            factory::build_openai_provider_factory(state.http_client.clone(), state.config.clone());
-
-        match queue::drain_session_queue_with_turn_builder(
+        match queue_worker::drain_session_queue_with_subscriptions(
             state.clone(),
             session_id.clone(),
-            &mut turn_builder,
-            &mut provider_factory,
             &mut token_sink,
             &mut approval_handler,
         )

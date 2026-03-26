@@ -12,7 +12,7 @@
 ## Module Map
 
 - `src/main.rs` - CLI entrypoint, server launch, tracing setup.
-- `src/cli.rs` - CLI presentation and denial formatting.
+- `src/terminal_ui.rs` - CLI presentation and denial formatting.
 - `src/lib.rs` - crate re-exports.
 - `src/agent/loop_impl.rs` - core agent loop and turn runner.
 - `src/agent/audit.rs` - denial/audit persistence helpers and shared denial text formatting.
@@ -60,7 +60,7 @@
 - `src/llm/mod.rs` - provider trait and shared LLM types.
 - `src/llm/openai.rs` - OpenAI backend and SSE parsing.
 - `src/plan.rs` - plan orchestration and CLI state transitions.
-- `src/util.rs` - timestamp and utility helpers.
+- `src/logging.rs` - tracing formatter and user-output targets; `src/util.rs` now holds timestamp helpers.
 
 ## Execution Flow
 

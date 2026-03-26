@@ -2,7 +2,7 @@ use std::io::{self, BufRead, Write};
 
 use crate::agent::{ApprovalHandler, TokenSink};
 use crate::gate::Severity;
-use crate::util::{STDERR_USER_OUTPUT_TARGET, STDOUT_USER_OUTPUT_TARGET};
+use crate::logging::{STDERR_USER_OUTPUT_TARGET, STDOUT_USER_OUTPUT_TARGET};
 use tracing::{info, warn};
 
 const LOW_APPROVAL_PREFIX: &str = "⚠️";
