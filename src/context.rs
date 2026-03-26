@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
 use crate::identity;
-use crate::llm::history_groups::{estimate_message_tokens, history_group_range};
+use crate::llm::history_groups::{
+    collect_newest_group_ranges_within_budget, estimate_message_tokens,
+};
 use crate::llm::{ChatMessage, ChatRole, MessageContent};
 use crate::skills::SkillDefinition;
 use crate::skills::SkillSummary;
@@ -385,36 +387,25 @@ impl History {
             return;
         }
 
-        let mut current_tokens = messages.iter().map(estimate_message_tokens).sum::<usize>();
-        let mut selected = Vec::new();
-
-        let mut index = self.history.len();
-        while index > 0 {
-            index -= 1;
-
-            let Some((start, end)) = history_group_range(&self.history, index) else {
-                continue;
-            };
-
-            let group_tokens = self.history[start..end]
-                .iter()
-                .map(estimate_message_tokens)
-                .sum::<usize>();
-
-            if current_tokens + group_tokens > self.max_tokens {
-                break;
-            }
-
-            selected.splice(0..0, self.history[start..end].iter().cloned());
-            current_tokens += group_tokens;
-            index = start;
-        }
+        let current_tokens = messages.iter().map(estimate_message_tokens).sum::<usize>();
+        let selected = collect_newest_group_ranges_within_budget(
+            &self.history,
+            self.max_tokens.saturating_sub(current_tokens),
+            |start, end| {
+                self.history[start..end]
+                    .iter()
+                    .map(estimate_message_tokens)
+                    .sum::<usize>()
+            },
+        );
 
         if selected.is_empty() {
             return;
         }
 
-        messages.extend(selected);
+        for (start, end) in selected {
+            messages.extend(self.history[start..end].iter().cloned());
+        }
     }
 }
 

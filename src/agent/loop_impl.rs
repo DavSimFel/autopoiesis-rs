@@ -4,31 +4,22 @@ use anyhow::{Context, Result};
 use serde_json::{Value, from_str};
 
 use crate::delegation::{self, DelegationAdvice};
-use crate::gate::{BudgetSnapshot, GuardContext, Verdict};
-use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall, TurnMeta};
+use crate::gate::{GuardContext, Verdict};
+use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall};
 use crate::principal::Principal;
 use crate::session::Session;
 use crate::turn::Turn;
 use crate::util::utc_timestamp;
 use tracing::{debug, info, warn};
 
+use super::TurnVerdict;
+use super::audit::{
+    append_denial_note_for_inbound, append_denial_note_for_inbound_approval,
+    append_denial_note_for_tool_approval, append_denial_note_for_tool_deny, make_denial_verdict,
+    persist_denied_assistant_text,
+};
+use super::usage::{charged_turn_meta, flush_buffered_tokens, post_turn_budget_denial};
 use super::{ApprovalHandler, TokenSink};
-
-const MAX_DENIALS_PER_TURN: usize = 2;
-
-/// Agent verdict returned after processing a queued message or turn.
-pub enum TurnVerdict {
-    Executed(Vec<ToolCall>),
-    Denied { reason: String, gate_id: String },
-    Approved { tool_calls: Vec<ToolCall> },
-}
-
-/// Outcome returned when draining a queued message.
-pub enum QueueOutcome {
-    Agent(TurnVerdict),
-    Stored,
-    UnsupportedRole(String),
-}
 
 fn command_from_tool_call(call: &ToolCall) -> Option<String> {
     let value = from_str::<Value>(&call.arguments).ok()?;
@@ -38,160 +29,13 @@ fn command_from_tool_call(call: &ToolCall) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn append_audit_note(session: &mut Session, note: String) -> Result<()> {
-    let mut message = ChatMessage::with_role_with_principal(
-        crate::llm::ChatRole::Assistant,
-        Some(Principal::System),
-    );
-    message.content.push(MessageContent::text(note));
-    session.append(message, None)
-}
-
-fn persist_denied_assistant_text(
-    session: &mut Session,
-    turn: &Turn,
-    mut assistant_message: ChatMessage,
-    meta: Option<TurnMeta>,
-) -> Result<()> {
-    crate::gate::guard_message_output(turn, &mut assistant_message);
-    assistant_message
-        .content
-        .retain(|block| matches!(block, MessageContent::Text { .. }));
-
-    if assistant_message.content.is_empty() {
-        assistant_message.content.push(MessageContent::Text {
-            text: String::new(),
-        });
-    }
-
-    session.append(assistant_message, meta)
-}
-
-fn append_approval_denied(session: &mut Session, gate_id: &str) -> Result<()> {
-    append_audit_note(
-        session,
-        format!("Tool execution rejected after approval by {gate_id}"),
-    )
-}
-
-fn append_inbound_approval_denied(session: &mut Session, gate_id: &str) -> Result<()> {
-    append_audit_note(
-        session,
-        format!("Message rejected after approval by {gate_id}"),
-    )
-}
-
-fn append_hard_deny(session: &mut Session, by: &str) -> Result<()> {
-    append_audit_note(session, format!("Tool execution hard-denied by {by}"))
-}
-
-fn append_inbound_deny(session: &mut Session, gate_id: &str) -> Result<()> {
-    append_audit_note(session, format!("Message hard-denied by {gate_id}"))
-}
-
-fn flush_buffered_tokens<TS: TokenSink + ?Sized>(
-    token_sink: &mut TS,
-    buffered_tokens: &mut Vec<String>,
-) {
-    for token in buffered_tokens.drain(..) {
-        token_sink.on_token(token);
-    }
-}
-
-pub(super) fn make_denial_verdict(
-    denial_count: &mut usize,
-    gate_id: String,
-    reason: String,
-) -> TurnVerdict {
-    *denial_count += 1;
-    if *denial_count >= MAX_DENIALS_PER_TURN {
-        TurnVerdict::Denied {
-            reason: format!(
-                "stopped after {} denied actions this turn; last denial by {gate_id}: {reason}",
-                *denial_count
-            ),
-            gate_id,
-        }
-    } else {
-        TurnVerdict::Denied { reason, gate_id }
-    }
-}
-
-fn inbound_verdict_name(verdict: &Verdict) -> &'static str {
+fn inbound_verdict_name(verdict: &crate::gate::Verdict) -> &'static str {
     match verdict {
-        Verdict::Allow => "allow",
-        Verdict::Modify => "modify",
-        Verdict::Deny { .. } => "deny",
-        Verdict::Approve { .. } => "approve",
+        crate::gate::Verdict::Allow => "allow",
+        crate::gate::Verdict::Modify => "modify",
+        crate::gate::Verdict::Deny { .. } => "deny",
+        crate::gate::Verdict::Approve { .. } => "approve",
     }
-}
-
-fn token_total(meta: Option<&TurnMeta>, assistant_message: &ChatMessage) -> u64 {
-    let estimated_tokens = Session::estimate_message_tokens(assistant_message);
-    match meta {
-        Some(meta) => match (meta.input_tokens, meta.output_tokens) {
-            (Some(input), Some(output)) => input.saturating_add(output),
-            (Some(input), None) => input.max(estimated_tokens),
-            (None, Some(output)) => output.max(estimated_tokens),
-            (None, None) => estimated_tokens,
-        },
-        None => estimated_tokens,
-    }
-}
-
-fn charged_turn_meta(meta: Option<TurnMeta>, assistant_message: &ChatMessage) -> TurnMeta {
-    let estimated_tokens = Session::estimate_message_tokens(assistant_message);
-    match meta {
-        Some(mut meta) => {
-            match (meta.input_tokens, meta.output_tokens) {
-                (Some(_), Some(_)) => {}
-                (Some(input), None) => {
-                    meta.output_tokens = Some(estimated_tokens.saturating_sub(input))
-                }
-                (None, Some(output)) => {
-                    meta.input_tokens = Some(estimated_tokens.saturating_sub(output))
-                }
-                (None, None) => meta.output_tokens = Some(estimated_tokens),
-            }
-            meta
-        }
-        None => TurnMeta {
-            model: None,
-            input_tokens: None,
-            output_tokens: Some(estimated_tokens),
-            reasoning_tokens: None,
-            reasoning_trace: None,
-        },
-    }
-}
-
-fn post_turn_budget_denial(
-    turn: &Turn,
-    session: &Session,
-    assistant_message: &ChatMessage,
-    turn_meta: Option<&TurnMeta>,
-) -> Result<Option<(String, String)>> {
-    if !turn.needs_budget_context() {
-        return Ok(None);
-    }
-
-    let turn_tokens = token_total(turn_meta, assistant_message);
-    let mut budget: BudgetSnapshot = session
-        .budget_snapshot()
-        .context("failed to read live budget snapshot")?;
-    budget.turn_tokens += turn_tokens;
-    budget.session_tokens += turn_tokens;
-    budget.day_tokens += turn_tokens;
-    let context = GuardContext {
-        budget,
-        ..Default::default()
-    };
-
-    if let Some(crate::gate::Verdict::Deny { reason, gate_id }) = turn.check_budget(context) {
-        return Ok(Some((gate_id, reason)));
-    }
-
-    Ok(None)
 }
 
 fn persisted_inbound_user_message(
@@ -304,7 +148,7 @@ where
                     crate::gate::guard_message_output(turn, &mut user_message);
                     session.append(user_message, None)?;
                 }
-                append_inbound_deny(session, &gate_id)?;
+                append_denial_note_for_inbound(session, &gate_id)?;
                 warn!(%gate_id, "inbound message denied");
                 break 'agent_turn Some(make_denial_verdict(&mut denial_count, gate_id, reason));
             }
@@ -335,7 +179,7 @@ where
                         crate::gate::guard_message_output(turn, &mut user_message);
                         session.append(user_message, None)?;
                     }
-                    append_inbound_approval_denied(session, &gate_id)?;
+                    append_denial_note_for_inbound_approval(session, &gate_id)?;
                     warn!(%gate_id, "inbound approval denied");
                     break 'agent_turn Some(make_denial_verdict(
                         &mut denial_count,
@@ -436,7 +280,7 @@ where
                                 turn_reply.assistant_message,
                                 Some(charged_meta.clone()),
                             )?;
-                            append_hard_deny(session, &gate_id)?;
+                            append_denial_note_for_tool_deny(session, &gate_id)?;
                             warn!(%gate_id, "tool call hard-denied");
                             break 'agent_turn Some(make_denial_verdict(
                                 &mut denial_count,
@@ -460,7 +304,7 @@ where
                                     turn_reply.assistant_message,
                                     Some(charged_meta.clone()),
                                 )?;
-                                append_approval_denied(session, &gate_id)?;
+                                append_denial_note_for_tool_approval(session, &gate_id)?;
                                 warn!(%gate_id, "tool call approval denied");
                                 break 'agent_turn Some(make_denial_verdict(
                                     &mut denial_count,
@@ -483,7 +327,7 @@ where
                             turn_reply.assistant_message,
                             Some(charged_meta.clone()),
                         )?;
-                        append_hard_deny(session, &gate_id)?;
+                        append_denial_note_for_tool_deny(session, &gate_id)?;
                         warn!(%gate_id, "tool batch hard-denied");
                         break 'agent_turn Some(make_denial_verdict(
                             &mut denial_count,
@@ -507,7 +351,7 @@ where
                                 turn_reply.assistant_message,
                                 Some(charged_meta.clone()),
                             )?;
-                            append_approval_denied(session, &gate_id)?;
+                            append_denial_note_for_tool_approval(session, &gate_id)?;
                             warn!(%gate_id, "tool batch approval denied");
                             break 'agent_turn Some(make_denial_verdict(
                                 &mut denial_count,

@@ -150,10 +150,6 @@ impl DrainBackend for SharedStoreDrainBackend {
     }
 }
 
-pub fn format_denial_message(reason: &str, gate_id: &str) -> String {
-    format!("Command hard-denied by {gate_id}: {reason}")
-}
-
 trait DrainProcessor {
     fn process<'a>(
         &'a mut self,

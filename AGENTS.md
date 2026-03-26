@@ -44,12 +44,16 @@ docs/                Architecture, specs, risks, vision, roadmap
 |------|---------|
 | `src/main.rs` | CLI entrypoint, server launch, tracing setup |
 | `src/agent/loop_impl.rs` | Core agent loop and turn orchestration |
+| `src/agent/audit.rs` | Denial/audit persistence helpers and shared denial formatting |
+| `src/agent/usage.rs` | Token charging and post-turn budget helpers |
 | `src/agent/shell_execute.rs` | Shared guarded shell execution path |
-| `src/turn.rs` | Tier-aware turn assembly and guard composition |
+| `src/turn/mod.rs` | Tier-aware turn assembly and guard composition facade |
+| `src/turn/{builders,tiers,verdicts}.rs` | Focused turn construction and guard policy submodules |
 | `src/store.rs` | SQLite sessions, queue, subscriptions, and plan tables |
 | `src/plan/*.rs` | Plan execution, patching, notifications, recovery |
 | `src/config/mod.rs` | `agents.toml` loading and policy/config validation across split submodules |
-| `src/context.rs` | Identity, skill, and history context assembly |
+| `src/context/mod.rs` | Identity, skill, subscription, and history context facade |
+| `src/context/{identity_prompt,skill_summaries,skill_instructions,subscriptions,history}.rs` | Focused context submodules |
 | `src/subscription.rs` | Subscription records, filters, and token accounting |
 | `src/skills.rs` | Skill catalog loading and summaries |
 | `src/server/*.rs` | HTTP, WS, auth, and queue management |

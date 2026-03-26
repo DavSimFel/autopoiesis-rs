@@ -7,7 +7,7 @@ use crate::session::Session;
 use crate::store::{QueuedMessage, Store};
 use crate::turn::Turn;
 
-use super::loop_impl::QueueOutcome;
+use super::QueueOutcome;
 use super::{ApprovalHandler, TokenSink, TurnVerdict};
 use crate::session_runtime::drain::{self, StoreDrainBackend};
 

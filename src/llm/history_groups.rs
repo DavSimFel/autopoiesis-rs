@@ -137,6 +137,47 @@ pub fn history_group_range(history: &[ChatMessage], index: usize) -> Option<(usi
     }
 }
 
+/// Collect the newest whole history groups that fit within `max_tokens`.
+///
+/// Invariant: assistant/tool round-trips are the unit of replay. Callers must
+/// only include or exclude a group as a whole.
+pub fn collect_newest_group_ranges_within_budget<F>(
+    history: &[ChatMessage],
+    max_tokens: usize,
+    mut group_token_count: F,
+) -> Vec<(usize, usize)>
+where
+    F: FnMut(usize, usize) -> usize,
+{
+    if history.is_empty() {
+        return Vec::new();
+    }
+
+    let mut index = history.len();
+    let mut current_tokens = 0usize;
+    let mut selected = Vec::new();
+
+    while index > 0 {
+        index -= 1;
+
+        let Some((start, end)) = history_group_range(history, index) else {
+            continue;
+        };
+
+        let group_tokens = group_token_count(start, end);
+        if current_tokens + group_tokens > max_tokens {
+            break;
+        }
+
+        selected.push((start, end));
+        current_tokens += group_tokens;
+        index = start;
+    }
+
+    selected.reverse();
+    selected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +229,37 @@ mod tests {
 
         assert_eq!(history_group_range(&history, 1), Some((1, 3)));
         assert_eq!(history_group_range(&history, 2), Some((1, 3)));
+    }
+
+    #[test]
+    fn collect_newest_group_ranges_within_budget_returns_whole_groups() {
+        let history = vec![
+            ChatMessage::user("old"),
+            assistant_with_blocks(vec![
+                MessageContent::text("alpha"),
+                MessageContent::ToolCall {
+                    call: crate::llm::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "execute".to_string(),
+                        arguments: "{\"command\":\"echo hi\"}".to_string(),
+                    },
+                },
+            ]),
+            ChatMessage::tool_result_with_principal(
+                "call-1",
+                "execute",
+                "ok",
+                Some(Principal::System),
+            ),
+            ChatMessage::user("new"),
+        ];
+
+        let selected =
+            collect_newest_group_ranges_within_budget(&history, usize::MAX, |start, end| {
+                estimate_messages_tokens(&history[start..end])
+            });
+
+        assert_eq!(selected, vec![(0, 1), (1, 3), (3, 4)]);
     }
 
     #[test]

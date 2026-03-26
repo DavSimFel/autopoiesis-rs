@@ -113,16 +113,11 @@ impl ApprovalHandler for CliApprovalHandler {
     }
 }
 
-/// Format a denial message for CLI and server output.
-pub fn format_denial_message(reason: &str, gate_id: &str) -> String {
-    crate::session_runtime::drain::format_denial_message(reason, gate_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::format_denial_message;
     use crate::gate::Severity;
-    use crate::session_runtime::drain::format_denial_message;
 
     #[test]
     fn format_denial_message_uses_gate_and_reason() {

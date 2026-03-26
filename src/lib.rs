@@ -2,6 +2,7 @@ pub mod agent;
 pub mod auth;
 pub mod cli;
 pub mod config;
+#[path = "context/mod.rs"]
 pub mod context;
 pub mod delegation;
 pub mod gate;
@@ -27,6 +28,7 @@ pub mod subscription;
 pub mod template;
 pub mod time;
 pub mod tool;
+#[path = "turn/mod.rs"]
 pub mod turn;
 pub mod util;
 

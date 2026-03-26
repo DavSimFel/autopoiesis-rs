@@ -14,7 +14,9 @@
 - `src/main.rs` - CLI entrypoint, server launch, tracing setup.
 - `src/cli.rs` - CLI presentation and denial formatting.
 - `src/lib.rs` - crate re-exports.
-- `src/agent/loop_impl.rs` - agent loop, turn orchestration, approvals, tool execution.
+- `src/agent/loop_impl.rs` - core agent loop and turn runner.
+- `src/agent/audit.rs` - denial/audit persistence helpers and shared denial text formatting.
+- `src/agent/usage.rs` - token charging and post-turn budget helpers.
 - `src/agent/queue.rs` - queue draining for CLI/session work.
 - `src/agent/shell_execute.rs` - guarded shell execution shared by the agent loop and plan engine.
 - `src/agent/spawn.rs` - child-session creation and drain orchestration.
@@ -38,10 +40,12 @@
 - `src/plan/patch.rs` - plan patching and revision handling.
 - `src/plan/recovery.rs` - crash recovery for stalled plan runs.
 - `src/config/mod.rs` - config facade; `src/config/{runtime,load,spawn_runtime,agents,models,domains,policy,file_schema}.rs` own runtime state, validation, and schema parsing.
-- `src/context.rs` - context sources and prompt assembly helpers.
+- `src/context/mod.rs` - context facade and public reexports.
+- `src/context/{identity_prompt,skill_summaries,skill_instructions,subscriptions,history}.rs` - focused context sources and prompt assembly helpers.
 - `src/session.rs` - JSONL history and per-session metadata.
 - `src/store.rs` - SQLite sessions, queue, subscriptions, and plan tables.
-- `src/turn.rs` - tier-aware turn assembly and guard composition.
+- `src/turn/mod.rs` - turn facade and public reexports.
+- `src/turn/{verdicts,tiers,builders}.rs` - guard verdicts, tier resolution, and turn construction.
 - `src/tool.rs` - shell tool execution primitives.
 - `src/spawn.rs` - model selection, delegation thresholding, child spawn helpers.
 - `src/skills.rs` - skill catalog loading and summaries.
@@ -94,7 +98,7 @@ CLI / HTTP / WS
 - T1 uses shell plus its identity stack and skill summaries.
 - T2 uses `read_file` only, plus its identity stack and skill summaries.
 - T3 uses shell and can receive full skill instructions when spawned.
-- `build_turn_for_config()` is shared by CLI and server paths.
+- `build_turn_for_config()` is shared by CLI and server paths through the turn builder module.
 
 ### Guard Pipeline
 

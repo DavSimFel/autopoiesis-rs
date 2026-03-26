@@ -11,16 +11,37 @@ use crate::turn::Turn;
 
 pub use crate::spawn::{SpawnDrainResult, SpawnRequest, SpawnResult};
 
+mod audit;
 mod loop_impl;
 mod queue;
 pub(crate) mod shell_execute;
 mod spawn;
+mod usage;
 
-pub use crate::session_runtime::drain::format_denial_message;
-pub use loop_impl::{QueueOutcome, TurnVerdict, run_agent_loop};
+pub use audit::format_denial_message;
+pub use loop_impl::run_agent_loop;
 pub use queue::drain_queue;
 pub use spawn::spawn_and_drain;
 pub(crate) use spawn::{SpawnDrainContext, finish_spawned_child_drain};
+
+/// Agent verdict returned after processing a queued message or turn.
+pub enum TurnVerdict {
+    Executed(Vec<crate::llm::ToolCall>),
+    Denied {
+        reason: String,
+        gate_id: String,
+    },
+    Approved {
+        tool_calls: Vec<crate::llm::ToolCall>,
+    },
+}
+
+/// Outcome returned when draining a queued message.
+pub enum QueueOutcome {
+    Agent(TurnVerdict),
+    Stored,
+    UnsupportedRole(String),
+}
 
 /// Receiver of streaming tokens emitted by the model during completion.
 pub trait TokenSink {

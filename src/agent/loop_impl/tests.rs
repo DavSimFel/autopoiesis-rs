@@ -1,5 +1,6 @@
-use crate::agent::loop_impl::make_denial_verdict;
+use crate::agent::audit::make_denial_verdict;
 use crate::agent::tests::common::*;
+use crate::agent::usage::{charged_turn_meta, token_total};
 use crate::llm::TurnMeta;
 
 struct TailUserContext;
@@ -855,7 +856,7 @@ fn token_total_does_not_overcharge_partial_metadata() {
         reasoning_trace: None,
     };
     assert_eq!(
-        super::token_total(Some(&input_only), &assistant_message),
+        token_total(Some(&input_only), &assistant_message),
         estimated_tokens.max(11)
     );
 
@@ -867,7 +868,7 @@ fn token_total_does_not_overcharge_partial_metadata() {
         reasoning_trace: None,
     };
     assert_eq!(
-        super::token_total(Some(&output_only), &assistant_message),
+        token_total(Some(&output_only), &assistant_message),
         estimated_tokens.max(17)
     );
 }
@@ -890,7 +891,7 @@ fn charged_turn_meta_preserves_partial_usage_totals() {
         reasoning_tokens: None,
         reasoning_trace: None,
     };
-    let charged = super::charged_turn_meta(Some(input_only), &assistant_message);
+    let charged = charged_turn_meta(Some(input_only), &assistant_message);
     assert_eq!(charged.input_tokens, Some(11));
     assert_eq!(
         charged.output_tokens,
@@ -904,7 +905,7 @@ fn charged_turn_meta_preserves_partial_usage_totals() {
         reasoning_tokens: None,
         reasoning_trace: None,
     };
-    let charged = super::charged_turn_meta(Some(output_only), &assistant_message);
+    let charged = charged_turn_meta(Some(output_only), &assistant_message);
     assert_eq!(
         charged.input_tokens,
         Some(estimated_tokens.saturating_sub(17))
