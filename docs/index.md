@@ -1,43 +1,48 @@
 # Docs Index
 
-> Reading order by audience:
-> - **Operator** (David): README → vision → roadmap
-> - **Agent / Reviewer** (Silas): index → relevant spec or architecture doc → risks
-> - **Coding agent** (Codex): AGENTS.md → relevant docs for the files being changed
+> Reading order by role:
+> - Operator: README -> vision -> roadmap -> risks
+> - Implementer: AGENTS.md -> risks -> architecture/overview -> relevant spec
+> - Reviewer: index -> the docs for the file area being changed -> risks
 
-## Live Documents
+## Live Docs
 
-| Document | Path | Purpose | Updated |
-|----------|------|---------|---------|
-| **Vision** | [vision.md](vision.md) | Where we're going | On design decisions |
-| **Roadmap** | [roadmap.md](roadmap.md) | What's next, priority order | After every merge |
-| **Risks** | [risks.md](risks.md) | Live hazards, open P1s | After reviews |
+| Document | Path | Purpose |
+|----------|------|---------|
+| Vision | [vision.md](vision.md) | Current system direction and shipped capabilities |
+| Roadmap | [roadmap.md](roadmap.md) | What remains after the shipped phases |
+| Risks | [risks.md](risks.md) | Open hazards and resolved audit items |
 
-## Architecture (as-built)
+## Architecture
 
 | Document | Path | Covers |
 |----------|------|--------|
-| **Overview** | [architecture/overview.md](architecture/overview.md) | Module map, execution flow, data model |
+| Overview | [architecture/overview.md](architecture/overview.md) | Module map, data flow, and current runtime behavior |
+| Guarded Shell Executor | [architecture/guarded-shell-executor.md](architecture/guarded-shell-executor.md) | Shared shell execution path |
 
-## Specs (pre-implementation)
+## Specs
 
-| Spec | Path | Status |
-|------|------|--------|
-| **Identity v2** | [specs/identity-v2.md](specs/identity-v2.md) | Design complete, not built |
+| Document | Path | Status |
+|----------|------|--------|
+| Identity v2 | [specs/identity-v2.md](specs/identity-v2.md) | Implemented, describes the live identity stack |
+| Plan Engine | [specs/plan-engine.md](specs/plan-engine.md) | Implemented, describes the live plan executor |
 
-## Research (cited by living docs)
+## Reference
 
-| Document | Path | Referenced by |
-|----------|------|---------------|
-| **Security Model** | [research/security-model.md](research/security-model.md) | Referenced by identity-v2 design process (debate files) |
+| Document | Path | Purpose |
+|----------|------|---------|
+| README | [README.md](../README.md) | Entry point and usage |
+| AGENTS | [AGENTS.md](../AGENTS.md) | Working instructions for codex agents |
 
 ## Archive
 
-Superseded specs, retired research, and obsolete docs: [archive/](archive/)
+| Document | Path | Purpose |
+|----------|------|---------|
+| Research | [research/security-model.md](research/security-model.md) | Historical background only |
 
 ## Rules
 
-- Every merge that changes `src/` must update relevant docs in the same merge.
-- Specs draft in `docs/specs/`. After shipping: fold into architecture, archive spec.
-- Research stays only while cited by a living spec or architecture doc.
-- Architecture docs describe current code, not future intent.
+- Architecture docs describe the current code, not future intent.
+- Shipped specs stay live when they are still the most precise normative docs.
+- Research stays only while it is actually referenced.
+- Every merge that changes `src/` must update the docs that describe that code.

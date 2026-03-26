@@ -2,7 +2,7 @@
 
 How to work in this repo. Read this first.
 
-> **⚠️ Read [docs/risks.md](docs/risks.md) before trusting any invariant claim.** The guard pipeline, approval system, and queue semantics have known broken invariants.
+> **⚠️ Read [docs/risks.md](docs/risks.md) before trusting any invariant claim.** Shell guards remain heuristic, there is no PTY or real sandboxing yet, and subscriptions are not wired into turn context.
 
 ## Build and test
 
@@ -16,121 +16,147 @@ cargo test --features integration  # live API tests (skip if no auth)
 
 **Every change must pass all four checks before committing.** Pre-commit hooks enforce this.
 
-## Reading order
+## Reading Order
 
-- **Fixing a bug:** this file → [docs/risks.md](docs/risks.md) → [docs/architecture/overview.md](docs/architecture/overview.md) → code
-- **Building a feature:** this file → [docs/risks.md](docs/risks.md) → [docs/architecture/overview.md](docs/architecture/overview.md) → [docs/roadmap.md](docs/roadmap.md) → [docs/vision.md](docs/vision.md)
-- **Understanding a spec:** [docs/index.md](docs/index.md) → relevant spec in [docs/specs/](docs/specs/)
+- Fixing a bug: this file -> [docs/risks.md](docs/risks.md) -> [docs/architecture/overview.md](docs/architecture/overview.md) -> code.
+- Building a feature: this file -> [docs/risks.md](docs/risks.md) -> [docs/architecture/overview.md](docs/architecture/overview.md) -> [docs/roadmap.md](docs/roadmap.md) -> [docs/vision.md](docs/vision.md).
+- Understanding a spec: [docs/index.md](docs/index.md) -> relevant spec in [docs/specs/](docs/specs/).
 
-## Project structure
+## Project Structure
 
-```
-src/                 45 Rust source files (~24.8K lines)
-  gate/              Guard pipeline (budget, secret redaction, shell safety, exfil detection, protected paths)
-  llm/               LLM provider trait + OpenAI backend
+```text
+src/                 52 Rust source files (~34.8K lines)
+  agent/             Turn loop, queue drain, spawn helpers, guarded shell executor
+  server/            HTTP, WebSocket, auth, queue draining
+  gate/              Budget, shell safety, redaction, exfil detection, output capping
+  plan/              Plan runner, executor, patching, recovery, notifications
+  llm/               Provider trait + OpenAI backend
 identity-templates/  Git-tracked runtime prompt files (constitution, agent, context)
-agents.toml          Model config, shell policy, budget limits
+agents.toml          Model config, shell policy, read policy, queue limits, domains
 sessions/            JSONL history + SQLite queue + subscriptions (gitignored)
 tests/               Integration + shipped policy tests
-docs/                Architecture, specs, risks, vision, roadmap (see docs/index.md)
+docs/                Architecture, specs, risks, vision, roadmap
 ```
 
-## Architecture rules
+## Key Files
 
-1. **Tiered tools.** Shell remains the universal execution tool for T1/T3. T2 uses `read_file` only.
-2. **Guard pipeline order.** Deny > Approve > Allow in `resolve_verdict()` (turn.rs).
-3. **No `unsafe` outside tool.rs.** `set_resource_limits()`, `signal_process_group()`, and the `pre_exec` closure.
-4. **Traits for composition.** ContextSource, Tool, Guard, LlmProvider, TokenSink, ApprovalHandler.
-5. **Two paths share one Turn.** CLI and server both use `build_turn_for_config()`. Don't diverge.
-6. **Specs sync on every merge.** Every merge that changes `src/` must update relevant docs. Pre-commit hook auto-updates architecture stats.
+| File | Purpose |
+|------|---------|
+| `src/main.rs` | CLI entrypoint, server launch, tracing setup |
+| `src/agent/loop_impl.rs` | Core agent loop and turn orchestration |
+| `src/agent/shell_execute.rs` | Shared guarded shell execution path |
+| `src/turn.rs` | Tier-aware turn assembly and guard composition |
+| `src/store.rs` | SQLite sessions, queue, subscriptions, and plan tables |
+| `src/plan/*.rs` | Plan execution, patching, notifications, recovery |
+| `src/config.rs` | `agents.toml` loading and policy/config validation |
+| `src/context.rs` | Identity, skill, and history context assembly |
+| `src/subscription.rs` | Subscription records, filters, and token accounting |
+| `src/skills.rs` | Skill catalog loading and summaries |
+| `src/server/*.rs` | HTTP, WS, auth, and queue management |
 
-## Coding standards
+## Architecture Rules
 
-### Junior readability rule
-**A junior dev should be able to read any file and understand what it does.** This is the bar for all decisions below.
+1. Tiered tools are real: T1 and T3 use shell, T2 uses `read_file` only.
+2. Guard precedence is deny, then approve, then allow.
+3. Shared shell execution must go through `src/agent/shell_execute.rs`.
+4. `build_turn_for_config()` is the shared turn constructor for CLI and server paths.
+5. `agent/`, `server/`, `gate/`, and `plan/` are the current major responsibility boundaries.
+6. Docs must stay synced with `src/` changes in the same merge.
 
-### Error handling
-- `anyhow::Result` for orchestration, CLI wiring, and glue code.
-- `thiserror` at boundaries where callers branch on failure kind: server HTTP responses, config loading.
-- `.context("description")` on every fallible op. No bare `?`.
-- No `.unwrap()` in non-test code. Never silently swallow errors.
+## Architecture Diagram
+
+```text
+CLI / HTTP / WS
+   -> SQLite queue / session store
+   -> drain queue
+   -> build_turn_for_config()
+   -> identity + context + skills + tier tool surface + guards
+   -> LLM stream
+   -> guarded shell or read tool
+   -> JSONL session append + SQLite metadata
+   -> response / token stream / plan notification
+
+Plan engine:
+T2 plan-json -> plan.rs / plan/* -> spawn or guarded shell -> checks -> notify T2
+```
+
+## Coding Standards
+
+### Junior Readability Rule
+
+A junior dev should be able to read any file and understand what it does.
+
+### Error Handling
+
+- Use `anyhow::Result` for orchestration, CLI wiring, and glue code.
+- Use `thiserror` at boundaries where callers branch on failure kind.
+- Add context to fallible operations.
+- Do not use `.unwrap()` in non-test code.
 
 ### Logging
-- Use `tracing` (not `log`/`env_logger`). Spans per agent turn for correlated debugging.
-- `info` — lifecycle events (session start, turn complete, server bind).
-- `warn` — policy denials, recoverable failures, tainted input.
-- `debug` — state transitions, guard evaluations, token counts.
-- `trace` — SSE frame parsing, JSONL line details (only when debugging wire issues).
 
-### Comments and documentation
-- **Comment policy decisions and security boundaries.** "Why this command is denied." "Why we strip tool_calls on denial."
-- **Comment non-obvious invariants.** "Trimming never splits assistant/tool round-trips because..."
-- **Don't restate code.** If the code needs a comment to be understood, the abstraction is probably too big.
-- **Doc comments (///)** on public types, async entrypoints, and guard invariants.
-- **Format spec at the top** of hand-rolled parsers (SSE parser, JSONL persistence).
+- Use `tracing`.
+- `info` for lifecycle events.
+- `warn` for policy denials and recoverable failures.
+- `debug` for state transitions and guard evaluation.
+- `trace` for wire-format parsing and queue details.
 
-### Module structure
-- Split by **responsibility**, not by line count. Each file does one thing.
-- `agent.rs` → agent loop, approval flow, tool execution (split when adding identity v2).
-- `server/` → `server/mod.rs`, `server/http.rs`, `server/ws.rs`, `server/auth.rs`, `server/queue.rs`.
-- **Separate policy from I/O from state mutation.** Never mix all three in one function.
+### Comments and Documentation
 
-### Async patterns
-- **Small async fns for I/O.** Network calls, file reads, queue operations.
-- **Sync helpers for policy and state mutation.** Guard evaluation, verdict resolution, session trimming.
-- **`tokio::task::spawn_blocking`** for rusqlite. Keep DB work isolated in store.rs.
-- **No nested closures** unless they genuinely simplify. Prefer named functions.
-- **Small enums/structs for flow state** over giant match chains inside closures.
+- Comment policy decisions and security boundaries.
+- Comment non-obvious invariants.
+- Do not restate code.
+- Add doc comments on public types and async entrypoints.
+
+### Module Structure
+
+- Split by responsibility, not line count.
+- Keep policy separate from I/O and state mutation.
+- Prefer named helpers over nested closures.
+
+### Async Patterns
+
+- Use small async fns for I/O.
+- Keep policy and state mutation synchronous where possible.
+- Use `spawn_blocking` for rusqlite work.
 
 ### Protocols
-- **SSE** for streaming token output to clients (stateless, resumable, mobile-friendly).
-- **WebSocket** for bidirectional needs only (approval prompts during execution).
-- **HTTP** for control plane (sessions, health, queue management).
-- Make the protocol split obvious in module names and routing.
+
+- SSE for streaming token output.
+- WebSocket for approvals and bidirectional interaction.
+- HTTP for control plane operations.
 
 ### Parsers
-- **SSE parser** (llm/openai.rs): hand-rolled, ~100 lines, 12 tests. Justified — format is tiny and fully owned. Add format spec comment at the top.
-- **JSONL** (session.rs): `serde_json::from_str` per line. No library needed.
-- If adding a new parser, prefer a library unless the format is trivial and fully tested.
+
+- `src/llm/openai.rs` has the SSE parser.
+- `src/session.rs` handles JSONL replay.
+- Prefer libraries for new parsers unless the format is tiny and fully owned.
 
 ### Dependencies
-- **Minimize.** Justify every new crate in the PR description.
-- **Current stack:** axum, tokio, rusqlite, reqwest, tiktoken-rs, serde/serde_json, clap, anyhow.
-- **Next adds:** `tracing` + `tracing-subscriber` (observability), `thiserror` (typed errors at boundaries).
-- Don't switch rusqlite → sqlx unless SQLite contention becomes a measured bottleneck.
 
-### Testing
-- **Unit tests** in `#[cfg(test)] mod tests` at the bottom of each source file.
-- **Integration tests** in `tests/` behind feature flags.
-- **Missing gap:** end-to-end tests that boot temp SQLite + exercise a full agent turn across modules.
-- Test names describe behavior: `trim_drops_oldest_non_system_messages`.
-- Unique temp dir names (timestamp-based) to avoid test interference.
+- Minimize dependencies.
+- `tracing` and `tracing-subscriber` are already in the stack.
+- `thiserror` is already in the stack.
+- Do not switch rusqlite to sqlx without measured contention.
 
-## Git workflow
+## Common Pitfalls
 
-- Commit messages: `feat:`, `fix:`, `chore:`, `refactor:`, `docs:` prefix. Imperative mood.
-- Pre-commit hooks run: fmt + clippy + test + secret scan + architecture stats auto-update.
-- Direct to main for codex-loop work. Feature branches for parallel or experimental work.
+- SSE events can split across chunk boundaries.
+- Tool call IDs must survive replay.
+- JSONL history and SQLite queue are separate persistence layers.
+- Process-group kills are required to terminate descendants.
+- Taint comes from user and system messages, not assistant messages.
 
-## Common pitfalls
+## Pre-Merge Checklist
 
-- **SSE parsing:** Events can split mid-JSON across byte boundaries. Don't assume complete lines.
-- **Tool call IDs:** Assistant messages must include `ToolCall` content blocks for API replay.
-- **Ghost tool entries:** Skip SSE tool events with no `call_id`. Never fall back to `"unknown"`.
-- **JSONL ≠ SQLite queue.** JSONL persists history. SQLite handles delivery. Complementary, not redundant.
-- **Process-group kill:** `setpgid(0,0)` + `killpg` — kills all descendants, not just parent shell.
-- **Taint propagation:** Only User and System messages taint. Agent messages don't. Standing approvals skip when tainted.
-
-## Pre-merge checklist
-
-1. `cargo test` + `cargo clippy -- -D warnings` + `cargo fmt --check` all pass.
+1. `cargo test`, `cargo clippy -- -D warnings`, and `cargo fmt --check` all pass.
 2. No execution path consumes prompts without claiming a queue row.
 3. Every claimed queue row ends in `processed` or `failed`.
 4. Guard pipeline covers inbound, tool calls, and outbound text.
-5. Session reload preserves system/assistant/tool messages + tool_call metadata.
+5. Session reload preserves system, assistant, and tool messages plus tool-call metadata.
 6. Trimming never splits assistant/tool round-trips.
-7. No secrets in code. Token files use `0600`.
-8. Docs updated if `src/` changed.
+7. No secrets in code.
+8. Docs are updated if `src/` changed.
 
 ## Don't
 
@@ -139,5 +165,4 @@ docs/                Architecture, specs, risks, vision, roadmap (see docs/index
 - Don't skip tests or weaken assertions.
 - Don't put secrets in code.
 - Don't mix policy, I/O, and state mutation in one function.
-- Don't use nested closures where a named function works.
 - Don't add dependencies without justification.
