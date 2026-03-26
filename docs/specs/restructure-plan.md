@@ -4,6 +4,8 @@ Basis for this plan: `AGENTS.md`, `agents.toml`, `Cargo.toml`, `docs/architectur
 
 Counting note: `prod` means code outside `#[cfg(test)]` modules and dedicated test-only files. `test` means inline `#[cfg(test)]` code plus dedicated test-only files. `src/` totals: `15,754 prod / 20,353 test / 36,107 total`.
 
+Historical note: this document captures the pre-split module layout as the basis for the restructuring work. The `src/context.rs` and `src/turn.rs` references below are migration anchors, not the current module roots.
+
 ## 1. Current State
 
 ### Root And Top-Level Modules

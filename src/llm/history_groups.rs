@@ -263,6 +263,39 @@ mod tests {
     }
 
     #[test]
+    fn collect_newest_group_ranges_within_budget_stops_on_budget_cutoff() {
+        let history = vec![
+            ChatMessage::user("old"),
+            assistant_with_blocks(vec![
+                MessageContent::text("alpha"),
+                MessageContent::ToolCall {
+                    call: crate::llm::ToolCall {
+                        id: "call-1".to_string(),
+                        name: "execute".to_string(),
+                        arguments: "{\"command\":\"echo hi\"}".to_string(),
+                    },
+                },
+            ]),
+            ChatMessage::tool_result_with_principal(
+                "call-1",
+                "execute",
+                "ok",
+                Some(Principal::System),
+            ),
+            ChatMessage::user("new"),
+        ];
+
+        let newest_group_tokens = estimate_messages_tokens(&history[3..4]);
+        let selected = collect_newest_group_ranges_within_budget(
+            &history,
+            newest_group_tokens,
+            |start, end| estimate_messages_tokens(&history[start..end]),
+        );
+
+        assert_eq!(selected, vec![(3, 4)]);
+    }
+
+    #[test]
     fn estimate_messages_tokens_uses_shared_message_estimator() {
         let messages = vec![
             ChatMessage::user("hello"),

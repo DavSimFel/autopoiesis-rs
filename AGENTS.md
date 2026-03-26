@@ -2,7 +2,7 @@
 
 How to work in this repo. Read this first.
 
-> **⚠️ Read [docs/risks.md](docs/risks.md) before trusting any invariant claim.** Shell guards remain heuristic, there is no PTY or real sandboxing yet, and subscriptions are not wired into turn context.
+> **⚠️ Read [docs/risks.md](docs/risks.md) before trusting any invariant claim.** Shell guards remain heuristic, there is no PTY or real sandboxing yet, and subscriptions are wired into turn context through `build_turn_for_config_with_subscriptions()`.
 
 ## Build and test
 

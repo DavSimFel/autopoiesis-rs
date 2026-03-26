@@ -1,5 +1,6 @@
 const REDACTION_MARKER: &str = "[REDACTED]";
-use super::secret_catalog::{SECRET_PATTERNS, SecretBodyKind, SecretPattern, SecretSuffixLen};
+use super::secret_catalog::SECRET_PATTERNS;
+use super::secret_catalog::{SecretBodyKind, SecretPattern, SecretSuffixLen};
 
 enum StreamingSecretDecision {
     NeedMore,
