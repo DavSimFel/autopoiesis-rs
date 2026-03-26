@@ -583,22 +583,15 @@ impl Store {
                  WHERE id = (
                      SELECT id
                      FROM plan_runs
-                     WHERE (status = 'pending' AND (claimed_at IS NULL OR claimed_at <= ?1))
-                        OR (status = 'running' AND claimed_at <= ?1)
+                     WHERE status = 'pending'
+                       AND (claimed_at IS NULL OR claimed_at <= ?1)
                      ORDER BY
-                         CASE status
-                             WHEN 'pending' THEN 0
-                             WHEN 'running' THEN 1
-                             ELSE 2
-                         END,
                          created_at ASC,
                          id ASC
                      LIMIT 1
                  )
-                 AND (
-                     (status = 'pending' AND (claimed_at IS NULL OR claimed_at <= ?1))
-                     OR (status = 'running' AND claimed_at <= ?1)
-                 )
+                 AND status = 'pending'
+                 AND (claimed_at IS NULL OR claimed_at <= ?1)
                  RETURNING
                     id,
                     owner_session_id,
@@ -700,6 +693,73 @@ impl Store {
         Ok(plan_runs)
     }
 
+    pub fn list_recent_plan_runs(&self, limit: usize) -> Result<Vec<PlanRun>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT
+                    id,
+                    owner_session_id,
+                    topic,
+                    trigger_source,
+                    status,
+                    revision,
+                    current_step_index,
+                    active_child_session_id,
+                    definition_json,
+                    last_failure_json,
+                    claimed_at,
+                    created_at,
+                    updated_at
+                 FROM plan_runs
+                 ORDER BY updated_at DESC, created_at DESC, id DESC
+                 LIMIT ?1",
+            )
+            .context("failed to prepare list_recent_plan_runs query")?;
+
+        let plan_runs = statement
+            .query_map(params![limit as i64], plan_run_from_row)
+            .context("failed to query recent plan runs")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to collect recent plan runs")?;
+
+        Ok(plan_runs)
+    }
+
+    pub fn list_recent_active_plan_runs(&self, limit: usize) -> Result<Vec<PlanRun>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT
+                    id,
+                    owner_session_id,
+                    topic,
+                    trigger_source,
+                    status,
+                    revision,
+                    current_step_index,
+                    active_child_session_id,
+                    definition_json,
+                    last_failure_json,
+                    claimed_at,
+                    created_at,
+                    updated_at
+                 FROM plan_runs
+                 WHERE status IN ('pending', 'running', 'waiting_t2')
+                 ORDER BY updated_at DESC, created_at DESC, id DESC
+                 LIMIT ?1",
+            )
+            .context("failed to prepare list_recent_active_plan_runs query")?;
+
+        let plan_runs = statement
+            .query_map(params![limit as i64], plan_run_from_row)
+            .context("failed to query recent active plan runs")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to collect recent active plan runs")?;
+
+        Ok(plan_runs)
+    }
+
     pub fn recover_stale_plan_runs(&mut self, stale_after_secs: u64) -> Result<u64> {
         let stale_after_secs = stale_after_secs.min(i64::MAX as u64) as i64;
         let stale_before = unix_timestamp().saturating_sub(stale_after_secs);
@@ -728,6 +788,254 @@ impl Store {
                 .context("failed to clear stale plan run claims")?;
             Ok((pending_count + leaked_count) as u64)
         })
+    }
+
+    pub fn resume_waiting_plan_run(&mut self, id: &str) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE plan_runs
+                 SET status = 'pending',
+                     claimed_at = NULL,
+                     last_failure_json = NULL,
+                     updated_at = ?2
+                 WHERE id = ?1
+                   AND status = 'waiting_t2'",
+                params![id, utc_timestamp()],
+            )
+            .context("failed to resume waiting plan run")?;
+        Ok(changed > 0)
+    }
+
+    pub fn cancel_plan_run(&mut self, id: &str) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE plan_runs
+                 SET status = 'failed',
+                     claimed_at = NULL,
+                     last_failure_json = NULL,
+                     updated_at = ?2
+                 WHERE id = ?1
+                   AND status IN ('pending', 'running', 'waiting_t2')",
+                params![id, utc_timestamp()],
+            )
+            .context("failed to cancel plan run")?;
+        Ok(changed > 0)
+    }
+
+    pub fn update_plan_run_status_preserving_failed(
+        &mut self,
+        id: &str,
+        status: &str,
+        updated_fields: PlanRunUpdateFields,
+    ) -> Result<bool> {
+        validate_plan_run_status(status)?;
+        if let Some(revision) = updated_fields.revision
+            && revision <= 0
+        {
+            return Err(anyhow::anyhow!("invalid plan run revision: {revision}"));
+        }
+        if let Some(current_step_index) = updated_fields.current_step_index
+            && current_step_index < 0
+        {
+            return Err(anyhow::anyhow!(
+                "invalid plan run current step index: {current_step_index}"
+            ));
+        }
+        let updated_at = utc_timestamp();
+        let mut sql = String::from("UPDATE plan_runs SET status = ?1, updated_at = ?2");
+        let mut bindings: Vec<Box<dyn ToSql>> =
+            vec![Box::new(status.to_string()), Box::new(updated_at)];
+        let mut next_index = 3usize;
+
+        if let Some(revision) = updated_fields.revision {
+            sql.push_str(&format!(", revision = ?{next_index}"));
+            bindings.push(Box::new(revision));
+            next_index += 1;
+        }
+
+        if let Some(current_step_index) = updated_fields.current_step_index {
+            sql.push_str(&format!(", current_step_index = ?{next_index}"));
+            bindings.push(Box::new(current_step_index));
+            next_index += 1;
+        }
+
+        if let Some(definition_json) = updated_fields.definition_json {
+            if definition_json.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "invalid plan run definition json: definition_json must not be empty"
+                ));
+            }
+            sql.push_str(&format!(", definition_json = ?{next_index}"));
+            bindings.push(Box::new(definition_json));
+            next_index += 1;
+        }
+
+        match updated_fields.active_child_session_id {
+            NullableUpdate::Unchanged => {}
+            NullableUpdate::Null => {
+                sql.push_str(&format!(", active_child_session_id = ?{next_index}"));
+                bindings.push(Box::new(Option::<String>::None));
+                next_index += 1;
+            }
+            NullableUpdate::Value(value) => {
+                sql.push_str(&format!(", active_child_session_id = ?{next_index}"));
+                bindings.push(Box::new(Some(value)));
+                next_index += 1;
+            }
+        }
+
+        match updated_fields.last_failure_json {
+            NullableUpdate::Unchanged => {}
+            NullableUpdate::Null => {
+                sql.push_str(&format!(", last_failure_json = ?{next_index}"));
+                bindings.push(Box::new(Option::<String>::None));
+                next_index += 1;
+            }
+            NullableUpdate::Value(value) => {
+                sql.push_str(&format!(", last_failure_json = ?{next_index}"));
+                bindings.push(Box::new(Some(value)));
+                next_index += 1;
+            }
+        }
+
+        sql.push_str(&format!(" WHERE id = ?{next_index} AND status != 'failed'"));
+        bindings.push(Box::new(id.to_string()));
+
+        let changed = self
+            .conn
+            .execute(
+                &sql,
+                rusqlite::params_from_iter(bindings.iter().map(|value| value.as_ref())),
+            )
+            .context("failed to update plan run status")?;
+        Ok(changed > 0)
+    }
+
+    pub fn list_stale_running_plan_runs(&self, stale_after_secs: u64) -> Result<Vec<PlanRun>> {
+        let stale_after_secs = stale_after_secs.min(i64::MAX as u64) as i64;
+        let stale_before = unix_timestamp().saturating_sub(stale_after_secs);
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT
+                    id,
+                    owner_session_id,
+                    topic,
+                    trigger_source,
+                    status,
+                    revision,
+                    current_step_index,
+                    active_child_session_id,
+                    definition_json,
+                    last_failure_json,
+                    claimed_at,
+                    created_at,
+                    updated_at
+                 FROM plan_runs
+                 WHERE status = 'running'
+                   AND claimed_at IS NOT NULL
+                   AND claimed_at <= ?1
+                 ORDER BY claimed_at ASC, created_at ASC, id ASC",
+            )
+            .context("failed to prepare list_stale_running_plan_runs query")?;
+
+        let plan_runs = statement
+            .query_map(params![stale_before], plan_run_from_row)
+            .context("failed to query stale running plan runs")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to collect stale running plan runs")?;
+
+        Ok(plan_runs)
+    }
+
+    pub fn next_step_attempt_index_for_run(&self, plan_run: &PlanRun) -> Result<i64> {
+        let attempts = self.get_step_attempts(&plan_run.id, plan_run.current_step_index)?;
+        Ok(attempts
+            .into_iter()
+            .filter(|attempt| attempt.revision == plan_run.revision)
+            .map(|attempt| attempt.attempt)
+            .max()
+            .map(|attempt| attempt + 1)
+            .unwrap_or(0))
+    }
+
+    pub fn max_step_attempt_index_for_run(&self, plan_run_id: &str) -> Result<i64> {
+        let max_attempt: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MAX(attempt) FROM plan_step_attempts WHERE plan_run_id = ?1",
+                params![plan_run_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .context("failed to query maximum plan step attempt")?;
+        Ok(max_attempt.unwrap_or(-1))
+    }
+
+    pub fn crash_running_step_attempts_for_run(
+        &mut self,
+        plan_run_id: &str,
+    ) -> Result<Vec<StepAttempt>> {
+        self.with_transaction(|tx| {
+            Self::crash_running_step_attempts_for_run_in_transaction(tx, plan_run_id)
+        })
+    }
+
+    pub(crate) fn crash_running_step_attempts_for_run_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        plan_run_id: &str,
+    ) -> Result<Vec<StepAttempt>> {
+        let attempts = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT
+                        id,
+                        plan_run_id,
+                        revision,
+                        step_index,
+                        step_id,
+                        attempt,
+                        status,
+                        child_session_id,
+                        summary_json,
+                        checks_json,
+                        started_at,
+                        finished_at
+                     FROM plan_step_attempts
+                     WHERE plan_run_id = ?1
+                       AND status = 'running'
+                       AND finished_at IS NULL
+                     ORDER BY revision DESC, step_index DESC, attempt DESC, id DESC",
+                )
+                .context("failed to prepare crashed step attempt recovery query")?;
+            statement
+                .query_map(params![plan_run_id], step_attempt_from_row)
+                .context("failed to query crashed step attempts")?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("failed to collect crashed step attempts")?
+        };
+
+        for attempt in &attempts {
+            let changed = tx
+                .execute(
+                    "UPDATE plan_step_attempts
+                     SET status = 'crashed',
+                         finished_at = ?2
+                     WHERE id = ?1
+                       AND status = 'running'
+                       AND finished_at IS NULL",
+                    params![attempt.id, utc_timestamp()],
+                )
+                .context("failed to crash plan step attempt")?;
+            if changed == 0 {
+                return Err(anyhow::anyhow!(
+                    "failed to crash plan step attempt: attempt not found or already finalized"
+                ));
+            }
+        }
+
+        Ok(attempts)
     }
 
     pub fn record_step_attempt(&mut self, record: StepAttemptRecord) -> Result<i64> {
@@ -2201,7 +2509,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_next_runnable_plan_run_skips_running_row_after_recovery_leaves_claimable() {
+    fn claim_next_runnable_plan_run_skips_running_row_after_recovery() {
         let path = temp_db_path("plan_run_claim_runnable");
         let mut store = Store::new(&path).unwrap();
         store.create_session("owner", None).unwrap();
@@ -2222,16 +2530,12 @@ mod tests {
         assert_eq!(recovered_run.status, "running");
         assert!(recovered_run.claimed_at.is_some());
 
-        let claimed = store.claim_next_runnable_plan_run(300).unwrap();
-        assert_eq!(
-            claimed.as_ref().map(|plan_run| plan_run.id.as_str()),
-            Some("plan-1")
-        );
+        assert!(store.claim_next_runnable_plan_run(300).unwrap().is_none());
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn claim_next_runnable_plan_run_claims_stale_running_row() {
+    fn claim_next_runnable_plan_run_does_not_claim_stale_running_row() {
         let path = temp_db_path("plan_run_claim_runnable_running");
         let mut store = Store::new(&path).unwrap();
         store.create_session("owner", None).unwrap();
@@ -2249,10 +2553,7 @@ mod tests {
             )
             .unwrap();
 
-        let claimed = store.claim_next_runnable_plan_run(300).unwrap().unwrap();
-        assert_eq!(claimed.id, "plan-running");
-        assert_eq!(claimed.status, "running");
-        assert!(claimed.claimed_at.is_some());
+        assert!(store.claim_next_runnable_plan_run(300).unwrap().is_none());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2394,7 +2695,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_stale_plan_runs_leaves_stale_running_rows_claimable() {
+    fn recover_stale_plan_runs_keeps_stale_running_rows_unclaimable() {
         let path = temp_db_path("plan_run_recover_running");
         let mut store = Store::new(&path).unwrap();
         store.create_session("owner", None).unwrap();
@@ -2416,6 +2717,70 @@ mod tests {
         let recovered_run = store.get_plan_run("plan-1").unwrap().unwrap();
         assert_eq!(recovered_run.status, "running");
         assert!(recovered_run.claimed_at.is_some());
+        assert!(store.claim_next_runnable_plan_run(300).unwrap().is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn crash_running_step_attempts_for_run_marks_rows_crashed_and_returns_original_metadata() {
+        let path = temp_db_path("plan_run_crash_attempts");
+        let mut store = Store::new(&path).unwrap();
+        store.create_session("owner", None).unwrap();
+        store
+            .create_plan_run(
+                "plan-1",
+                "owner",
+                r#"{"kind":"plan","steps":[]}"#,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .record_step_attempt(StepAttemptRecord {
+                plan_run_id: "plan-1".to_string(),
+                revision: 1,
+                step_index: 0,
+                step_id: "step-a".to_string(),
+                attempt: 0,
+                status: "running".to_string(),
+                child_session_id: Some("child-a".to_string()),
+                summary_json: r#"{"kind":"plan_step_summary","attempt":0}"#.to_string(),
+                checks_json: r#"[{"check_id":"check-a"}]"#.to_string(),
+            })
+            .unwrap();
+        store
+            .record_step_attempt(StepAttemptRecord {
+                plan_run_id: "plan-1".to_string(),
+                revision: 1,
+                step_index: 0,
+                step_id: "step-a".to_string(),
+                attempt: 1,
+                status: "running".to_string(),
+                child_session_id: Some("child-b".to_string()),
+                summary_json: r#"{"kind":"plan_step_summary","attempt":1}"#.to_string(),
+                checks_json: r#"[{"check_id":"check-b"}]"#.to_string(),
+            })
+            .unwrap();
+
+        let crashed = store.crash_running_step_attempts_for_run("plan-1").unwrap();
+        assert_eq!(crashed.len(), 2);
+        assert_eq!(crashed[0].status, "running");
+        assert_eq!(
+            crashed[0].summary_json,
+            r#"{"kind":"plan_step_summary","attempt":1}"#
+        );
+        assert_eq!(
+            crashed[1].summary_json,
+            r#"{"kind":"plan_step_summary","attempt":0}"#
+        );
+
+        let attempts = store.get_step_attempts("plan-1", 0).unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts.iter().all(|attempt| attempt.status == "crashed"));
+        assert!(attempts.iter().all(|attempt| attempt.finished_at.is_some()));
+        assert_eq!(attempts[0].checks_json, r#"[{"check_id":"check-a"}]"#);
+        assert_eq!(attempts[1].checks_json, r#"[{"check_id":"check-b"}]"#);
 
         let _ = std::fs::remove_file(&path);
     }

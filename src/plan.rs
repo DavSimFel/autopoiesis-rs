@@ -5,8 +5,10 @@ use std::collections::HashSet;
 pub(crate) mod executor;
 pub(crate) mod notify;
 pub(crate) mod patch;
+pub mod recovery;
 pub mod runner;
 
+pub use recovery::recover_crashed_plans;
 pub use runner::{
     CheckOutcome, CheckVerdict, ObservedOutput, PlanFailureDetails, StepOutcome, run_plan_step,
     tick_plan_runner,

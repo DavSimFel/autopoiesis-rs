@@ -36,6 +36,7 @@ context.rs                  ContextSource trait - Identity (prompt files), Skill
 turn.rs                     Turn composition: tier-aware ContextSource + Tool + Guard builder, taint via is_taint_source()
 tool.rs                     Shell tool: async exec, RLIMIT, process-group kill, bounded output drain
 store.rs                    SQLite session registry + message queue + subscriptions table
+plan.rs                     Plan engine, crash recovery, failure notifications, CLI state transitions
 auth.rs                     OAuth device flow, token storage/refresh
 config.rs                   agents.toml loading, ShellPolicy, BudgetConfig, skill catalog loading,
                             resolved identity file lists

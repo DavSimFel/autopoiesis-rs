@@ -142,6 +142,7 @@ If this passes, the tier architecture is real.
 - CI pipeline (GitHub Actions)
 - Pre-commit hooks (fmt + clippy + test + secrets + auto-stats)
 - Docs restructure (index, specs/, architecture/, archive/)
+- Phase 6 plan engine (crash recovery, CLI commands, startup wiring)
 
 </details>
 

@@ -1,9 +1,45 @@
 use anyhow::{Context, Result};
+use rusqlite::OptionalExtension;
 use serde::Serialize;
+#[cfg(test)]
+use std::cell::Cell;
 
 use crate::plan::runner::{CheckVerdict, ObservedOutput, PlanFailureDetails};
 use crate::store::{NullableUpdate, PlanRun, Store};
 use crate::util::utc_timestamp;
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_NOTIFY_FAILURE_TX_ERROR_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_force_notify_failure_tx_error(value: bool) {
+    set_force_notify_failure_tx_error_after(value.then_some(1));
+}
+
+#[cfg(test)]
+pub(crate) fn set_force_notify_failure_tx_error_after(value: Option<usize>) {
+    FORCE_NOTIFY_FAILURE_TX_ERROR_AFTER.with(|flag| flag.set(value));
+}
+
+#[cfg(test)]
+fn should_force_notify_failure_tx_error() -> bool {
+    FORCE_NOTIFY_FAILURE_TX_ERROR_AFTER.with(|flag| {
+        let current = flag.get();
+        match current {
+            Some(1) => {
+                flag.set(None);
+                true
+            }
+            Some(n) => {
+                flag.set(Some(n.saturating_sub(1)));
+                false
+            }
+            None => false,
+        }
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct PlanFailureNotificationPayload {
@@ -30,90 +66,116 @@ pub(crate) fn notify_plan_failure(
     plan_run: &PlanRun,
     failure: &PlanFailureDetails,
 ) -> Result<()> {
+    store
+        .with_transaction(|tx| notify_plan_failure_in_transaction(tx, plan_run, failure))
+        .context("failed to notify plan failure atomically")?;
+
+    Ok(())
+}
+
+pub(crate) fn notify_plan_failure_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    plan_run: &PlanRun,
+    failure: &PlanFailureDetails,
+) -> Result<()> {
+    let current_status: Option<String> = tx
+        .query_row(
+            "SELECT status FROM plan_runs WHERE id = ?1",
+            rusqlite::params![plan_run.id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to inspect plan run before notifying failure")?;
+    match current_status.as_deref() {
+        Some("failed") => return Ok(()),
+        Some(_) => {}
+        None => {
+            return Err(anyhow::anyhow!(
+                "failed to update plan run after failure: plan run not found"
+            ));
+        }
+    }
+
     let payload = build_plan_failure_payload(plan_run, failure);
     let payload_json = serde_json::to_string(&payload)
         .context("failed to serialize plan failure notification payload")?;
+    crate::store::Store::enqueue_message_in_transaction(
+        tx,
+        &plan_run.owner_session_id,
+        "user",
+        &payload_json,
+        &format!("agent-plan-{}", plan_run.id),
+    )
+    .context("failed to enqueue plan failure notification")?;
 
-    let owner_session_id = plan_run.owner_session_id.clone();
-    let plan_run_id = plan_run.id.clone();
-    let source = format!("agent-plan-{plan_run_id}");
-    let active_child_session_update = failure.active_child_session_update.clone();
-    store
-        .with_transaction(|tx| {
-            crate::store::Store::enqueue_message_in_transaction(
-                tx,
-                &owner_session_id,
-                "user",
-                &payload_json,
-                &source,
-            )
-            .context("failed to enqueue plan failure notification")?;
-            match active_child_session_update {
-                NullableUpdate::Unchanged => {
-                    let changed = tx
-                        .execute(
-                            "UPDATE plan_runs
-                         SET status = 'waiting_t2',
-                             updated_at = ?2,
-                             last_failure_json = ?3,
-                             claimed_at = NULL
-                             WHERE id = ?1",
-                            rusqlite::params![plan_run_id, utc_timestamp(), payload_json],
-                        )
-                        .context("failed to update plan run after failure")?;
-                    if changed == 0 {
-                        return Err(anyhow::anyhow!(
-                            "failed to update plan run after failure: plan run not found"
-                        ));
-                    }
-                }
-                NullableUpdate::Null => {
-                    let changed = tx
-                        .execute(
-                            "UPDATE plan_runs
-                         SET status = 'waiting_t2',
-                             updated_at = ?2,
-                             last_failure_json = ?3,
-                             claimed_at = NULL,
-                             active_child_session_id = ?4
-                         WHERE id = ?1",
-                            rusqlite::params![
-                                plan_run_id,
-                                utc_timestamp(),
-                                payload_json,
-                                Option::<String>::None,
-                            ],
-                        )
-                        .context("failed to update plan run after failure")?;
-                    if changed == 0 {
-                        return Err(anyhow::anyhow!(
-                            "failed to update plan run after failure: plan run not found"
-                        ));
-                    }
-                }
-                NullableUpdate::Value(value) => {
-                    let changed = tx
-                        .execute(
-                            "UPDATE plan_runs
-                         SET status = 'waiting_t2',
-                             updated_at = ?2,
-                             last_failure_json = ?3,
-                             claimed_at = NULL,
-                             active_child_session_id = ?4
-                         WHERE id = ?1",
-                            rusqlite::params![plan_run_id, utc_timestamp(), payload_json, value],
-                        )
-                        .context("failed to update plan run after failure")?;
-                    if changed == 0 {
-                        return Err(anyhow::anyhow!(
-                            "failed to update plan run after failure: plan run not found"
-                        ));
-                    }
-                }
+    #[cfg(test)]
+    if should_force_notify_failure_tx_error() {
+        return Err(anyhow::anyhow!("forced plan failure transaction error"));
+    }
+
+    match &failure.active_child_session_update {
+        NullableUpdate::Unchanged => {
+            let changed = tx
+                .execute(
+                    "UPDATE plan_runs
+                     SET status = 'waiting_t2',
+                         updated_at = ?2,
+                         last_failure_json = ?3,
+                         claimed_at = NULL
+                     WHERE id = ?1",
+                    rusqlite::params![plan_run.id, utc_timestamp(), &payload_json],
+                )
+                .context("failed to update plan run after failure")?;
+            if changed == 0 {
+                return Err(anyhow::anyhow!(
+                    "failed to update plan run after failure: plan run not found"
+                ));
             }
-            Ok(())
-        })
-        .context("failed to notify plan failure atomically")?;
+        }
+        NullableUpdate::Null => {
+            let changed = tx
+                .execute(
+                    "UPDATE plan_runs
+                     SET status = 'waiting_t2',
+                         updated_at = ?2,
+                         last_failure_json = ?3,
+                         claimed_at = NULL,
+                         active_child_session_id = ?4
+                     WHERE id = ?1",
+                    rusqlite::params![
+                        plan_run.id,
+                        utc_timestamp(),
+                        &payload_json,
+                        Option::<String>::None,
+                    ],
+                )
+                .context("failed to update plan run after failure")?;
+            if changed == 0 {
+                return Err(anyhow::anyhow!(
+                    "failed to update plan run after failure: plan run not found"
+                ));
+            }
+        }
+        NullableUpdate::Value(value) => {
+            let changed = tx
+                .execute(
+                    "UPDATE plan_runs
+                     SET status = 'waiting_t2',
+                         updated_at = ?2,
+                         last_failure_json = ?3,
+                         claimed_at = NULL,
+                         active_child_session_id = ?4
+                     WHERE id = ?1",
+                    rusqlite::params![plan_run.id, utc_timestamp(), &payload_json, value],
+                )
+                .context("failed to update plan run after failure")?;
+            if changed == 0 {
+                return Err(anyhow::anyhow!(
+                    "failed to update plan run after failure: plan run not found"
+                ));
+            }
+        }
+    }
 
     Ok(())
 }
@@ -153,6 +215,7 @@ fn verdict_to_string(verdict: &CheckVerdict) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::set_force_notify_failure_tx_error;
     use super::*;
     use crate::plan::runner::{CheckOutcome, ObservedOutput, PlanFailureDetails};
     use crate::store::{NullableUpdate, PlanRunUpdateFields};
@@ -261,6 +324,63 @@ mod tests {
         notify_plan_failure(&mut store, &plan_run, &failure).unwrap();
         let updated = store.get_plan_run(&plan_run.id).unwrap().unwrap();
         assert!(updated.active_child_session_id.is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn notify_plan_failure_rolls_back_when_transaction_fails() {
+        let (mut store, root) = test_store();
+        let plan_run = test_plan_run(&mut store);
+        let failure = PlanFailureDetails {
+            step_index: 1,
+            step_id: "step-1".to_string(),
+            attempt: 0,
+            reason: "boom".to_string(),
+            payload_child_session_id: None,
+            active_child_session_update: NullableUpdate::Unchanged,
+            checks: vec![],
+        };
+
+        set_force_notify_failure_tx_error(true);
+        let err = notify_plan_failure(&mut store, &plan_run, &failure).expect_err("tx should fail");
+        set_force_notify_failure_tx_error(false);
+
+        assert!(
+            err.to_string()
+                .contains("failed to notify plan failure atomically")
+        );
+        let restored = store.get_plan_run(&plan_run.id).unwrap().unwrap();
+        assert_eq!(restored.status, "pending");
+        assert_eq!(restored.last_failure_json, None);
+        assert!(store.dequeue_next_message("owner").unwrap().is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn notify_plan_failure_does_not_resurrect_failed_plan_run() {
+        let (mut store, root) = test_store();
+        let plan_run = test_plan_run(&mut store);
+        store
+            .update_plan_run_status("plan-1", "failed", Default::default())
+            .unwrap();
+        let failure = PlanFailureDetails {
+            step_index: 1,
+            step_id: "step-1".to_string(),
+            attempt: 0,
+            reason: "boom".to_string(),
+            payload_child_session_id: None,
+            active_child_session_update: NullableUpdate::Unchanged,
+            checks: vec![],
+        };
+
+        notify_plan_failure(&mut store, &plan_run, &failure).unwrap();
+
+        let restored = store.get_plan_run(&plan_run.id).unwrap().unwrap();
+        assert_eq!(restored.status, "failed");
+        assert_eq!(restored.last_failure_json, None);
+        assert!(store.dequeue_next_message("owner").unwrap().is_none());
 
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -14,7 +14,7 @@ use axum::{
 use reqwest::Client;
 use tokio::sync::Mutex;
 
-use crate::{config, store};
+use crate::{config, plan, store};
 use tracing::{info, warn};
 
 mod auth;
@@ -49,6 +49,15 @@ pub async fn run(port: u16) -> Result<()> {
         Ok(_) => {}
         Err(error) => {
             warn!(%error, "failed to recover stale messages");
+        }
+    }
+    match plan::recover_crashed_plans(&mut store, config.queue.stale_processing_timeout_secs) {
+        Ok(recovered) if recovered > 0 => {
+            info!(recovered, "recovered crashed plan runs from previous crash");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(%error, "failed to recover crashed plan runs");
         }
     }
     let state = ServerState {

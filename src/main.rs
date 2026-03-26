@@ -88,6 +88,10 @@ enum Commands {
         #[arg(short, long, default_value_t = 8423)]
         port: u16,
     },
+    Plan {
+        #[command(subcommand)]
+        action: PlanCommand,
+    },
     Sub {
         #[command(subcommand)]
         action: SubscriptionCommand,
@@ -106,6 +110,14 @@ enum SubscriptionCommand {
     Add(SubscriptionAddArgs),
     Remove(SubscriptionRemoveArgs),
     List(SubscriptionListArgs),
+}
+
+#[derive(Subcommand)]
+enum PlanCommand {
+    Status(PlanStatusArgs),
+    List(PlanListArgs),
+    Resume(PlanRunIdArgs),
+    Cancel(PlanRunIdArgs),
 }
 
 #[derive(Args)]
@@ -146,6 +158,22 @@ struct SubscriptionRemoveArgs {
 struct SubscriptionListArgs {
     #[arg(long)]
     topic: Option<String>,
+}
+
+#[derive(Args)]
+struct PlanStatusArgs {
+    plan_run_id: Option<String>,
+}
+
+#[derive(Args)]
+struct PlanRunIdArgs {
+    plan_run_id: String,
+}
+
+#[derive(Args)]
+struct PlanListArgs {
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
 }
 
 fn resolve_session_id(cli_session: Option<&str>, config_session: Option<&str>) -> String {
@@ -267,6 +295,128 @@ fn print_subscription_rows(records: &[SubscriptionRecord]) {
     for record in records {
         info!(target: STDOUT_USER_OUTPUT_TARGET, "{}", record.format_listing());
     }
+}
+
+fn plan_run_retries(store: &store::Store, plan_run: &store::PlanRun) -> Result<i64> {
+    let next_attempt = store.next_step_attempt_index_for_run(plan_run)?;
+    Ok(if next_attempt > 0 {
+        next_attempt - 1
+    } else {
+        0
+    })
+}
+
+fn resolve_plan_run_for_status(
+    store: &store::Store,
+    plan_run_id: Option<&str>,
+) -> Result<Option<store::PlanRun>> {
+    match plan_run_id {
+        Some(plan_run_id) => store.get_plan_run(plan_run_id),
+        None => Ok(store.list_recent_active_plan_runs(1)?.into_iter().next()),
+    }
+}
+
+fn format_plan_run_summary(plan_run: &store::PlanRun, retries: i64) -> String {
+    let current_step = if plan_run.current_step_index >= 0 {
+        plan_run.current_step_index.to_string()
+    } else {
+        "n/a".to_string()
+    };
+    format!(
+        "{} status={} step={} retries={} claimed_at={} updated_at={}",
+        plan_run.id,
+        plan_run.status,
+        current_step,
+        retries,
+        plan_run
+            .claimed_at
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        plan_run.updated_at,
+    )
+}
+
+async fn handle_plan_command(command: PlanCommand) -> Result<()> {
+    let mut store = store::Store::new("sessions/queue.sqlite")?;
+
+    match command {
+        PlanCommand::Status(args) => {
+            match resolve_plan_run_for_status(&store, args.plan_run_id.as_deref())? {
+                Some(plan_run) => {
+                    let retries = plan_run_retries(&store, &plan_run)?;
+                    info!(
+                        target: STDOUT_USER_OUTPUT_TARGET,
+                        "{}",
+                        format_plan_run_summary(&plan_run, retries)
+                    );
+                    if let Some(failure_json) = &plan_run.last_failure_json {
+                        info!(
+                            target: STDOUT_USER_OUTPUT_TARGET,
+                            "last failure: {failure_json}"
+                        );
+                    }
+                }
+                None => match args.plan_run_id {
+                    Some(plan_run_id) => info!(
+                        target: STDOUT_USER_OUTPUT_TARGET,
+                        "plan run {} not found",
+                        plan_run_id
+                    ),
+                    None => info!(
+                        target: STDOUT_USER_OUTPUT_TARGET,
+                        "no active plan runs"
+                    ),
+                },
+            }
+        }
+        PlanCommand::List(args) => {
+            let plan_runs = store.list_recent_plan_runs(args.limit)?;
+            if plan_runs.is_empty() {
+                info!(target: STDOUT_USER_OUTPUT_TARGET, "no recent plan runs");
+            } else {
+                for plan_run in plan_runs {
+                    let retries = plan_run_retries(&store, &plan_run)?;
+                    info!(
+                        target: STDOUT_USER_OUTPUT_TARGET,
+                        "{}",
+                        format_plan_run_summary(&plan_run, retries)
+                    );
+                }
+            }
+        }
+        PlanCommand::Resume(args) => {
+            if store.resume_waiting_plan_run(&args.plan_run_id)? {
+                info!(
+                    target: STDOUT_USER_OUTPUT_TARGET,
+                    "resumed plan run {}",
+                    args.plan_run_id
+                );
+            } else {
+                info!(
+                    target: STDOUT_USER_OUTPUT_TARGET,
+                    "plan run {} is not waiting_t2",
+                    args.plan_run_id
+                );
+            }
+        }
+        PlanCommand::Cancel(args) => {
+            if store.cancel_plan_run(&args.plan_run_id)? {
+                info!(
+                    target: STDOUT_USER_OUTPUT_TARGET,
+                    "cancelled plan run {}",
+                    args.plan_run_id
+                );
+            } else {
+                info!(
+                    target: STDOUT_USER_OUTPUT_TARGET,
+                    "plan run {} could not be cancelled",
+                    args.plan_run_id
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn handle_subscription_command(command: SubscriptionCommand) -> Result<()> {
@@ -407,6 +557,9 @@ async fn main() -> Result<()> {
         Some(Commands::Serve { port }) => {
             server::run(port).await?;
         }
+        Some(Commands::Plan { action }) => {
+            handle_plan_command(action).await?;
+        }
         Some(Commands::Sub { action }) => {
             handle_subscription_command(action).await?;
         }
@@ -523,11 +676,17 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_session_id;
+    use super::{
+        Cli, Commands, PlanCommand, PlanListArgs, PlanRunIdArgs, PlanStatusArgs,
+        handle_plan_command, resolve_session_id,
+    };
     use super::{
         STDERR_USER_OUTPUT_TARGET, STDOUT_USER_OUTPUT_TARGET, build_tracing_subscriber_with_filters,
     };
+    use autopoiesis::store::{PlanRunUpdateFields, Store};
+    use clap::Parser;
     use std::io::{self, Write};
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::filter::EnvFilter;
 
@@ -550,6 +709,197 @@ mod tests {
     #[test]
     fn resolve_session_id_falls_back_to_default() {
         assert_eq!(resolve_session_id(None, None), "default");
+    }
+
+    #[test]
+    fn parses_plan_status_command() {
+        let cli = Cli::parse_from(["autopoiesis", "plan", "status", "plan-1"]);
+        match cli.command {
+            Some(Commands::Plan {
+                action: PlanCommand::Status(args),
+            }) => assert_eq!(args.plan_run_id.as_deref(), Some("plan-1")),
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn parses_plan_status_command_without_id() {
+        let cli = Cli::parse_from(["autopoiesis", "plan", "status"]);
+        match cli.command {
+            Some(Commands::Plan {
+                action: PlanCommand::Status(args),
+            }) => assert_eq!(args.plan_run_id, None),
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn parses_plan_list_command() {
+        let cli = Cli::parse_from(["autopoiesis", "plan", "list", "--limit", "3"]);
+        match cli.command {
+            Some(Commands::Plan {
+                action: PlanCommand::List(args),
+            }) => assert_eq!(args.limit, 3),
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn plan_summary_includes_status_step_and_retries() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "autopoiesis_plan_cli_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let mut store = Store::new(temp_root.join("queue.sqlite")).unwrap();
+        store.create_session("owner", None).unwrap();
+        store
+            .create_plan_run(
+                "plan-1",
+                "owner",
+                r#"{"kind":"plan","steps":[]}"#,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .update_plan_run_status(
+                "plan-1",
+                "running",
+                PlanRunUpdateFields {
+                    current_step_index: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let plan_run = store.get_plan_run("plan-1").unwrap().unwrap();
+        let retries = super::plan_run_retries(&store, &plan_run).unwrap();
+        let summary = super::format_plan_run_summary(&plan_run, retries);
+
+        assert!(summary.contains("plan-1"));
+        assert!(summary.contains("status=running"));
+        assert!(summary.contains("step=2"));
+        assert!(summary.contains("retries=0"));
+
+        std::fs::remove_dir_all(Path::new(&temp_root)).unwrap();
+    }
+
+    #[test]
+    fn plan_status_missing_id_lookup_returns_none() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "autopoiesis_plan_status_lookup_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let store = Store::new(temp_root.join("queue.sqlite")).unwrap();
+
+        assert!(
+            super::resolve_plan_run_for_status(&store, Some("missing-plan"))
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(Path::new(&temp_root)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_plan_command_emits_expected_output_branches() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "autopoiesis_plan_command_output_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(temp_root.join("sessions")).unwrap();
+        let old_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_root).unwrap();
+        struct RestoreDir(std::path::PathBuf);
+        impl Drop for RestoreDir {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _restore_dir = RestoreDir(old_dir);
+
+        {
+            let mut store = Store::new("sessions/queue.sqlite").unwrap();
+            store.create_session("owner", None).unwrap();
+            store
+                .create_plan_run(
+                    "plan-waiting",
+                    "owner",
+                    r#"{"kind":"plan","steps":[]}"#,
+                    None,
+                    None,
+                )
+                .unwrap();
+            store
+                .update_plan_run_status("plan-waiting", "waiting_t2", Default::default())
+                .unwrap();
+        }
+
+        let stdout = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = build_tracing_subscriber_with_filters(
+            {
+                let stdout = stdout.clone();
+                move || SharedWriter(stdout.clone())
+            },
+            {
+                let stdout = stdout.clone();
+                move || SharedWriter(stdout.clone())
+            },
+            {
+                let stdout = stdout.clone();
+                move || SharedWriter(stdout.clone())
+            },
+            EnvFilter::new("info"),
+            EnvFilter::new(format!("{STDOUT_USER_OUTPUT_TARGET}=trace")),
+            EnvFilter::new(format!("{STDERR_USER_OUTPUT_TARGET}=trace")),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        handle_plan_command(PlanCommand::Status(PlanStatusArgs {
+            plan_run_id: Some("missing-plan".to_string()),
+        }))
+        .await
+        .unwrap();
+        let output = String::from_utf8(stdout.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("plan run missing-plan not found"));
+        stdout.lock().unwrap().clear();
+
+        handle_plan_command(PlanCommand::Resume(PlanRunIdArgs {
+            plan_run_id: "plan-waiting".to_string(),
+        }))
+        .await
+        .unwrap();
+        let output = String::from_utf8(stdout.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("resumed plan run plan-waiting"));
+        stdout.lock().unwrap().clear();
+
+        handle_plan_command(PlanCommand::Cancel(PlanRunIdArgs {
+            plan_run_id: "plan-waiting".to_string(),
+        }))
+        .await
+        .unwrap();
+        let output = String::from_utf8(stdout.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("cancelled plan run plan-waiting"));
+        stdout.lock().unwrap().clear();
+
+        handle_plan_command(PlanCommand::List(PlanListArgs { limit: 10 }))
+            .await
+            .unwrap();
+        let output = String::from_utf8(stdout.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("plan-waiting"));
+        assert!(output.contains("status=failed"));
+
+        std::fs::remove_dir_all(Path::new(&temp_root)).unwrap();
     }
 
     #[derive(Clone)]

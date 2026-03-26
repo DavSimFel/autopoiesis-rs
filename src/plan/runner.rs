@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::gate::output_cap::safe_call_id_for_filename;
 use crate::llm::ToolCall;
 use crate::plan::notify::notify_plan_failure;
+use crate::plan::recovery::crash_plan_run_to_waiting_t2;
 use crate::plan::{PlanAction, PlanStepSpec, ShellCheckSpec, ShellExpectation};
 use crate::session::Session;
 use crate::spawn::SpawnRequest;
@@ -516,9 +517,6 @@ where
     P: crate::llm::LlmProvider,
     TS: TokenSink + Send,
 {
-    store
-        .finalize_stale_step_attempts(&plan_run.id, plan_run.revision)
-        .context("failed to recover stale step attempts")?;
     let plan_action = plan_action_from_run(plan_run)?;
     ensure!(
         plan_run.current_step_index >= 0,
@@ -531,8 +529,8 @@ where
         return Err(anyhow!("plan run current step index is out of range"));
     }
     if current_step_index == plan_action.steps.len() {
-        store
-            .update_plan_run_status(
+        let _ = store
+            .update_plan_run_status_preserving_failed(
                 &plan_run.id,
                 "completed",
                 PlanRunUpdateFields {
@@ -544,6 +542,16 @@ where
             )
             .context("failed to mark completed plan run")?;
         return Ok(StepOutcome::Completed);
+    }
+
+    let preexisting_running_attempts = store
+        .get_step_attempts(&plan_run.id, step_index)?
+        .into_iter()
+        .any(|attempt| attempt.revision == plan_run.revision && attempt.status == "running");
+    if preexisting_running_attempts {
+        let failure = crash_plan_run_to_waiting_t2(store, plan_run)
+            .context("failed to hand off preexisting running plan step attempts")?;
+        return Ok(StepOutcome::WaitingT2 { failure });
     }
 
     let step = step_at(&plan_action, current_step_index)?;
@@ -632,7 +640,7 @@ where
                     let summary_json = serialize_json(&summary, "step summary")?;
                     let checks_json = initial_checks_json.clone();
                     store
-                        .update_plan_run_status(
+                        .update_plan_run_status_preserving_failed(
                             &plan_run.id,
                             "failed",
                             PlanRunUpdateFields {
@@ -735,7 +743,7 @@ where
 
             let completed = current_step_index + 1 >= plan_action.steps.len();
             store
-                .update_plan_run_status(
+                .update_plan_run_status_preserving_failed(
                     &plan_run.id,
                     if completed { "completed" } else { "pending" },
                     PlanRunUpdateFields {
@@ -951,7 +959,7 @@ where
 
             let completed = current_step_index + 1 >= plan_action.steps.len();
             store
-                .update_plan_run_status(
+                .update_plan_run_status_preserving_failed(
                     &plan_run.id,
                     if completed { "completed" } else { "pending" },
                     PlanRunUpdateFields {
@@ -1009,8 +1017,14 @@ where
 
     match outcome {
         Ok(StepOutcome::WaitingT2 { failure }) => {
-            notify_plan_failure(store, &plan_run, &failure)
-                .context("failed to notify T2 of plan failure")?;
+            let should_notify = store
+                .get_plan_run(&plan_run.id)?
+                .map(|current| current.status != "waiting_t2")
+                .unwrap_or(true);
+            if should_notify {
+                notify_plan_failure(store, &plan_run, &failure)
+                    .context("failed to notify T2 of plan failure")?;
+            }
             Ok(Some(StepOutcome::WaitingT2 { failure }))
         }
         Ok(outcome) => {
@@ -1024,7 +1038,7 @@ where
                 "message": error.to_string(),
             })
             .to_string();
-            if let Err(cleanup_error) = store.update_plan_run_status(
+            if let Err(cleanup_error) = store.update_plan_run_status_preserving_failed(
                 &plan_run.id,
                 "failed",
                 PlanRunUpdateFields {
@@ -1565,7 +1579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_plan_step_finalizes_stale_attempts_before_resuming_step() {
+    async fn run_plan_step_detects_preexisting_running_attempt_and_returns_waiting_t2() {
         let root = temp_sessions_dir("stale_attempt_resume");
         let config = test_config(&root);
         let mut store = Store::new(root.join("store.sqlite")).unwrap();
@@ -1633,17 +1647,17 @@ mod tests {
             })
             .unwrap();
         store
-            .update_plan_run_status(
+            .update_plan_run_status_preserving_failed(
                 &plan_run.id,
                 "running",
                 PlanRunUpdateFields {
-                    current_step_index: Some(1),
+                    current_step_index: Some(0),
                     ..Default::default()
                 },
             )
             .unwrap();
         let resumed_plan_run = store.get_plan_run(&plan_run.id).unwrap().unwrap();
-        assert_eq!(resumed_plan_run.current_step_index, 1);
+        assert_eq!(resumed_plan_run.current_step_index, 0);
 
         let mut make_provider = |_config: &crate::config::Config| {
             let provider = StaticProvider {
@@ -1667,15 +1681,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(outcome, StepOutcome::Completed);
+        assert!(matches!(outcome, StepOutcome::WaitingT2 { .. }));
         let attempts = store.get_step_attempts(&plan_run.id, 0).unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].id, stale_attempt_id);
         assert_eq!(attempts[0].status, "crashed");
         assert!(attempts[0].finished_at.is_some());
         let updated = store.get_plan_run(&plan_run.id).unwrap().unwrap();
-        assert_eq!(updated.status, "completed");
-        assert_eq!(updated.current_step_index, 2);
+        assert_eq!(updated.status, "waiting_t2");
+        assert_eq!(updated.current_step_index, 0);
     }
 
     #[tokio::test]
@@ -1937,7 +1951,7 @@ mod tests {
             &shell_plan("echo shell-ok", "echo shell-ok", "shell-ok"),
         );
         store
-            .update_plan_run_status(
+            .update_plan_run_status_preserving_failed(
                 "plan-bad",
                 "pending",
                 PlanRunUpdateFields {
