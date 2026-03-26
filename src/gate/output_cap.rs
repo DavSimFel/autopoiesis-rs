@@ -21,8 +21,9 @@ pub(crate) fn safe_call_id_for_filename(call_id: &str) -> String {
     for byte in call_id.as_bytes() {
         match byte {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => safe.push(*byte as char),
-            _ => write!(&mut safe, "_{:0width$X}", byte, width = HEX_WIDTH)
-                .expect("writing to String cannot fail"),
+            _ => {
+                let _ = write!(&mut safe, "_{:0width$X}", byte, width = HEX_WIDTH);
+            }
         }
     }
 

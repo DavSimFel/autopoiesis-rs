@@ -1,9 +1,10 @@
 //! Shared message and provider abstractions for LLM backends.
-#![allow(async_fn_in_trait)]
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::principal::Principal;
 
@@ -203,13 +204,16 @@ pub enum StopReason {
     ToolCalls,
 }
 
+/// Boxed future used by `LlmProvider` methods.
+pub type BoxFutureLlm<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 /// Abstraction over an LLM that can stream completion output.
 pub trait LlmProvider {
     /// Build and send a completion request, invoking `on_token` on each token chunk.
-    async fn stream_completion(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[FunctionTool],
-        on_token: &mut (dyn FnMut(String) + Send),
-    ) -> Result<StreamedTurn>;
+    fn stream_completion<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [FunctionTool],
+        on_token: &'a mut (dyn FnMut(String) + Send),
+    ) -> BoxFutureLlm<'a, Result<StreamedTurn>>;
 }

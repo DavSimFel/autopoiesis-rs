@@ -76,12 +76,15 @@ impl ExfilDetector {
 
     fn has_sensitive_read(&self, command: &str) -> bool {
         let lowered = command.to_lowercase();
-        let structured_read = shell_words::split(command).ok().is_some_and(|argv| {
-            simple_command_reads_protected_path(&argv)
-                || self.skills_dirs.iter().any(|skills_dir| {
-                    simple_command_reads_target_path(&argv, &skills_dir.to_string_lossy())
-                })
-        });
+        let structured_read = match shell_words::split(command) {
+            Ok(argv) => {
+                simple_command_reads_protected_path(&argv)
+                    || self.skills_dirs.iter().any(|skills_dir| {
+                        simple_command_reads_target_path(&argv, &skills_dir.to_string_lossy())
+                    })
+            }
+            Err(_) => true,
+        };
         let literal_read = SENSITIVE_READ_PATH_FRAGMENTS
             .iter()
             .any(|fragment| lowered.contains(fragment))

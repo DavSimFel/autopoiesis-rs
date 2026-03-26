@@ -31,22 +31,24 @@ impl InspectingProvider {
 }
 
 impl crate::llm::LlmProvider for InspectingProvider {
-    async fn stream_completion(
-        &self,
-        messages: &[ChatMessage],
-        _tools: &[FunctionTool],
-        _on_token: &mut (dyn FnMut(String) + Send),
-    ) -> Result<StreamedTurn> {
-        self.observed_message_counts
-            .lock()
-            .expect("observed message count mutex poisoned")
-            .push(messages.len());
+    fn stream_completion<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        _tools: &'a [FunctionTool],
+        _on_token: &'a mut (dyn FnMut(String) + Send),
+    ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+        Box::pin(async move {
+            self.observed_message_counts
+                .lock()
+                .expect("observed message count mutex poisoned")
+                .push(messages.len());
 
-        Ok(StreamedTurn {
-            assistant_message: ChatMessage::system("ok"),
-            tool_calls: vec![],
-            meta: None,
-            stop_reason: StopReason::Stop,
+            Ok(StreamedTurn {
+                assistant_message: ChatMessage::system("ok"),
+                tool_calls: vec![],
+                meta: None,
+                stop_reason: StopReason::Stop,
+            })
         })
     }
 }
@@ -65,17 +67,19 @@ impl SequenceProvider {
 }
 
 impl crate::llm::LlmProvider for SequenceProvider {
-    async fn stream_completion(
-        &self,
-        _messages: &[ChatMessage],
-        _tools: &[FunctionTool],
-        _on_token: &mut (dyn FnMut(String) + Send),
-    ) -> Result<StreamedTurn> {
-        self.turns
-            .lock()
-            .expect("sequence provider mutex poisoned")
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("no more turns"))
+    fn stream_completion<'a>(
+        &'a self,
+        _messages: &'a [ChatMessage],
+        _tools: &'a [FunctionTool],
+        _on_token: &'a mut (dyn FnMut(String) + Send),
+    ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+        Box::pin(async move {
+            self.turns
+                .lock()
+                .expect("sequence provider mutex poisoned")
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("no more turns"))
+        })
     }
 }
 
@@ -85,13 +89,13 @@ pub(crate) struct StaticProvider {
 }
 
 impl crate::llm::LlmProvider for StaticProvider {
-    async fn stream_completion(
-        &self,
-        _messages: &[ChatMessage],
-        _tools: &[FunctionTool],
-        _on_token: &mut (dyn FnMut(String) + Send),
-    ) -> Result<StreamedTurn> {
-        Ok(self.turn.clone())
+    fn stream_completion<'a>(
+        &'a self,
+        _messages: &'a [ChatMessage],
+        _tools: &'a [FunctionTool],
+        _on_token: &'a mut (dyn FnMut(String) + Send),
+    ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+        Box::pin(async move { Ok(self.turn.clone()) })
     }
 }
 
@@ -99,13 +103,13 @@ impl crate::llm::LlmProvider for StaticProvider {
 pub(crate) struct FailingProvider;
 
 impl crate::llm::LlmProvider for FailingProvider {
-    async fn stream_completion(
-        &self,
-        _messages: &[ChatMessage],
-        _tools: &[FunctionTool],
-        _on_token: &mut (dyn FnMut(String) + Send),
-    ) -> Result<StreamedTurn> {
-        Err(anyhow::anyhow!("provider failure"))
+    fn stream_completion<'a>(
+        &'a self,
+        _messages: &'a [ChatMessage],
+        _tools: &'a [FunctionTool],
+        _on_token: &'a mut (dyn FnMut(String) + Send),
+    ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+        Box::pin(async move { Err(anyhow::anyhow!("provider failure")) })
     }
 }
 
@@ -232,32 +236,34 @@ pub(crate) struct RecordingProvider {
 }
 
 impl crate::llm::LlmProvider for RecordingProvider {
-    async fn stream_completion(
-        &self,
-        _messages: &[ChatMessage],
-        tools: &[FunctionTool],
-        _on_token: &mut (dyn FnMut(String) + Send),
-    ) -> Result<StreamedTurn> {
-        self.observed_tools
-            .lock()
-            .expect("tools mutex poisoned")
-            .push(tools.iter().map(|tool| tool.name.clone()).collect());
+    fn stream_completion<'a>(
+        &'a self,
+        _messages: &'a [ChatMessage],
+        tools: &'a [FunctionTool],
+        _on_token: &'a mut (dyn FnMut(String) + Send),
+    ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+        Box::pin(async move {
+            self.observed_tools
+                .lock()
+                .expect("tools mutex poisoned")
+                .push(tools.iter().map(|tool| tool.name.clone()).collect());
 
-        Ok(StreamedTurn {
-            assistant_message: ChatMessage {
-                role: crate::llm::ChatRole::Assistant,
-                principal: Principal::Agent,
-                content: vec![MessageContent::text(self.assistant_text.clone())],
-            },
-            tool_calls: vec![],
-            meta: Some(crate::llm::TurnMeta {
-                model: Some("gpt-child".to_string()),
-                input_tokens: Some(1),
-                output_tokens: Some(1),
-                reasoning_tokens: None,
-                reasoning_trace: None,
-            }),
-            stop_reason: StopReason::Stop,
+            Ok(StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    principal: Principal::Agent,
+                    content: vec![MessageContent::text(self.assistant_text.clone())],
+                },
+                tool_calls: vec![],
+                meta: Some(crate::llm::TurnMeta {
+                    model: Some("gpt-child".to_string()),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    reasoning_tokens: None,
+                    reasoning_trace: None,
+                }),
+                stop_reason: StopReason::Stop,
+            })
         })
     }
 }
@@ -269,49 +275,51 @@ pub(crate) struct MessageRecordingProvider {
 }
 
 impl crate::llm::LlmProvider for MessageRecordingProvider {
-    async fn stream_completion(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[FunctionTool],
-        _on_token: &mut (dyn FnMut(String) + Send),
-    ) -> Result<StreamedTurn> {
-        self.observed_system_texts
-            .lock()
-            .expect("system text mutex poisoned")
-            .push(
-                messages
-                    .iter()
-                    .find(|message| message.role == crate::llm::ChatRole::System)
-                    .map(|message| {
-                        message
-                            .content
-                            .iter()
-                            .filter_map(|block| match block {
-                                MessageContent::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default(),
-            );
+    fn stream_completion<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [FunctionTool],
+        _on_token: &'a mut (dyn FnMut(String) + Send),
+    ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+        Box::pin(async move {
+            self.observed_system_texts
+                .lock()
+                .expect("system text mutex poisoned")
+                .push(
+                    messages
+                        .iter()
+                        .find(|message| message.role == crate::llm::ChatRole::System)
+                        .map(|message| {
+                            message
+                                .content
+                                .iter()
+                                .filter_map(|block| match block {
+                                    MessageContent::Text { text } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default(),
+                );
 
-        let _ = tools;
-        Ok(StreamedTurn {
-            assistant_message: ChatMessage {
-                role: crate::llm::ChatRole::Assistant,
-                principal: Principal::Agent,
-                content: vec![MessageContent::text(self.assistant_text.clone())],
-            },
-            tool_calls: vec![],
-            meta: Some(crate::llm::TurnMeta {
-                model: Some("gpt-child".to_string()),
-                input_tokens: Some(1),
-                output_tokens: Some(1),
-                reasoning_tokens: None,
-                reasoning_trace: None,
-            }),
-            stop_reason: StopReason::Stop,
+            let _ = tools;
+            Ok(StreamedTurn {
+                assistant_message: ChatMessage {
+                    role: crate::llm::ChatRole::Assistant,
+                    principal: Principal::Agent,
+                    content: vec![MessageContent::text(self.assistant_text.clone())],
+                },
+                tool_calls: vec![],
+                meta: Some(crate::llm::TurnMeta {
+                    model: Some("gpt-child".to_string()),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    reasoning_tokens: None,
+                    reasoning_trace: None,
+                }),
+                stop_reason: StopReason::Stop,
+            })
         })
     }
 }
@@ -398,7 +406,11 @@ pub(crate) fn shell_policy(
     default_severity: &str,
 ) -> crate::config::ShellPolicy {
     crate::config::ShellPolicy {
-        default: default.to_string(),
+        default: match default {
+            "allow" => crate::config::ShellDefaultAction::Allow,
+            "approve" => crate::config::ShellDefaultAction::Approve,
+            other => panic!("unexpected shell default in test helper: {other}"),
+        },
         allow_patterns: allow_patterns
             .iter()
             .map(|pattern| pattern.to_string())
@@ -411,7 +423,12 @@ pub(crate) fn shell_policy(
             .iter()
             .map(|pattern| pattern.to_string())
             .collect(),
-        default_severity: default_severity.to_string(),
+        default_severity: match default_severity {
+            "low" => crate::config::ShellDefaultSeverity::Low,
+            "medium" => crate::config::ShellDefaultSeverity::Medium,
+            "high" => crate::config::ShellDefaultSeverity::High,
+            other => panic!("unexpected shell severity in test helper: {other}"),
+        },
         max_output_bytes: crate::config::DEFAULT_SHELL_MAX_OUTPUT_BYTES,
         max_timeout_ms: crate::config::DEFAULT_SHELL_MAX_TIMEOUT_MS,
     }

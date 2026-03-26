@@ -537,7 +537,7 @@ where
                     } else {
                         let result = match turn.execute_tool(&call.name, &call.arguments).await {
                             Ok(output) => output,
-                            Err(err) => format!(r#"{{"error": "{err}"}}"#),
+                            Err(err) => serde_json::json!({ "error": err.to_string() }).to_string(),
                         };
                         let result = crate::gate::guard_text_output(turn, result);
                         crate::gate::cap_tool_output(

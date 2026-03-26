@@ -483,125 +483,127 @@ impl LlmProvider for OpenAIProvider {
     /// - partial assistant output
     /// - tool call argument streaming and completion
     /// - final completion signal
-    async fn stream_completion(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[FunctionTool],
-        on_token: &mut (dyn FnMut(String) + Send),
-    ) -> Result<StreamedTurn> {
-        let (instructions, input) = Self::build_input(messages);
-        let tools_json = Self::build_tools(tools);
+    fn stream_completion<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [FunctionTool],
+        on_token: &'a mut (dyn FnMut(String) + Send),
+    ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+        Box::pin(async move {
+            let (instructions, input) = Self::build_input(messages);
+            let tools_json = Self::build_tools(tools);
 
-        let mut request = json!({
-            "model": self.model,
-            "input": input,
-            "stream": true,
-            "store": false,
-        });
+            let mut request = json!({
+                "model": self.model,
+                "input": input,
+                "stream": true,
+                "store": false,
+            });
 
-        if let Some(ref instructions) = instructions {
-            request["instructions"] = json!(instructions);
-        }
+            if let Some(ref instructions) = instructions {
+                request["instructions"] = json!(instructions);
+            }
 
-        if !tools_json.is_empty() {
-            request["tools"] = json!(tools_json);
-        }
+            if !tools_json.is_empty() {
+                request["tools"] = json!(tools_json);
+            }
 
-        if let Some(ref effort) = self.reasoning_effort {
-            request["reasoning"] = json!({"effort": effort});
-        }
+            if let Some(ref effort) = self.reasoning_effort {
+                request["reasoning"] = json!({"effort": effort});
+            }
 
-        let response = self
-            .client
-            .post(&self.base_url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&request)
-            .send()
-            .await
-            .context("failed to send request to OpenAI")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
+            let response = self
+                .client
+                .post(&self.base_url)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .json(&request)
+                .send()
                 .await
-                .unwrap_or_else(|_| String::from("<failed to read response body>"));
-            anyhow::bail!("API error {status}: {body}");
-        }
+                .context("failed to send request to OpenAI")?;
 
-        let mut state = SseStreamState::new();
-        let mut stream_buffer = String::new();
-        let mut done = false;
-        let mut terminal_seen = false;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| String::from("<failed to read response body>"));
+                anyhow::bail!("API error {status}: {body}");
+            }
 
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("failed to read streamed completion response chunk")?;
-            let chunk = String::from_utf8_lossy(&chunk);
-            trace!(chunk_len = chunk.len(), "received sse chunk");
-            stream_buffer.push_str(&chunk);
+            let mut state = SseStreamState::new();
+            let mut stream_buffer = String::new();
+            let mut done = false;
+            let mut terminal_seen = false;
 
-            while let Some(line_end) = stream_buffer.find('\n') {
-                let raw_line = stream_buffer[..line_end].to_string();
-                stream_buffer.drain(..line_end + 1);
-                trace!(line_len = raw_line.len(), "parsing sse line from stream");
-                if let Some(event) = parse_sse_line(&raw_line)
-                    && {
-                        note_terminal_sse_event(&event, &mut terminal_seen);
-                        apply_sse_event(event, &mut state, on_token)
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.context("failed to read streamed completion response chunk")?;
+                let chunk = String::from_utf8_lossy(&chunk);
+                trace!(chunk_len = chunk.len(), "received sse chunk");
+                stream_buffer.push_str(&chunk);
+
+                while let Some(line_end) = stream_buffer.find('\n') {
+                    let raw_line = stream_buffer[..line_end].to_string();
+                    stream_buffer.drain(..line_end + 1);
+                    trace!(line_len = raw_line.len(), "parsing sse line from stream");
+                    if let Some(event) = parse_sse_line(&raw_line)
+                        && {
+                            note_terminal_sse_event(&event, &mut terminal_seen);
+                            apply_sse_event(event, &mut state, on_token)
+                        }
+                    {
+                        done = true;
+                        break;
                     }
-                {
-                    done = true;
+                }
+
+                if done {
                     break;
                 }
             }
 
-            if done {
-                break;
+            if !stream_buffer.is_empty()
+                && let Some(event) = parse_sse_line(stream_buffer.trim_end())
+            {
+                trace!(
+                    buffer_len = stream_buffer.len(),
+                    "parsing trailing sse buffer"
+                );
+                note_terminal_sse_event(&event, &mut terminal_seen);
+                let _ = apply_sse_event(event, &mut state, on_token);
             }
-        }
 
-        if !stream_buffer.is_empty()
-            && let Some(event) = parse_sse_line(stream_buffer.trim_end())
-        {
-            trace!(
-                buffer_len = stream_buffer.len(),
-                "parsing trailing sse buffer"
-            );
-            note_terminal_sse_event(&event, &mut terminal_seen);
-            let _ = apply_sse_event(event, &mut state, on_token);
-        }
+            require_terminal_sse_event(terminal_seen)?;
 
-        require_terminal_sse_event(terminal_seen)?;
+            let tool_calls: Vec<ToolCall> = state
+                .tool_calls
+                .into_iter()
+                .map(|(id, name, arguments)| ToolCall {
+                    id,
+                    name,
+                    arguments,
+                })
+                .collect();
 
-        let tool_calls: Vec<ToolCall> = state
-            .tool_calls
-            .into_iter()
-            .map(|(id, name, arguments)| ToolCall {
-                id,
-                name,
-                arguments,
+            let mut assistant_msg =
+                ChatMessage::with_role_with_principal(ChatRole::Assistant, Some(Principal::Agent));
+            if !state.assistant_content.is_empty() {
+                assistant_msg.content.push(MessageContent::Text {
+                    text: state.assistant_content,
+                });
+            }
+            for tc in &tool_calls {
+                assistant_msg
+                    .content
+                    .push(MessageContent::ToolCall { call: tc.clone() });
+            }
+
+            Ok(StreamedTurn {
+                assistant_message: assistant_msg,
+                tool_calls,
+                meta: state.completion_meta,
+                stop_reason: state.stop_reason,
             })
-            .collect();
-
-        let mut assistant_msg =
-            ChatMessage::with_role_with_principal(ChatRole::Assistant, Some(Principal::Agent));
-        if !state.assistant_content.is_empty() {
-            assistant_msg.content.push(MessageContent::Text {
-                text: state.assistant_content,
-            });
-        }
-        for tc in &tool_calls {
-            assistant_msg
-                .content
-                .push(MessageContent::ToolCall { call: tc.clone() });
-        }
-
-        Ok(StreamedTurn {
-            assistant_message: assistant_msg,
-            tool_calls,
-            meta: state.completion_meta,
-            stop_reason: state.stop_reason,
         })
     }
 }

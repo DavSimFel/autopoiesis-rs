@@ -435,13 +435,13 @@ mod tests {
     }
 
     impl llm::LlmProvider for StaticProvider {
-        async fn stream_completion(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: &[FunctionTool],
-            _on_token: &mut (dyn FnMut(String) + Send),
-        ) -> Result<StreamedTurn> {
-            Ok(self.turn.clone())
+        fn stream_completion<'a>(
+            &'a self,
+            _messages: &'a [ChatMessage],
+            _tools: &'a [FunctionTool],
+            _on_token: &'a mut (dyn FnMut(String) + Send),
+        ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+            Box::pin(async move { Ok(self.turn.clone()) })
         }
     }
 
@@ -459,17 +459,19 @@ mod tests {
     }
 
     impl llm::LlmProvider for SequenceProvider {
-        async fn stream_completion(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: &[FunctionTool],
-            _on_token: &mut (dyn FnMut(String) + Send),
-        ) -> Result<StreamedTurn> {
-            self.turns
-                .lock()
-                .expect("sequence provider mutex poisoned")
-                .pop()
-                .ok_or_else(|| anyhow!("no more turns"))
+        fn stream_completion<'a>(
+            &'a self,
+            _messages: &'a [ChatMessage],
+            _tools: &'a [FunctionTool],
+            _on_token: &'a mut (dyn FnMut(String) + Send),
+        ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+            Box::pin(async move {
+                self.turns
+                    .lock()
+                    .expect("sequence provider mutex poisoned")
+                    .pop()
+                    .ok_or_else(|| anyhow!("no more turns"))
+            })
         }
     }
 
@@ -482,15 +484,17 @@ mod tests {
     }
 
     impl llm::LlmProvider for BlockingProvider {
-        async fn stream_completion(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: &[FunctionTool],
-            _on_token: &mut (dyn FnMut(String) + Send),
-        ) -> Result<StreamedTurn> {
-            let _ = self.starts.send(self.label);
-            self.barrier.wait().await;
-            Ok(self.turn.clone())
+        fn stream_completion<'a>(
+            &'a self,
+            _messages: &'a [ChatMessage],
+            _tools: &'a [FunctionTool],
+            _on_token: &'a mut (dyn FnMut(String) + Send),
+        ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+            Box::pin(async move {
+                let _ = self.starts.send(self.label);
+                self.barrier.wait().await;
+                Ok(self.turn.clone())
+            })
         }
     }
 
@@ -1062,24 +1066,25 @@ mod tests {
         }
 
         impl llm::LlmProvider for BlockingProvider {
-            async fn stream_completion(
-                &self,
-                _messages: &[ChatMessage],
-                _tools: &[FunctionTool],
-                _on_token: &mut (dyn FnMut(String) + Send),
-            ) -> Result<StreamedTurn> {
-                match self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
-                    0 => {
-                        self.first_started.notify_one();
-                        self.release.notified().await;
-                        Ok(blocking_turn("serialized"))
+            fn stream_completion<'a>(
+                &'a self,
+                _messages: &'a [ChatMessage],
+                _tools: &'a [FunctionTool],
+                _on_token: &'a mut (dyn FnMut(String) + Send),
+            ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+                Box::pin(async move {
+                    match self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                        0 => {
+                            self.first_started.notify_one();
+                            self.release.notified().await;
+                            Ok(blocking_turn("serialized"))
+                        }
+                        1 => Ok(blocking_turn("serialized")),
+                        other => panic!("unexpected extra provider call: {other}"),
                     }
-                    1 => Ok(blocking_turn("serialized")),
-                    other => panic!("unexpected extra provider call: {other}"),
-                }
+                })
             }
         }
-
         let release = Arc::new(tokio::sync::Notify::new());
         let first_started = Arc::new(tokio::sync::Notify::new());
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1187,15 +1192,17 @@ mod tests {
         }
 
         impl llm::LlmProvider for NotifyProvider {
-            async fn stream_completion(
-                &self,
-                _messages: &[ChatMessage],
-                _tools: &[FunctionTool],
-                _on_token: &mut (dyn FnMut(String) + Send),
-            ) -> Result<StreamedTurn> {
-                let _ = self.starts.send(self.label);
-                self.release.notified().await;
-                Ok(self.turn.clone())
+            fn stream_completion<'a>(
+                &'a self,
+                _messages: &'a [ChatMessage],
+                _tools: &'a [FunctionTool],
+                _on_token: &'a mut (dyn FnMut(String) + Send),
+            ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+                Box::pin(async move {
+                    let _ = self.starts.send(self.label);
+                    self.release.notified().await;
+                    Ok(self.turn.clone())
+                })
             }
         }
 

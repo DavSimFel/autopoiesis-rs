@@ -29,13 +29,13 @@ impl Guard for ApprovalProbeGuard {
 struct PanicProvider;
 
 impl crate::llm::LlmProvider for PanicProvider {
-    async fn stream_completion(
-        &self,
+    fn stream_completion<'a>(
+        &'a self,
         _messages: &[crate::llm::ChatMessage],
         _tools: &[crate::llm::FunctionTool],
-        _on_token: &mut (dyn FnMut(String) + Send),
-    ) -> anyhow::Result<StreamedTurn> {
-        panic!("provider should not be called when inbound approval is denied");
+        _on_token: &'a mut (dyn FnMut(String) + Send),
+    ) -> crate::llm::BoxFutureLlm<'a, anyhow::Result<StreamedTurn>> {
+        Box::pin(async move { panic!("provider should not be called when inbound approval is denied") })
     }
 }
 
@@ -133,14 +133,16 @@ max_tokens_per_day = 10
     }
 
     impl crate::llm::LlmProvider for CountingProvider {
-        async fn stream_completion(
-            &self,
+        fn stream_completion<'a>(
+            &'a self,
             _messages: &[crate::llm::ChatMessage],
             _tools: &[crate::llm::FunctionTool],
-            _on_token: &mut (dyn FnMut(String) + Send),
-        ) -> anyhow::Result<StreamedTurn> {
+            _on_token: &'a mut (dyn FnMut(String) + Send),
+        ) -> crate::llm::BoxFutureLlm<'a, anyhow::Result<StreamedTurn>> {
+            Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.turn.clone())
+            })
         }
     }
 

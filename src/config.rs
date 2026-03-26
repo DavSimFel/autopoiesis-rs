@@ -515,13 +515,50 @@ mod tests {
     }
 
     fn assert_default_shell_policy(policy: &ShellPolicy) {
-        assert_eq!(policy.default, "approve");
+        assert_eq!(policy.default, ShellDefaultAction::Approve);
         assert!(policy.allow_patterns.is_empty());
         assert!(policy.deny_patterns.is_empty());
         assert!(policy.standing_approvals.is_empty());
-        assert_eq!(policy.default_severity, "medium");
+        assert_eq!(policy.default_severity, ShellDefaultSeverity::Medium);
         assert_eq!(policy.max_output_bytes, DEFAULT_SHELL_MAX_OUTPUT_BYTES);
         assert_eq!(policy.max_timeout_ms, DEFAULT_SHELL_MAX_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn shell_policy_parsing_is_trimmed_and_case_insensitive() {
+        assert_eq!(
+            <ShellDefaultAction as std::convert::TryFrom<String>>::try_from(
+                "  AlLoW  ".to_string()
+            )
+            .unwrap(),
+            ShellDefaultAction::Allow
+        );
+        assert_eq!(
+            <ShellDefaultSeverity as std::convert::TryFrom<String>>::try_from(
+                "  MeDiuM  ".to_string()
+            )
+            .unwrap(),
+            ShellDefaultSeverity::Medium
+        );
+    }
+
+    #[test]
+    fn shell_policy_parsing_works_through_toml_deserialization() {
+        #[derive(serde::Deserialize)]
+        struct WrapperAction {
+            action: ShellDefaultAction,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct WrapperSeverity {
+            severity: ShellDefaultSeverity,
+        }
+
+        let action: WrapperAction = toml::from_str("action = \"  ApPrOvE  \"").unwrap();
+        let severity: WrapperSeverity = toml::from_str("severity = \"  HiGh  \"").unwrap();
+
+        assert_eq!(action.action, ShellDefaultAction::Approve);
+        assert_eq!(severity.severity, ShellDefaultSeverity::High);
     }
 
     fn assert_default_queue_config(queue: &QueueConfig) {
@@ -550,7 +587,7 @@ mod tests {
         assert_eq!(config.reasoning_effort, Some("low".to_string()));
         assert_eq!(config.session_name, Some("fix-auth".to_string()));
         assert_eq!(config.operator_key, Some("operator-secret".to_string()));
-        assert_eq!(config.shell_policy.default, "allow");
+        assert_eq!(config.shell_policy.default, ShellDefaultAction::Allow);
         assert_eq!(
             config.shell_policy.allow_patterns,
             vec!["git *".to_string(), "cargo *".to_string()]
@@ -563,7 +600,10 @@ mod tests {
             config.shell_policy.standing_approvals,
             vec!["git push *".to_string(), "cargo publish *".to_string()]
         );
-        assert_eq!(config.shell_policy.default_severity, "high");
+        assert_eq!(
+            config.shell_policy.default_severity,
+            ShellDefaultSeverity::High
+        );
         assert_eq!(config.shell_policy.max_output_bytes, 2048);
         assert_eq!(config.shell_policy.max_timeout_ms, 4096);
         assert_eq!(config.budget, None);
@@ -1607,11 +1647,57 @@ mod domain_context_extend_tests {
 }
 
 /// Shell execution policy loaded from `[shell]` in `agents.toml`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+#[serde(rename_all = "lowercase")]
+pub enum ShellDefaultAction {
+    Allow,
+    #[default]
+    Approve,
+}
+
+impl TryFrom<String> for ShellDefaultAction {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "allow" => Ok(Self::Allow),
+            "approve" => Ok(Self::Approve),
+            other => Err(format!("invalid shell default action: {other}")),
+        }
+    }
+}
+
+/// Shell severity for unmatched commands loaded from `[shell]`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+#[serde(rename_all = "lowercase")]
+pub enum ShellDefaultSeverity {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl TryFrom<String> for ShellDefaultSeverity {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            other => Err(format!("invalid shell severity: {other}")),
+        }
+    }
+}
+
+/// Shell execution policy loaded from `[shell]` in `agents.toml`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ShellPolicy {
     /// "approve" (default) or "allow".
-    pub default: String,
+    pub default: ShellDefaultAction,
     /// Glob patterns that are auto-allowed.
     pub allow_patterns: Vec<String>,
     /// Glob patterns that are always denied.
@@ -1619,7 +1705,7 @@ pub struct ShellPolicy {
     /// Glob patterns that bypass approval prompts but remain auditable.
     pub standing_approvals: Vec<String>,
     /// Severity for commands that don't match any pattern.
-    pub default_severity: String,
+    pub default_severity: ShellDefaultSeverity,
     /// Maximum combined stdout/stderr bytes captured from a shell command.
     #[serde(default = "default_shell_max_output_bytes")]
     pub max_output_bytes: usize,
@@ -1631,11 +1717,11 @@ pub struct ShellPolicy {
 impl Default for ShellPolicy {
     fn default() -> Self {
         Self {
-            default: "approve".to_string(),
+            default: ShellDefaultAction::Approve,
             allow_patterns: Vec::new(),
             deny_patterns: Vec::new(),
             standing_approvals: Vec::new(),
-            default_severity: "medium".to_string(),
+            default_severity: ShellDefaultSeverity::Medium,
             max_output_bytes: default_shell_max_output_bytes(),
             max_timeout_ms: default_shell_max_timeout_ms(),
         }

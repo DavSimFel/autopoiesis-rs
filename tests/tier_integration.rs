@@ -10,6 +10,7 @@ use autopoiesis::Principal;
 use autopoiesis::agent::TurnVerdict;
 use autopoiesis::config::Config;
 use autopoiesis::gate::BudgetSnapshot;
+use autopoiesis::llm;
 use autopoiesis::llm::{
     ChatMessage, ChatRole, FunctionTool, LlmProvider, MessageContent, StopReason, StreamedTurn,
     ToolCall, TurnMeta,
@@ -210,27 +211,29 @@ impl ScriptedProvider {
 }
 
 impl LlmProvider for ScriptedProvider {
-    async fn stream_completion(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[FunctionTool],
-        _on_token: &mut (dyn FnMut(String) + Send),
-    ) -> Result<StreamedTurn> {
-        self.observed_messages
-            .lock()
-            .expect("messages mutex poisoned")
-            .push(messages.to_vec());
-        self.observed_tools
-            .lock()
-            .expect("tools mutex poisoned")
-            .push(tools.iter().map(|tool| tool.name.clone()).collect());
-        let response = self
-            .responses
-            .lock()
-            .expect("responses mutex poisoned")
-            .pop_front()
-            .expect("scripted provider ran out of responses");
-        Ok(response)
+    fn stream_completion<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [FunctionTool],
+        _on_token: &'a mut (dyn FnMut(String) + Send),
+    ) -> llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+        Box::pin(async move {
+            self.observed_messages
+                .lock()
+                .expect("messages mutex poisoned")
+                .push(messages.to_vec());
+            self.observed_tools
+                .lock()
+                .expect("tools mutex poisoned")
+                .push(tools.iter().map(|tool| tool.name.clone()).collect());
+            let response = self
+                .responses
+                .lock()
+                .expect("responses mutex poisoned")
+                .pop_front()
+                .expect("scripted provider ran out of responses");
+            Ok(response)
+        })
     }
 }
 
@@ -856,14 +859,16 @@ token_estimate = 250
     }
 
     impl LlmProvider for CountingProvider {
-        async fn stream_completion(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: &[FunctionTool],
-            _on_token: &mut (dyn FnMut(String) + Send),
-        ) -> Result<StreamedTurn> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(self.turn.clone())
+        fn stream_completion<'a>(
+            &'a self,
+            _messages: &'a [ChatMessage],
+            _tools: &'a [FunctionTool],
+            _on_token: &'a mut (dyn FnMut(String) + Send),
+        ) -> llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(self.turn.clone())
+            })
         }
     }
 

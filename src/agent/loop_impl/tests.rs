@@ -27,7 +27,7 @@ async fn trims_context_before_stream_completion_when_over_estimated_limit() {
     let turn = Turn::new()
         .context(History::new(1_000))
         .tool(Shell::new())
-        .guard(SecretRedactor::new(&[]));
+        .guard(SecretRedactor::new(&[]).expect("empty secret redaction patterns are valid"));
     let mut make_provider = {
         let provider = provider.clone();
         move || {
@@ -132,25 +132,26 @@ async fn delegation_hint_is_retained_when_provider_fails() {
     }
 
     impl crate::llm::LlmProvider for FailingProvider {
-        async fn stream_completion(
-            &self,
-            messages: &[ChatMessage],
-            _tools: &[FunctionTool],
-            _on_token: &mut (dyn FnMut(String) + Send),
-        ) -> Result<StreamedTurn> {
-            let saw_hint = messages.iter().any(|message| {
+        fn stream_completion<'a>(
+            &'a self,
+            messages: &'a [ChatMessage],
+            _tools: &'a [FunctionTool],
+            _on_token: &'a mut (dyn FnMut(String) + Send),
+        ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+            Box::pin(async move {
+                let saw_hint = messages.iter().any(|message| {
                     matches!(message.role, crate::llm::ChatRole::System)
                         && message.content.iter().any(|block| matches!(block, MessageContent::Text { text } if text == crate::delegation::DELEGATION_HINT))
                 });
-            *self
-                .observed_hint
-                .lock()
-                .expect("hint mutex should not be poisoned") = saw_hint;
+                *self
+                    .observed_hint
+                    .lock()
+                    .expect("hint mutex should not be poisoned") = saw_hint;
 
-            Err(anyhow::anyhow!("provider failure"))
+                Err(anyhow::anyhow!("provider failure"))
+            })
         }
     }
-
     let turn = Turn::new().delegation(crate::delegation::DelegationConfig {
         token_threshold: Some(u64::MAX),
         tool_depth_threshold: None,
@@ -213,26 +214,28 @@ async fn delegation_hint_is_ignored_when_delegation_is_disabled() {
     }
 
     impl crate::llm::LlmProvider for HintObservingProvider {
-        async fn stream_completion(
-            &self,
-            messages: &[ChatMessage],
-            _tools: &[FunctionTool],
-            _on_token: &mut (dyn FnMut(String) + Send),
-        ) -> Result<StreamedTurn> {
-            let saw_hint = messages.iter().any(|message| {
+        fn stream_completion<'a>(
+            &'a self,
+            messages: &'a [ChatMessage],
+            _tools: &'a [FunctionTool],
+            _on_token: &'a mut (dyn FnMut(String) + Send),
+        ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+            Box::pin(async move {
+                let saw_hint = messages.iter().any(|message| {
                     matches!(message.role, crate::llm::ChatRole::System)
                         && message.content.iter().any(|block| matches!(block, MessageContent::Text { text } if text == crate::delegation::DELEGATION_HINT))
                 });
-            *self
-                .observed_hint
-                .lock()
-                .expect("hint mutex should not be poisoned") = saw_hint;
+                *self
+                    .observed_hint
+                    .lock()
+                    .expect("hint mutex should not be poisoned") = saw_hint;
 
-            Ok(StreamedTurn {
-                assistant_message: ChatMessage::system("ok"),
-                tool_calls: vec![],
-                meta: None,
-                stop_reason: StopReason::Stop,
+                Ok(StreamedTurn {
+                    assistant_message: ChatMessage::system("ok"),
+                    tool_calls: vec![],
+                    meta: None,
+                    stop_reason: StopReason::Stop,
+                })
             })
         }
     }
@@ -291,26 +294,28 @@ async fn delegation_hint_is_cleared_after_successful_turn_without_new_advice() {
     }
 
     impl crate::llm::LlmProvider for HintObservingProvider {
-        async fn stream_completion(
-            &self,
-            messages: &[ChatMessage],
-            _tools: &[FunctionTool],
-            _on_token: &mut (dyn FnMut(String) + Send),
-        ) -> Result<StreamedTurn> {
-            let saw_hint = messages.iter().any(|message| {
+        fn stream_completion<'a>(
+            &'a self,
+            messages: &'a [ChatMessage],
+            _tools: &'a [FunctionTool],
+            _on_token: &'a mut (dyn FnMut(String) + Send),
+        ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+            Box::pin(async move {
+                let saw_hint = messages.iter().any(|message| {
                     matches!(message.role, crate::llm::ChatRole::System)
                         && message.content.iter().any(|block| matches!(block, MessageContent::Text { text } if text == crate::delegation::DELEGATION_HINT))
                 });
-            *self
-                .observed_hint
-                .lock()
-                .expect("hint mutex should not be poisoned") = saw_hint;
+                *self
+                    .observed_hint
+                    .lock()
+                    .expect("hint mutex should not be poisoned") = saw_hint;
 
-            Ok(StreamedTurn {
-                assistant_message: ChatMessage::system("ok"),
-                tool_calls: vec![],
-                meta: None,
-                stop_reason: StopReason::Stop,
+                Ok(StreamedTurn {
+                    assistant_message: ChatMessage::system("ok"),
+                    tool_calls: vec![],
+                    meta: None,
+                    stop_reason: StopReason::Stop,
+                })
             })
         }
     }
@@ -373,69 +378,71 @@ async fn delegation_hint_accumulates_tool_calls_across_batches() {
     }
 
     impl crate::llm::LlmProvider for HintObservingSequenceProvider {
-        async fn stream_completion(
-            &self,
-            messages: &[ChatMessage],
-            _tools: &[FunctionTool],
-            _on_token: &mut (dyn FnMut(String) + Send),
-        ) -> Result<StreamedTurn> {
-            let saw_hint = messages.iter().any(|message| {
+        fn stream_completion<'a>(
+            &'a self,
+            messages: &'a [ChatMessage],
+            _tools: &'a [FunctionTool],
+            _on_token: &'a mut (dyn FnMut(String) + Send),
+        ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+            Box::pin(async move {
+                let saw_hint = messages.iter().any(|message| {
                     matches!(message.role, crate::llm::ChatRole::System)
                         && message.content.iter().any(|block| matches!(block, MessageContent::Text { text } if text == crate::delegation::DELEGATION_HINT))
                 });
-            self.observed_hints
-                .lock()
-                .expect("hint mutex should not be poisoned")
-                .push(saw_hint);
+                self.observed_hints
+                    .lock()
+                    .expect("hint mutex should not be poisoned")
+                    .push(saw_hint);
 
-            let mut call_index = self
-                .call_index
-                .lock()
-                .expect("call index mutex should not be poisoned");
-            let turn = match *call_index {
-                0 => StreamedTurn {
-                    assistant_message: ChatMessage::system("batch one"),
-                    tool_calls: vec![
-                        ToolCall {
-                            id: "call-1".to_string(),
-                            name: "execute".to_string(),
-                            arguments: r#"{"command":"true"}"#.to_string(),
-                        },
-                        ToolCall {
-                            id: "call-2".to_string(),
-                            name: "execute".to_string(),
-                            arguments: r#"{"command":"true"}"#.to_string(),
-                        },
-                    ],
-                    meta: None,
-                    stop_reason: StopReason::ToolCalls,
-                },
-                1 => StreamedTurn {
-                    assistant_message: ChatMessage::system("batch two"),
-                    tool_calls: vec![
-                        ToolCall {
-                            id: "call-3".to_string(),
-                            name: "execute".to_string(),
-                            arguments: r#"{"command":"true"}"#.to_string(),
-                        },
-                        ToolCall {
-                            id: "call-4".to_string(),
-                            name: "execute".to_string(),
-                            arguments: r#"{"command":"true"}"#.to_string(),
-                        },
-                    ],
-                    meta: None,
-                    stop_reason: StopReason::ToolCalls,
-                },
-                _ => StreamedTurn {
-                    assistant_message: ChatMessage::system("done"),
-                    tool_calls: vec![],
-                    meta: None,
-                    stop_reason: StopReason::Stop,
-                },
-            };
-            *call_index += 1;
-            Ok(turn)
+                let mut call_index = self
+                    .call_index
+                    .lock()
+                    .expect("call index mutex should not be poisoned");
+                let turn = match *call_index {
+                    0 => StreamedTurn {
+                        assistant_message: ChatMessage::system("batch one"),
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "call-1".to_string(),
+                                name: "execute".to_string(),
+                                arguments: r#"{"command":"true"}"#.to_string(),
+                            },
+                            ToolCall {
+                                id: "call-2".to_string(),
+                                name: "execute".to_string(),
+                                arguments: r#"{"command":"true"}"#.to_string(),
+                            },
+                        ],
+                        meta: None,
+                        stop_reason: StopReason::ToolCalls,
+                    },
+                    1 => StreamedTurn {
+                        assistant_message: ChatMessage::system("batch two"),
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "call-3".to_string(),
+                                name: "execute".to_string(),
+                                arguments: r#"{"command":"true"}"#.to_string(),
+                            },
+                            ToolCall {
+                                id: "call-4".to_string(),
+                                name: "execute".to_string(),
+                                arguments: r#"{"command":"true"}"#.to_string(),
+                            },
+                        ],
+                        meta: None,
+                        stop_reason: StopReason::ToolCalls,
+                    },
+                    _ => StreamedTurn {
+                        assistant_message: ChatMessage::system("done"),
+                        tool_calls: vec![],
+                        meta: None,
+                        stop_reason: StopReason::Stop,
+                    },
+                };
+                *call_index += 1;
+                Ok(turn)
+            })
         }
     }
 
@@ -506,7 +513,10 @@ async fn inbound_redaction_is_persisted_before_session_write() {
     let (provider, _observed_message_counts) = InspectingProvider::new();
     let mut session = crate::session::Session::new(&dir).unwrap();
 
-    let turn = Turn::new().guard(SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"]));
+    let turn = Turn::new().guard(
+        SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"])
+            .expect("test secret redaction regex should be valid"),
+    );
     let mut make_provider = {
         let provider = provider.clone();
         move || {
@@ -1596,9 +1606,10 @@ async fn tool_output_is_redacted_before_persist() {
         },
     ]);
     let mut session = crate::session::Session::new(&dir).unwrap();
-    let turn = Turn::new()
-        .tool(LeakyTool)
-        .guard(SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"]));
+    let turn = Turn::new().tool(LeakyTool).guard(
+        SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"])
+            .expect("test secret redaction regex should be valid"),
+    );
     let mut make_provider = move || {
         let provider = provider.clone();
         async move { Ok::<_, anyhow::Error>(provider) }

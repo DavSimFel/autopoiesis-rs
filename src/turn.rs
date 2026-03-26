@@ -830,22 +830,25 @@ mod tests {
         }
 
         impl crate::llm::LlmProvider for InspectingProvider {
-            async fn stream_completion(
-                &self,
-                messages: &[ChatMessage],
-                _tools: &[FunctionTool],
-                _on_token: &mut (dyn FnMut(String) + Send),
-            ) -> anyhow::Result<crate::llm::StreamedTurn> {
-                *self
-                    .observed_messages
-                    .lock()
-                    .expect("messages mutex poisoned") = Some(messages.to_vec());
+            fn stream_completion<'a>(
+                &'a self,
+                messages: &'a [ChatMessage],
+                _tools: &'a [FunctionTool],
+                _on_token: &'a mut (dyn FnMut(String) + Send),
+            ) -> crate::llm::BoxFutureLlm<'a, anyhow::Result<crate::llm::StreamedTurn>>
+            {
+                Box::pin(async move {
+                    *self
+                        .observed_messages
+                        .lock()
+                        .expect("messages mutex poisoned") = Some(messages.to_vec());
 
-                Ok(crate::llm::StreamedTurn {
-                    assistant_message: ChatMessage::system("done"),
-                    tool_calls: vec![],
-                    meta: None,
-                    stop_reason: crate::llm::StopReason::Stop,
+                    Ok(crate::llm::StreamedTurn {
+                        assistant_message: ChatMessage::system("done"),
+                        tool_calls: vec![],
+                        meta: None,
+                        stop_reason: crate::llm::StopReason::Stop,
+                    })
                 })
             }
         }
@@ -927,22 +930,25 @@ mod tests {
         }
 
         impl crate::llm::LlmProvider for InspectingProvider {
-            async fn stream_completion(
-                &self,
-                messages: &[ChatMessage],
-                _tools: &[FunctionTool],
-                _on_token: &mut (dyn FnMut(String) + Send),
-            ) -> anyhow::Result<crate::llm::StreamedTurn> {
-                *self
-                    .observed_messages
-                    .lock()
-                    .expect("messages mutex poisoned") = Some(messages.to_vec());
+            fn stream_completion<'a>(
+                &'a self,
+                messages: &'a [ChatMessage],
+                _tools: &'a [FunctionTool],
+                _on_token: &'a mut (dyn FnMut(String) + Send),
+            ) -> crate::llm::BoxFutureLlm<'a, anyhow::Result<crate::llm::StreamedTurn>>
+            {
+                Box::pin(async move {
+                    *self
+                        .observed_messages
+                        .lock()
+                        .expect("messages mutex poisoned") = Some(messages.to_vec());
 
-                Ok(crate::llm::StreamedTurn {
-                    assistant_message: ChatMessage::system("done"),
-                    tool_calls: vec![],
-                    meta: None,
-                    stop_reason: crate::llm::StopReason::Stop,
+                    Ok(crate::llm::StreamedTurn {
+                        assistant_message: ChatMessage::system("done"),
+                        tool_calls: vec![],
+                        meta: None,
+                        stop_reason: crate::llm::StopReason::Stop,
+                    })
                 })
             }
         }

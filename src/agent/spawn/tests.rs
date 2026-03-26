@@ -1177,35 +1177,37 @@ async fn spawn_and_drain_invokes_approval_handler_for_t3_shell_calls() {
     }
 
     impl crate::llm::LlmProvider for ApprovalGateProvider {
-        async fn stream_completion(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: &[FunctionTool],
-            _on_token: &mut (dyn FnMut(String) + Send),
-        ) -> Result<StreamedTurn> {
-            match self.call_index.fetch_add(1, Ordering::SeqCst) {
-                0 => Ok(streamed_turn_with_tool_call(
-                    Some("requesting approval"),
-                    "true",
-                    "call-1",
-                )),
-                _ => Ok(StreamedTurn {
-                    assistant_message: ChatMessage {
-                        role: crate::llm::ChatRole::Assistant,
-                        principal: Principal::Agent,
-                        content: vec![MessageContent::text("approval handled")],
-                    },
-                    tool_calls: vec![],
-                    meta: Some(crate::llm::TurnMeta {
-                        model: Some("gpt-child".to_string()),
-                        input_tokens: Some(1),
-                        output_tokens: Some(1),
-                        reasoning_tokens: None,
-                        reasoning_trace: None,
+        fn stream_completion<'a>(
+            &'a self,
+            _messages: &'a [ChatMessage],
+            _tools: &'a [FunctionTool],
+            _on_token: &'a mut (dyn FnMut(String) + Send),
+        ) -> crate::llm::BoxFutureLlm<'a, Result<StreamedTurn>> {
+            Box::pin(async move {
+                match self.call_index.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(streamed_turn_with_tool_call(
+                        Some("requesting approval"),
+                        "true",
+                        "call-1",
+                    )),
+                    _ => Ok(StreamedTurn {
+                        assistant_message: ChatMessage {
+                            role: crate::llm::ChatRole::Assistant,
+                            principal: Principal::Agent,
+                            content: vec![MessageContent::text("approval handled")],
+                        },
+                        tool_calls: vec![],
+                        meta: Some(crate::llm::TurnMeta {
+                            model: Some("gpt-child".to_string()),
+                            input_tokens: Some(1),
+                            output_tokens: Some(1),
+                            reasoning_tokens: None,
+                            reasoning_trace: None,
+                        }),
+                        stop_reason: StopReason::Stop,
                     }),
-                    stop_reason: StopReason::Stop,
-                }),
-            }
+                }
+            })
         }
     }
 

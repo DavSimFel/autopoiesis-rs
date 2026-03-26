@@ -202,9 +202,10 @@ mod tests {
 
     #[test]
     fn guard_message_output_redacts_tool_call_arguments() {
-        let turn = Turn::new().guard(crate::gate::secret_redactor::SecretRedactor::new(&[
-            r"sk-[a-zA-Z0-9_-]{20,}",
-        ]));
+        let turn = Turn::new().guard(
+            crate::gate::secret_redactor::SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"])
+                .expect("test secret redaction regex should be valid"),
+        );
         let mut message = ChatMessage {
             role: ChatRole::Assistant,
             principal: Principal::Agent,
@@ -235,9 +236,10 @@ mod tests {
 
     #[test]
     fn guard_message_output_redacts_tool_call_argument_keys() {
-        let turn = Turn::new().guard(crate::gate::secret_redactor::SecretRedactor::new(&[
-            r"sk-[a-zA-Z0-9_-]{20,}",
-        ]));
+        let turn = Turn::new().guard(
+            crate::gate::secret_redactor::SecretRedactor::new(&[r"sk-[a-zA-Z0-9_-]{20,}"])
+                .expect("test secret redaction regex should be valid"),
+        );
         let mut message = ChatMessage {
             role: ChatRole::Assistant,
             principal: Principal::Agent,

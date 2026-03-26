@@ -18,9 +18,7 @@ jobs:
           components: rustfmt, clippy
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
-      - name: Check formatting
-        run: cargo fmt --check
-      - name: Run clippy
-        run: cargo clippy -- -D warnings
-      - name: Run tests
-        run: cargo test
+      - name: Run lint gate
+        run: ./xtask/lint.sh
+      - name: Run lint path smoke test
+        run: ./tests/xtask_lint_paths.sh

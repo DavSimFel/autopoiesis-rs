@@ -12,16 +12,16 @@ pub struct SecretRedactor {
 }
 
 impl SecretRedactor {
-    pub fn new(patterns: &[&str]) -> Self {
+    pub fn new(patterns: &[&str]) -> Result<Self, regex::Error> {
         let patterns = patterns
             .iter()
-            .filter_map(|pattern| regex::Regex::new(pattern).ok())
-            .collect();
+            .map(|pattern| regex::Regex::new(pattern))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        Self {
+        Ok(Self {
             id: SECRET_REDACTOR_ID.to_string(),
             patterns,
-        }
+        })
     }
 
     pub(crate) fn default_catalog() -> Self {
@@ -29,7 +29,7 @@ impl SecretRedactor {
             .iter()
             .map(|pattern| pattern.regex)
             .collect();
-        Self::new(&patterns)
+        Self::new(&patterns).expect("secret redaction catalog patterns must be valid")
     }
 
     fn redact_text(&self, text: &mut String) -> bool {
@@ -113,6 +113,11 @@ mod tests {
 
     fn make_secret_gate() -> SecretRedactor {
         SecretRedactor::default_catalog()
+    }
+
+    #[test]
+    fn rejects_invalid_regex_patterns() {
+        assert!(SecretRedactor::new(&["["]).is_err());
     }
 
     fn make_messages(text: &str) -> Vec<ChatMessage> {

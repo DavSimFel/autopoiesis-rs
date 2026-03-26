@@ -102,10 +102,9 @@ pub(crate) fn apply_plan_action(
     match action.kind {
         PlanActionKind::Plan => {
             if action.plan_run_id.is_some() {
-                let plan_run_id = action
-                    .plan_run_id
-                    .as_deref()
-                    .expect("checked is_some above");
+                let Some(plan_run_id) = action.plan_run_id.as_deref() else {
+                    unreachable!("checked is_some above");
+                };
                 apply_plan_patch(store, owner_session_id, plan_run_id, action)
             } else {
                 create_plan_run_from_action(store, owner_session_id, action)

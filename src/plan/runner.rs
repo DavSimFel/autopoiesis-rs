@@ -370,54 +370,63 @@ fn finalize_attempt(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_spawn_missing_metadata(
-    store: &mut Store,
-    plan_run: &PlanRun,
+struct SpawnMissingMetadataArgs<'a> {
+    store: &'a mut Store,
+    plan_run: &'a PlanRun,
     step_index: i64,
-    step_id: &str,
+    step_id: &'a str,
     attempt: i64,
-    spawn_result: &crate::spawn::SpawnResult,
+    spawn_result: &'a crate::spawn::SpawnResult,
     attempt_id: i64,
-) -> Result<StepOutcome> {
+}
+
+async fn handle_spawn_missing_metadata(args: SpawnMissingMetadataArgs<'_>) -> Result<StepOutcome> {
     let failure = build_waiting_t2_failure_details(
-        step_index,
-        step_id,
-        attempt,
+        args.step_index,
+        args.step_id,
+        args.attempt,
         "spawn_failed",
-        Some(spawn_result.child_session_id.clone()),
-        NullableUpdate::Value(spawn_result.child_session_id.clone()),
+        Some(args.spawn_result.child_session_id.clone()),
+        NullableUpdate::Value(args.spawn_result.child_session_id.clone()),
         Vec::new(),
     );
-    let summary = build_step_summary(
-        "plan_step_summary",
-        plan_run,
-        step_index,
-        step_id,
-        attempt,
-        None,
-        Some(spawn_result.child_session_id.clone()),
-        Some(spawn_result.resolved_model.clone()),
-        None,
-        None,
-        Vec::new(),
-    );
+    let summary = build_step_summary(StepSummaryArgs {
+        kind: "plan_step_summary",
+        plan_run: args.plan_run,
+        step_index: args.step_index,
+        step_id: args.step_id,
+        attempt: args.attempt,
+        command: None,
+        child_session_id: Some(args.spawn_result.child_session_id.clone()),
+        resolved_model: Some(args.spawn_result.resolved_model.clone()),
+        last_assistant_response: None,
+        observed: None,
+        checks: Vec::new(),
+    });
     let summary_json = serialize_json(&summary, "step summary")?;
     let checks_json = "[]".to_string();
-    store
-        .update_step_attempt_child_session(attempt_id, Some(&spawn_result.child_session_id))
+    args.store
+        .update_step_attempt_child_session(
+            args.attempt_id,
+            Some(&args.spawn_result.child_session_id),
+        )
         .context("failed to record spawned child session")?;
-    finalize_attempt(store, attempt_id, "crashed", &summary_json, &checks_json)
-        .context("failed to finalize crashed spawn attempt")?;
+    finalize_attempt(
+        args.store,
+        args.attempt_id,
+        "crashed",
+        &summary_json,
+        &checks_json,
+    )
+    .context("failed to finalize crashed spawn attempt")?;
     Ok(StepOutcome::WaitingT2 { failure })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_step_summary(
-    kind: &str,
-    plan_run: &PlanRun,
+struct StepSummaryArgs<'a> {
+    kind: &'a str,
+    plan_run: &'a PlanRun,
     step_index: i64,
-    step_id: &str,
+    step_id: &'a str,
     attempt: i64,
     command: Option<String>,
     child_session_id: Option<String>,
@@ -425,20 +434,22 @@ fn build_step_summary(
     last_assistant_response: Option<String>,
     observed: Option<ObservedOutput>,
     checks: Vec<CheckOutcome>,
-) -> StepSummaryPayload {
+}
+
+fn build_step_summary(args: StepSummaryArgs<'_>) -> StepSummaryPayload {
     StepSummaryPayload {
-        kind: kind.to_string(),
-        plan_run_id: plan_run.id.clone(),
-        revision: plan_run.revision,
-        step_index,
-        step_id: step_id.to_string(),
-        attempt,
-        command,
-        child_session_id,
-        resolved_model,
-        last_assistant_response,
-        observed,
-        checks,
+        kind: args.kind.to_string(),
+        plan_run_id: args.plan_run.id.clone(),
+        revision: args.plan_run.revision,
+        step_index: args.step_index,
+        step_id: args.step_id.to_string(),
+        attempt: args.attempt,
+        command: args.command,
+        child_session_id: args.child_session_id,
+        resolved_model: args.resolved_model,
+        last_assistant_response: args.last_assistant_response,
+        observed: args.observed,
+        checks: args.checks,
     }
 }
 
@@ -568,19 +579,19 @@ where
             ..
         } => {
             let initial_checks_json = "[]".to_string();
-            let initial_summary = build_step_summary(
-                "plan_step_summary",
+            let initial_summary = build_step_summary(StepSummaryArgs {
+                kind: "plan_step_summary",
                 plan_run,
                 step_index,
-                id,
+                step_id: id,
                 attempt,
-                Some(command.clone()),
-                None,
-                None,
-                None,
-                None,
-                Vec::new(),
-            );
+                command: Some(command.clone()),
+                child_session_id: None,
+                resolved_model: None,
+                last_assistant_response: None,
+                observed: None,
+                checks: Vec::new(),
+            });
             let initial_summary_json = serialize_json(&initial_summary, "step summary")?;
             let attempt_id = store.record_step_attempt(StepAttemptRecord {
                 plan_run_id: plan_run.id.clone(),
@@ -620,19 +631,19 @@ where
                         None,
                     );
                     let crash_json = serialize_json(&crash, "step crash")?;
-                    let summary = build_step_summary(
-                        "plan_step_summary",
+                    let summary = build_step_summary(StepSummaryArgs {
+                        kind: "plan_step_summary",
                         plan_run,
                         step_index,
-                        id,
+                        step_id: id,
                         attempt,
-                        Some(command.clone()),
-                        None,
-                        None,
-                        None,
-                        None,
-                        Vec::new(),
-                    );
+                        command: Some(command.clone()),
+                        child_session_id: None,
+                        resolved_model: None,
+                        last_assistant_response: None,
+                        observed: None,
+                        checks: Vec::new(),
+                    });
                     let summary_json = serialize_json(&summary, "step summary")?;
                     let checks_json = initial_checks_json.clone();
                     store
@@ -665,19 +676,19 @@ where
                     NullableUpdate::Null,
                     checks.clone(),
                 );
-                let summary = build_step_summary(
-                    "plan_step_summary",
+                let summary = build_step_summary(StepSummaryArgs {
+                    kind: "plan_step_summary",
                     plan_run,
                     step_index,
-                    id,
+                    step_id: id,
                     attempt,
-                    Some(command.clone()),
-                    None,
-                    None,
-                    None,
-                    None,
+                    command: Some(command.clone()),
+                    child_session_id: None,
+                    resolved_model: None,
+                    last_assistant_response: None,
+                    observed: None,
                     checks,
-                );
+                });
                 let summary_json = serialize_json(&summary, "step summary")?;
                 finalize_attempt(store, attempt_id, "failed", &summary_json, &checks_json)
                     .context("failed to finalize denied shell attempt")?;
@@ -706,19 +717,19 @@ where
             )
             .await;
             let failure_reason = step_result_to_failure_reason(&checks);
-            let summary = build_step_summary(
-                "plan_step_summary",
+            let summary = build_step_summary(StepSummaryArgs {
+                kind: "plan_step_summary",
                 plan_run,
                 step_index,
-                id,
+                step_id: id,
                 attempt,
-                Some(command.clone()),
-                None,
-                None,
-                None,
-                Some(observed.clone()),
-                checks.clone(),
-            );
+                command: Some(command.clone()),
+                child_session_id: None,
+                resolved_model: None,
+                last_assistant_response: None,
+                observed: Some(observed.clone()),
+                checks: checks.clone(),
+            });
             let summary_json = serialize_json(&summary, "step summary")?;
             let checks_json = serialize_json(&checks, "checks")?;
 
@@ -767,19 +778,19 @@ where
             id, spawn, checks, ..
         } => {
             let initial_checks_json = "[]".to_string();
-            let initial_summary = build_step_summary(
-                "plan_step_summary",
+            let initial_summary = build_step_summary(StepSummaryArgs {
+                kind: "plan_step_summary",
                 plan_run,
                 step_index,
-                id,
+                step_id: id,
                 attempt,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Vec::new(),
-            );
+                command: None,
+                child_session_id: None,
+                resolved_model: None,
+                last_assistant_response: None,
+                observed: None,
+                checks: Vec::new(),
+            });
             let initial_summary_json = serialize_json(&initial_summary, "step summary")?;
             let attempt_id = store.record_step_attempt(StepAttemptRecord {
                 plan_run_id: plan_run.id.clone(),
@@ -818,19 +829,19 @@ where
                             NullableUpdate::Null,
                             Vec::new(),
                         );
-                        let summary = build_step_summary(
-                            "plan_step_summary",
+                        let summary = build_step_summary(StepSummaryArgs {
+                            kind: "plan_step_summary",
                             plan_run,
                             step_index,
-                            id,
+                            step_id: id,
                             attempt,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            Vec::new(),
-                        );
+                            command: None,
+                            child_session_id: None,
+                            resolved_model: None,
+                            last_assistant_response: None,
+                            observed: None,
+                            checks: Vec::new(),
+                        });
                         let summary_json = serialize_json(&summary, "step summary")?;
                         let checks_json = initial_checks_json.clone();
                         finalize_attempt(store, attempt_id, "crashed", &summary_json, &checks_json)
@@ -842,15 +853,15 @@ where
                 store.get_session_metadata(&spawn_result.child_session_id)?,
             );
             let Some(metadata_json) = metadata_json else {
-                return handle_spawn_missing_metadata(
+                return handle_spawn_missing_metadata(SpawnMissingMetadataArgs {
                     store,
                     plan_run,
                     step_index,
-                    id,
+                    step_id: id,
                     attempt,
-                    &spawn_result,
+                    spawn_result: &spawn_result,
                     attempt_id,
-                )
+                })
                 .await;
             };
             let context = SpawnDrainContext {
@@ -879,19 +890,19 @@ where
                         NullableUpdate::Value(spawn_result.child_session_id.clone()),
                         Vec::new(),
                     );
-                    let summary = build_step_summary(
-                        "plan_step_summary",
+                    let summary = build_step_summary(StepSummaryArgs {
+                        kind: "plan_step_summary",
                         plan_run,
                         step_index,
-                        id,
+                        step_id: id,
                         attempt,
-                        None,
-                        Some(spawn_result.child_session_id.clone()),
-                        Some(spawn_result.resolved_model.clone()),
-                        None,
-                        None,
-                        Vec::new(),
-                    );
+                        command: None,
+                        child_session_id: Some(spawn_result.child_session_id.clone()),
+                        resolved_model: Some(spawn_result.resolved_model.clone()),
+                        last_assistant_response: None,
+                        observed: None,
+                        checks: Vec::new(),
+                    });
                     let summary_json = serialize_json(&summary, "step summary")?;
                     let checks_json = initial_checks_json.clone();
                     store
@@ -921,19 +932,19 @@ where
             )
             .await;
             let failure_reason = step_result_to_failure_reason(&checks);
-            let summary = build_step_summary(
-                "plan_step_summary",
+            let summary = build_step_summary(StepSummaryArgs {
+                kind: "plan_step_summary",
                 plan_run,
                 step_index,
-                id,
+                step_id: id,
                 attempt,
-                None,
-                Some(drain_result.child_session_id.clone()),
-                Some(drain_result.resolved_model.clone()),
-                drain_result.last_assistant_response.clone(),
-                None,
-                checks.clone(),
-            );
+                command: None,
+                child_session_id: Some(drain_result.child_session_id.clone()),
+                resolved_model: Some(drain_result.resolved_model.clone()),
+                last_assistant_response: drain_result.last_assistant_response.clone(),
+                observed: None,
+                checks: checks.clone(),
+            });
             let summary_json = serialize_json(&summary, "step summary")?;
             let checks_json = serialize_json(&checks, "checks")?;
 
@@ -1861,15 +1872,15 @@ mod tests {
             })
             .unwrap();
 
-        let outcome = handle_spawn_missing_metadata(
-            &mut store,
-            &plan_run,
-            0,
-            "step-spawn",
-            0,
-            &spawn_result,
+        let outcome = handle_spawn_missing_metadata(SpawnMissingMetadataArgs {
+            store: &mut store,
+            plan_run: &plan_run,
+            step_index: 0,
+            step_id: "step-spawn",
+            attempt: 0,
+            spawn_result: &spawn_result,
             attempt_id,
-        )
+        })
         .await
         .unwrap();
 

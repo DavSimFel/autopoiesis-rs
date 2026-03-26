@@ -18,7 +18,7 @@ pub struct GuardedShellResult {
 }
 
 /// Run the guarded shell path for a simple command string.
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn guarded_shell_execute<AH>(
     turn: &Turn,
     command: &str,
@@ -121,7 +121,7 @@ async fn execute_shell_call(
     debug!(call_id = %call.id, tool_name = %call.name, "executing guarded shell call");
     let raw_output = match turn.execute_tool(&call.name, &call.arguments).await {
         Ok(output) => output,
-        Err(err) => format!(r#"{{"error": "{err}"}}"#),
+        Err(err) => serde_json::json!({ "error": err.to_string() }).to_string(),
     };
     let exit_code = parse_exit_code(&raw_output);
     let output = guard_text_output(turn, raw_output);
@@ -185,7 +185,10 @@ mod tests {
                 &[],
                 "low",
             )))
-            .guard(SecretRedactor::new(&[r"shh-[a-zA-Z0-9_-]{8,}"]))
+            .guard(
+                SecretRedactor::new(&[r"shh-[a-zA-Z0-9_-]{8,}"])
+                    .expect("test secret redaction regex should be valid"),
+            )
     }
 
     #[derive(Clone)]
@@ -530,7 +533,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(result.output.contains(r#"{"error": "boom"}"#));
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["error"], "boom");
         assert_eq!(result.exit_code, None);
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use tracing::debug;
 
 use crate::config::ShellPolicy;
+use crate::config::{ShellDefaultAction, ShellDefaultSeverity};
 use crate::gate::secret_patterns::{
     command_writes_identity_template_path, command_writes_target_path,
     simple_command_reads_protected_path, simple_command_reads_target_path,
@@ -12,11 +13,6 @@ use crate::gate::{Guard, GuardContext, GuardEvent, Severity, Verdict};
 use crate::llm::ToolCall;
 
 const SHELL_POLICY_GUARD_ID: &str = "shell-policy";
-const SHELL_POLICY_ACTION_ALLOW: &str = "allow";
-const SHELL_POLICY_ACTION_APPROVE: &str = "approve";
-const SHELL_POLICY_SEVERITY_LOW: &str = "low";
-const SHELL_POLICY_SEVERITY_MEDIUM: &str = "medium";
-const SHELL_POLICY_SEVERITY_HIGH: &str = "high";
 const SHELL_POLICY_COMMAND_FIELD: &str = "command";
 const ALLOWLIST_MISS_REASON: &str = "shell command did not match any allowlist pattern";
 const COMPOUND_COMMAND_REASON: &str = "compound shell command requires explicit approval";
@@ -31,12 +27,6 @@ pub struct ShellSafety {
     default_severity: Severity,
     standing_approvals: Vec<String>,
     standing_approval_matches: Mutex<Vec<StandingApprovalMatch>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ShellDefaultAction {
-    Allow,
-    Approve,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,20 +49,11 @@ impl ShellSafety {
     }
 
     pub fn with_policy_and_skills_dirs(policy: ShellPolicy, skills_dirs: Vec<PathBuf>) -> Self {
-        let default_action = match policy.default.trim() {
-            value if value.eq_ignore_ascii_case(SHELL_POLICY_ACTION_ALLOW) => {
-                ShellDefaultAction::Allow
-            }
-            value if value.eq_ignore_ascii_case(SHELL_POLICY_ACTION_APPROVE) => {
-                ShellDefaultAction::Approve
-            }
-            _ => ShellDefaultAction::Approve,
-        };
-        let default_severity = match policy.default_severity.trim() {
-            value if value.eq_ignore_ascii_case(SHELL_POLICY_SEVERITY_LOW) => Severity::Low,
-            value if value.eq_ignore_ascii_case(SHELL_POLICY_SEVERITY_MEDIUM) => Severity::Medium,
-            value if value.eq_ignore_ascii_case(SHELL_POLICY_SEVERITY_HIGH) => Severity::High,
-            _ => Severity::Medium,
+        let default_action = policy.default;
+        let default_severity = match policy.default_severity {
+            ShellDefaultSeverity::Low => Severity::Low,
+            ShellDefaultSeverity::Medium => Severity::Medium,
+            ShellDefaultSeverity::High => Severity::High,
         };
         let standing_approvals = policy.standing_approvals.clone();
 
@@ -137,8 +118,8 @@ impl ShellSafety {
         })
     }
 
-    fn shell_words(command: &str) -> Option<Vec<String>> {
-        shell_words::split(command).ok()
+    fn shell_words(command: &str) -> Result<Vec<String>, shell_words::ParseError> {
+        shell_words::split(command)
     }
 
     fn is_compound_command(command: &str) -> bool {
@@ -177,16 +158,25 @@ impl ShellSafety {
             };
         }
 
-        if let Some(argv) = Self::shell_words(command)
-            && (simple_command_reads_protected_path(&argv)
-                || self.skills_dirs.iter().any(|skills_dir| {
-                    simple_command_reads_target_path(&argv, &skills_dir.to_string_lossy())
-                }))
-        {
-            return Verdict::Deny {
-                reason: format!("shell command reads protected credential path: `{command}`"),
-                gate_id: self.id.clone(),
-            };
+        match Self::shell_words(command) {
+            Ok(argv)
+                if simple_command_reads_protected_path(&argv)
+                    || self.skills_dirs.iter().any(|skills_dir| {
+                        simple_command_reads_target_path(&argv, &skills_dir.to_string_lossy())
+                    }) =>
+            {
+                return Verdict::Deny {
+                    reason: format!("shell command reads protected credential path: `{command}`"),
+                    gate_id: self.id.clone(),
+                };
+            }
+            Err(_) => {
+                return Verdict::Deny {
+                    reason: format!("shell command could not be parsed safely: `{command}`"),
+                    gate_id: self.id.clone(),
+                };
+            }
+            _ => {}
         }
 
         if command_writes_identity_template_path(command)
@@ -281,7 +271,11 @@ mod tests {
         default_severity: &str,
     ) -> ShellPolicy {
         ShellPolicy {
-            default: default.to_string(),
+            default: match default {
+                "allow" => crate::config::ShellDefaultAction::Allow,
+                "approve" => crate::config::ShellDefaultAction::Approve,
+                other => panic!("unexpected shell default in test helper: {other}"),
+            },
             allow_patterns: allow_patterns
                 .iter()
                 .map(|pattern| pattern.to_string())
@@ -294,7 +288,12 @@ mod tests {
                 .iter()
                 .map(|pattern| pattern.to_string())
                 .collect(),
-            default_severity: default_severity.to_string(),
+            default_severity: match default_severity {
+                "low" => crate::config::ShellDefaultSeverity::Low,
+                "medium" => crate::config::ShellDefaultSeverity::Medium,
+                "high" => crate::config::ShellDefaultSeverity::High,
+                other => panic!("unexpected shell severity in test helper: {other}"),
+            },
             max_output_bytes: crate::config::DEFAULT_SHELL_MAX_OUTPUT_BYTES,
             max_timeout_ms: crate::config::DEFAULT_SHELL_MAX_TIMEOUT_MS,
         }

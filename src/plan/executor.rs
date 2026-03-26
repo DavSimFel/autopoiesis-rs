@@ -6,7 +6,6 @@ use crate::llm::ToolCall;
 use crate::session::Session;
 use crate::turn::Turn;
 
-#[allow(dead_code)]
 pub async fn guarded_shell_execute_call<AH>(
     turn: &Turn,
     call: &ToolCall,

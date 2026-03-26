@@ -348,9 +348,8 @@ where
 #[derive(Debug, Deserialize)]
 struct AuthorizationResponse {
     authorization_code: String,
-    #[allow(dead_code)]
-    #[serde(default)]
-    code_challenge: Option<String>,
+    #[serde(rename = "code_challenge", default)]
+    _code_challenge: Option<String>,
     code_verifier: String,
 }
 
