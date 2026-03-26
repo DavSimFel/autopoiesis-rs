@@ -4,10 +4,11 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 use crate::llm::LlmProvider;
+use crate::plan::extract_plan_action;
 use crate::session::Session;
 use crate::store::Store;
 
-use super::drain_queue;
+use super::queue::drain_queue_with_stats;
 use super::{ApprovalHandler, SpawnDrainResult, SpawnRequest, SpawnResult, TokenSink, TurnVerdict};
 
 pub(super) type SpawnedChildMetadata = crate::spawn::ChildSessionMetadata;
@@ -108,7 +109,7 @@ where
         .context("failed to load child session history")?;
 
     let mut make_provider_for_turn = || make_provider(&child_config);
-    match drain_queue(
+    let (drain_result, processed_any, current_assistant_response) = drain_queue_with_stats(
         context.store,
         &context.spawn_result.child_session_id,
         &mut child_session,
@@ -117,8 +118,8 @@ where
         token_sink,
         approval_handler,
     )
-    .await?
-    {
+    .await?;
+    match drain_result {
         Some(TurnVerdict::Denied { reason, gate_id }) => {
             return Err(anyhow::anyhow!(
                 "child session denied by {gate_id}: {reason}"
@@ -132,12 +133,42 @@ where
         None => {}
     }
 
-    let last_assistant_response = crate::spawn::latest_assistant_response(&child_session);
+    let last_assistant_response = current_assistant_response;
+    if processed_any {
+        apply_t2_plan_handoff(
+            context.store,
+            &metadata.parent_session_id,
+            &metadata.tier,
+            last_assistant_response.as_deref(),
+        )?;
+    }
     Ok(SpawnDrainResult {
         child_session_id: context.spawn_result.child_session_id,
         resolved_model: context.spawn_result.resolved_model,
         last_assistant_response,
     })
+}
+
+fn apply_t2_plan_handoff(
+    store: &mut Store,
+    owner_session_id: &str,
+    tier: &str,
+    last_assistant_response: Option<&str>,
+) -> Result<()> {
+    if tier != "t2" {
+        return Ok(());
+    }
+
+    let Some(last_assistant_response) = last_assistant_response else {
+        return Ok(());
+    };
+
+    let Some(action) = extract_plan_action(last_assistant_response)? else {
+        return Ok(());
+    };
+
+    crate::plan::patch::apply_plan_action(store, owner_session_id, &action)?;
+    Ok(())
 }
 
 /// Spawn a child session and drain its queue to completion.

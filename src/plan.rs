@@ -3,10 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub(crate) mod executor;
+pub(crate) mod notify;
+pub(crate) mod patch;
 pub mod runner;
 
 pub use runner::{
-    CheckOutcome, CheckVerdict, ObservedOutput, StepOutcome, run_plan_step, tick_plan_runner,
+    CheckOutcome, CheckVerdict, ObservedOutput, PlanFailureDetails, StepOutcome, run_plan_step,
+    tick_plan_runner,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

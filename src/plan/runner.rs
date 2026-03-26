@@ -10,6 +10,7 @@ use crate::agent::{ApprovalHandler, SpawnDrainContext, TokenSink, finish_spawned
 use crate::config::Config;
 use crate::gate::output_cap::safe_call_id_for_filename;
 use crate::llm::ToolCall;
+use crate::plan::notify::notify_plan_failure;
 use crate::plan::{PlanAction, PlanStepSpec, ShellCheckSpec, ShellExpectation};
 use crate::session::Session;
 use crate::spawn::SpawnRequest;
@@ -46,10 +47,10 @@ fn maybe_force_missing_spawn_metadata(metadata_json: Option<String>) -> Option<S
     metadata_json
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepOutcome {
     Advanced,
-    WaitingT2 { failure_json: String },
+    WaitingT2 { failure: PlanFailureDetails },
     Completed,
     Failed,
 }
@@ -93,19 +94,6 @@ pub(crate) struct StepSummaryPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct StepFailurePayload {
-    pub kind: String,
-    pub plan_run_id: String,
-    pub revision: i64,
-    pub step_index: i64,
-    pub step_id: String,
-    pub attempt: i64,
-    pub reason: String,
-    pub child_session_id: Option<String>,
-    pub checks: Vec<CheckOutcome>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StepCrashPayload {
     pub kind: String,
     pub plan_run_id: String,
@@ -115,6 +103,17 @@ pub(crate) struct StepCrashPayload {
     pub attempt: i64,
     pub reason: String,
     pub child_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanFailureDetails {
+    pub step_index: i64,
+    pub step_id: String,
+    pub attempt: i64,
+    pub reason: String,
+    pub payload_child_session_id: Option<String>,
+    pub active_child_session_update: NullableUpdate<String>,
+    pub checks: Vec<CheckOutcome>,
 }
 
 pub(crate) fn build_step_call_id(
@@ -384,18 +383,15 @@ async fn handle_spawn_missing_metadata(
     spawn_result: &crate::spawn::SpawnResult,
     attempt_id: i64,
 ) -> Result<StepOutcome> {
-    let failure_json = serialize_json(
-        &build_step_failure(
-            plan_run,
-            step_index,
-            step_id,
-            attempt,
-            "spawn_failed",
-            Some(spawn_result.child_session_id.clone()),
-            Vec::new(),
-        ),
-        "step failure",
-    )?;
+    let failure = build_waiting_t2_failure_details(
+        step_index,
+        step_id,
+        attempt,
+        "spawn_failed",
+        Some(spawn_result.child_session_id.clone()),
+        NullableUpdate::Value(spawn_result.child_session_id.clone()),
+        Vec::new(),
+    );
     let summary = build_step_summary(
         "plan_step_summary",
         plan_run,
@@ -412,25 +408,11 @@ async fn handle_spawn_missing_metadata(
     let summary_json = serialize_json(&summary, "step summary")?;
     let checks_json = "[]".to_string();
     store
-        .update_plan_run_status(
-            &plan_run.id,
-            "waiting_t2",
-            PlanRunUpdateFields {
-                current_step_index: Some(step_index),
-                last_failure_json: NullableUpdate::Value(failure_json.clone()),
-                active_child_session_id: NullableUpdate::Value(
-                    spawn_result.child_session_id.clone(),
-                ),
-                ..PlanRunUpdateFields::default()
-            },
-        )
-        .context("failed to mark failed spawn step waiting_t2")?;
-    store
         .update_step_attempt_child_session(attempt_id, Some(&spawn_result.child_session_id))
         .context("failed to record spawned child session")?;
     finalize_attempt(store, attempt_id, "crashed", &summary_json, &checks_json)
         .context("failed to finalize crashed spawn attempt")?;
-    Ok(StepOutcome::WaitingT2 { failure_json })
+    Ok(StepOutcome::WaitingT2 { failure })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -463,28 +445,6 @@ fn build_step_summary(
     }
 }
 
-fn build_step_failure(
-    plan_run: &PlanRun,
-    step_index: i64,
-    step_id: &str,
-    attempt: i64,
-    reason: &str,
-    child_session_id: Option<String>,
-    checks: Vec<CheckOutcome>,
-) -> StepFailurePayload {
-    StepFailurePayload {
-        kind: "plan_failure".to_string(),
-        plan_run_id: plan_run.id.clone(),
-        revision: plan_run.revision,
-        step_index,
-        step_id: step_id.to_string(),
-        attempt,
-        reason: reason.to_string(),
-        child_session_id,
-        checks,
-    }
-}
-
 fn build_step_crash(
     plan_run: &PlanRun,
     step_index: i64,
@@ -502,6 +462,26 @@ fn build_step_crash(
         attempt,
         reason: reason.to_string(),
         child_session_id,
+    }
+}
+
+fn build_waiting_t2_failure_details(
+    step_index: i64,
+    step_id: &str,
+    attempt: i64,
+    reason: &str,
+    payload_child_session_id: Option<String>,
+    active_child_session_update: NullableUpdate<String>,
+    checks: Vec<CheckOutcome>,
+) -> PlanFailureDetails {
+    PlanFailureDetails {
+        step_index,
+        step_id: step_id.to_string(),
+        attempt,
+        reason: reason.to_string(),
+        payload_child_session_id,
+        active_child_session_update,
+        checks,
     }
 }
 
@@ -672,16 +652,15 @@ where
             if result.was_denied {
                 let checks = Vec::new();
                 let checks_json = serialize_json(&checks, "checks")?;
-                let failure = build_step_failure(
-                    plan_run,
+                let failure = build_waiting_t2_failure_details(
                     step_index,
                     id,
                     attempt,
                     "shell_denied",
                     None,
+                    NullableUpdate::Null,
                     checks.clone(),
                 );
-                let failure_json = serialize_json(&failure, "step failure")?;
                 let summary = build_step_summary(
                     "plan_step_summary",
                     plan_run,
@@ -696,21 +675,9 @@ where
                     checks,
                 );
                 let summary_json = serialize_json(&summary, "step summary")?;
-                store
-                    .update_plan_run_status(
-                        &plan_run.id,
-                        "waiting_t2",
-                        PlanRunUpdateFields {
-                            current_step_index: Some(step_index),
-                            last_failure_json: NullableUpdate::Value(failure_json.clone()),
-                            active_child_session_id: NullableUpdate::Null,
-                            ..PlanRunUpdateFields::default()
-                        },
-                    )
-                    .context("failed to mark denied shell step waiting_t2")?;
                 finalize_attempt(store, attempt_id, "failed", &summary_json, &checks_json)
                     .context("failed to finalize denied shell attempt")?;
-                return Ok(StepOutcome::WaitingT2 { failure_json });
+                return Ok(StepOutcome::WaitingT2 { failure });
             }
 
             let observed = observed_output_from_result(
@@ -752,33 +719,18 @@ where
             let checks_json = serialize_json(&checks, "checks")?;
 
             if let Some(reason) = failure_reason {
-                let failure_json = serialize_json(
-                    &build_step_failure(
-                        plan_run,
-                        step_index,
-                        id,
-                        attempt,
-                        reason,
-                        None,
-                        checks.clone(),
-                    ),
-                    "step failure",
-                )?;
-                store
-                    .update_plan_run_status(
-                        &plan_run.id,
-                        "waiting_t2",
-                        PlanRunUpdateFields {
-                            current_step_index: Some(step_index),
-                            last_failure_json: NullableUpdate::Value(failure_json.clone()),
-                            active_child_session_id: NullableUpdate::Null,
-                            ..PlanRunUpdateFields::default()
-                        },
-                    )
-                    .context("failed to mark failed shell step waiting_t2")?;
+                let failure = build_waiting_t2_failure_details(
+                    step_index,
+                    id,
+                    attempt,
+                    reason,
+                    None,
+                    NullableUpdate::Null,
+                    checks.clone(),
+                );
                 finalize_attempt(store, attempt_id, "failed", &summary_json, &checks_json)
                     .context("failed to finalize failed shell attempt")?;
-                return Ok(StepOutcome::WaitingT2 { failure_json });
+                return Ok(StepOutcome::WaitingT2 { failure });
             }
 
             let completed = current_step_index + 1 >= plan_action.steps.len();
@@ -848,18 +800,15 @@ where
                 match crate::spawn::spawn_child(store, config, parent_budget, spawn_request) {
                     Ok(result) => result,
                     Err(_error) => {
-                        let failure_json = serialize_json(
-                            &build_step_failure(
-                                plan_run,
-                                step_index,
-                                id,
-                                attempt,
-                                "spawn_failed",
-                                None,
-                                Vec::new(),
-                            ),
-                            "step failure",
-                        )?;
+                        let failure = build_waiting_t2_failure_details(
+                            step_index,
+                            id,
+                            attempt,
+                            "spawn_failed",
+                            None,
+                            NullableUpdate::Null,
+                            Vec::new(),
+                        );
                         let summary = build_step_summary(
                             "plan_step_summary",
                             plan_run,
@@ -875,21 +824,9 @@ where
                         );
                         let summary_json = serialize_json(&summary, "step summary")?;
                         let checks_json = initial_checks_json.clone();
-                        store
-                            .update_plan_run_status(
-                                &plan_run.id,
-                                "waiting_t2",
-                                PlanRunUpdateFields {
-                                    current_step_index: Some(step_index),
-                                    last_failure_json: NullableUpdate::Value(failure_json.clone()),
-                                    active_child_session_id: NullableUpdate::Null,
-                                    ..PlanRunUpdateFields::default()
-                                },
-                            )
-                            .context("failed to mark failed spawn step waiting_t2")?;
                         finalize_attempt(store, attempt_id, "crashed", &summary_json, &checks_json)
                             .context("failed to finalize crashed spawn attempt")?;
-                        return Ok(StepOutcome::WaitingT2 { failure_json });
+                        return Ok(StepOutcome::WaitingT2 { failure });
                     }
                 };
             let metadata_json = maybe_force_missing_spawn_metadata(
@@ -924,18 +861,15 @@ where
             {
                 Ok(result) => result,
                 Err(_error) => {
-                    let failure_json = serialize_json(
-                        &build_step_failure(
-                            plan_run,
-                            step_index,
-                            id,
-                            attempt,
-                            "spawn_failed",
-                            Some(spawn_result.child_session_id.clone()),
-                            Vec::new(),
-                        ),
-                        "step failure",
-                    )?;
+                    let failure = build_waiting_t2_failure_details(
+                        step_index,
+                        id,
+                        attempt,
+                        "spawn_failed",
+                        Some(spawn_result.child_session_id.clone()),
+                        NullableUpdate::Value(spawn_result.child_session_id.clone()),
+                        Vec::new(),
+                    );
                     let summary = build_step_summary(
                         "plan_step_summary",
                         plan_run,
@@ -952,20 +886,6 @@ where
                     let summary_json = serialize_json(&summary, "step summary")?;
                     let checks_json = initial_checks_json.clone();
                     store
-                        .update_plan_run_status(
-                            &plan_run.id,
-                            "waiting_t2",
-                            PlanRunUpdateFields {
-                                current_step_index: Some(step_index),
-                                last_failure_json: NullableUpdate::Value(failure_json.clone()),
-                                active_child_session_id: NullableUpdate::Value(
-                                    spawn_result.child_session_id.clone(),
-                                ),
-                                ..PlanRunUpdateFields::default()
-                            },
-                        )
-                        .context("failed to mark drained spawn step waiting_t2")?;
-                    store
                         .update_step_attempt_child_session(
                             attempt_id,
                             Some(&spawn_result.child_session_id),
@@ -973,7 +893,7 @@ where
                         .context("failed to record spawned child session")?;
                     finalize_attempt(store, attempt_id, "crashed", &summary_json, &checks_json)
                         .context("failed to finalize crashed spawn attempt")?;
-                    return Ok(StepOutcome::WaitingT2 { failure_json });
+                    return Ok(StepOutcome::WaitingT2 { failure });
                 }
             };
             let checks_call_id_prefix = build_step_call_id(
@@ -1009,30 +929,15 @@ where
             let checks_json = serialize_json(&checks, "checks")?;
 
             if let Some(reason) = failure_reason {
-                let failure_json = serialize_json(
-                    &build_step_failure(
-                        plan_run,
-                        step_index,
-                        id,
-                        attempt,
-                        reason,
-                        Some(drain_result.child_session_id.clone()),
-                        checks.clone(),
-                    ),
-                    "step failure",
-                )?;
-                store
-                    .update_plan_run_status(
-                        &plan_run.id,
-                        "waiting_t2",
-                        PlanRunUpdateFields {
-                            current_step_index: Some(step_index),
-                            last_failure_json: NullableUpdate::Value(failure_json.clone()),
-                            active_child_session_id: NullableUpdate::Null,
-                            ..PlanRunUpdateFields::default()
-                        },
-                    )
-                    .context("failed to mark failed spawn step waiting_t2")?;
+                let failure = build_waiting_t2_failure_details(
+                    step_index,
+                    id,
+                    attempt,
+                    reason,
+                    Some(drain_result.child_session_id.clone()),
+                    NullableUpdate::Null,
+                    checks.clone(),
+                );
                 store
                     .update_step_attempt_child_session(
                         attempt_id,
@@ -1041,7 +946,7 @@ where
                     .context("failed to record spawned child session")?;
                 finalize_attempt(store, attempt_id, "failed", &summary_json, &checks_json)
                     .context("failed to finalize failed spawn attempt")?;
-                return Ok(StepOutcome::WaitingT2 { failure_json });
+                return Ok(StepOutcome::WaitingT2 { failure });
             }
 
             let completed = current_step_index + 1 >= plan_action.steps.len();
@@ -1103,6 +1008,11 @@ where
     .await;
 
     match outcome {
+        Ok(StepOutcome::WaitingT2 { failure }) => {
+            notify_plan_failure(store, &plan_run, &failure)
+                .context("failed to notify T2 of plan failure")?;
+            Ok(Some(StepOutcome::WaitingT2 { failure }))
+        }
         Ok(outcome) => {
             store.release_plan_run_claim(&plan_run.id)?;
             Ok(Some(outcome))
@@ -1536,20 +1446,17 @@ mod tests {
         .await
         .unwrap();
 
-        let failure_json = match outcome {
-            StepOutcome::WaitingT2 { failure_json } => failure_json,
+        let failure = match outcome {
+            StepOutcome::WaitingT2 { failure } => failure,
             other => panic!("expected waiting_t2, got {other:?}"),
         };
+        crate::plan::notify::notify_plan_failure(&mut store, &plan_run, &failure).unwrap();
         let updated = store.get_plan_run(&plan_run.id).unwrap().unwrap();
         assert_eq!(updated.status, "waiting_t2");
-        assert!(
-            updated
-                .last_failure_json
-                .as_deref()
-                .unwrap()
-                .contains("shell_denied")
-        );
-        assert!(failure_json.contains("shell_denied"));
+        let failure_json = updated.last_failure_json.as_deref().unwrap();
+        let failure_payload: serde_json::Value = serde_json::from_str(failure_json).unwrap();
+        assert_eq!(failure.reason, "shell_denied");
+        assert_eq!(failure_payload["reason"], "shell_denied");
     }
 
     #[tokio::test]
@@ -1586,20 +1493,17 @@ mod tests {
         .await
         .unwrap();
 
-        let failure_json = match outcome {
-            StepOutcome::WaitingT2 { failure_json } => failure_json,
+        let failure = match outcome {
+            StepOutcome::WaitingT2 { failure } => failure,
             other => panic!("expected waiting_t2, got {other:?}"),
         };
+        crate::plan::notify::notify_plan_failure(&mut store, &plan_run, &failure).unwrap();
         let updated = store.get_plan_run(&plan_run.id).unwrap().unwrap();
         assert_eq!(updated.status, "waiting_t2");
-        assert!(
-            updated
-                .last_failure_json
-                .as_deref()
-                .unwrap()
-                .contains("spawn_failed")
-        );
-        assert!(failure_json.contains("spawn_failed"));
+        let failure_json = updated.last_failure_json.as_deref().unwrap();
+        let failure_payload: serde_json::Value = serde_json::from_str(failure_json).unwrap();
+        assert_eq!(failure.reason, "spawn_failed");
+        assert_eq!(failure_payload["reason"], "spawn_failed");
     }
 
     #[tokio::test]
@@ -1648,14 +1552,15 @@ mod tests {
         .await
         .unwrap();
 
-        let failure_json = match outcome {
-            StepOutcome::WaitingT2 { failure_json } => failure_json,
+        let failure = match outcome {
+            StepOutcome::WaitingT2 { failure } => failure,
             other => panic!("expected waiting_t2, got {other:?}"),
         };
+        crate::plan::notify::notify_plan_failure(&mut store, &plan_run, &failure).unwrap();
         let updated = store.get_plan_run(&plan_run.id).unwrap().unwrap();
         assert_eq!(updated.status, "waiting_t2");
         assert_eq!(updated.current_step_index, 0);
-        assert!(failure_json.contains("spawn_failed"));
+        assert_eq!(failure.reason, "spawn_failed");
         assert!(updated.active_child_session_id.is_some());
     }
 
@@ -1810,29 +1715,86 @@ mod tests {
         .await
         .unwrap();
 
-        let failure_json = match outcome {
-            StepOutcome::WaitingT2 { failure_json } => failure_json,
+        let failure = match outcome {
+            StepOutcome::WaitingT2 { failure } => failure,
             other => panic!("expected waiting_t2, got {other:?}"),
         };
+        crate::plan::notify::notify_plan_failure(&mut store, &plan_run, &failure).unwrap();
         let updated = store.get_plan_run(&plan_run.id).unwrap().unwrap();
         assert_eq!(updated.status, "waiting_t2");
         assert_eq!(updated.current_step_index, 0);
-        assert!(
-            updated
-                .last_failure_json
-                .as_deref()
-                .unwrap()
-                .contains("check_failed")
-        );
-
-        let failure: StepFailurePayload = serde_json::from_str(&failure_json).unwrap();
-        assert_eq!(failure.kind, "plan_failure");
+        let failure_json = updated.last_failure_json.as_deref().unwrap();
+        let failure_payload: serde_json::Value = serde_json::from_str(failure_json).unwrap();
         assert_eq!(failure.reason, "check_failed");
-        assert_eq!(failure.step_id, "step-shell");
+        assert_eq!(failure_payload["kind"], "plan_failure");
+        assert_eq!(failure_payload["reason"], "check_failed");
+        assert_eq!(failure_payload["step_id"], "step-shell");
 
         let attempts = store.get_step_attempts(&plan_run.id, 0).unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].status, "failed");
+    }
+
+    #[tokio::test]
+    async fn tick_plan_runner_notifies_t2_after_waiting_for_failure() {
+        let root = temp_sessions_dir("tick_waiting_t2_notify");
+        let config = test_config(&root);
+        let mut store = Store::new(root.join("store.sqlite")).unwrap();
+        let owner_session_id = "owner";
+        let owner_session_dir = root.join(owner_session_id);
+        std::fs::create_dir_all(&owner_session_dir).unwrap();
+        let _session = Session::new(&owner_session_dir).unwrap();
+        let plan_run = insert_plan_run(
+            &mut store,
+            owner_session_id,
+            "plan-tick-waiting-t2",
+            &shell_plan("echo shell-ok", "echo shell-ok", "not-present"),
+        );
+        let mut make_provider = |_config: &crate::config::Config| {
+            let provider = StaticProvider {
+                turn: child_turn("child ok"),
+            };
+            async move { Ok::<StaticProvider, anyhow::Error>(provider) }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler =
+            |_severity: &crate::gate::Severity, _reason: &str, _command: &str| true;
+
+        let outcome = tick_plan_runner(
+            &mut store,
+            &config,
+            &root,
+            &mut make_provider,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let failure = match outcome {
+            StepOutcome::WaitingT2 { failure } => failure,
+            other => panic!("expected waiting_t2, got {other:?}"),
+        };
+        assert_eq!(failure.reason, "check_failed");
+
+        let updated = store.get_plan_run(&plan_run.id).unwrap().unwrap();
+        assert_eq!(updated.status, "waiting_t2");
+        assert_eq!(updated.claimed_at, None);
+
+        let notification = store
+            .dequeue_next_message(owner_session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(notification.role, "user");
+        assert_eq!(notification.source, format!("agent-plan-{}", plan_run.id));
+        let payload: serde_json::Value = serde_json::from_str(&notification.content).unwrap();
+        assert_eq!(payload["kind"], "plan_failure");
+        assert_eq!(payload["plan_run_id"], plan_run.id);
+        assert_eq!(payload["reason"], "check_failed");
+        assert_eq!(payload["step_id"], "step-shell");
+        assert_eq!(payload["step_index"], 0);
+        assert_eq!(payload["attempt"], 0);
     }
 
     #[tokio::test]
@@ -1891,11 +1853,12 @@ mod tests {
         .await
         .unwrap();
 
-        let failure_json = match outcome {
-            StepOutcome::WaitingT2 { failure_json } => failure_json,
+        let failure = match outcome {
+            StepOutcome::WaitingT2 { failure } => failure,
             other => panic!("expected waiting_t2, got {other:?}"),
         };
-        assert!(failure_json.contains("spawn_failed"));
+        assert_eq!(failure.reason, "spawn_failed");
+        crate::plan::notify::notify_plan_failure(&mut store, &plan_run, &failure).unwrap();
 
         let updated = store.get_plan_run(&plan_run.id).unwrap().unwrap();
         assert_eq!(updated.status, "waiting_t2");

@@ -305,6 +305,21 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    pub(crate) fn enqueue_message_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        source: &str,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO messages (session_id, role, content, source, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, role, content, source, utc_timestamp()],
+        )
+        .context("failed to enqueue message")?;
+        Ok(())
+    }
+
     pub fn dequeue_next_message(&mut self, session_id: &str) -> Result<Option<QueuedMessage>> {
         let claimed_at = unix_timestamp();
         let mut statement = self

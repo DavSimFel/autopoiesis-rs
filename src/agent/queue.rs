@@ -79,8 +79,37 @@ where
     Fut: std::future::Future<Output = Result<P>>,
     P: LlmProvider,
 {
+    let (verdict, _processed_any, _last_assistant_response) = drain_queue_with_stats(
+        store,
+        session_id,
+        session,
+        turn,
+        make_provider,
+        token_sink,
+        approval_handler,
+    )
+    .await?;
+    Ok(verdict)
+}
+
+pub(crate) async fn drain_queue_with_stats<F, Fut, P>(
+    store: &mut Store,
+    session_id: &str,
+    session: &mut Session,
+    turn: &Turn,
+    make_provider: &mut F,
+    token_sink: &mut (dyn TokenSink + Send),
+    approval_handler: &mut (dyn ApprovalHandler + Send),
+) -> Result<(Option<TurnVerdict>, bool, Option<String>)>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<P>>,
+    P: LlmProvider,
+{
     info!(%session_id, "draining queue");
     let mut processed_any = false;
+    let mut last_assistant_response = None;
+    let baseline_assistant_response = crate::spawn::latest_assistant_response(session);
     while let Some(message) = store.dequeue_next_message(session_id)? {
         processed_any = true;
         let outcome = process_queued_message(
@@ -92,10 +121,15 @@ where
             approval_handler,
         )
         .await;
-
         match outcome {
             Ok(QueueOutcome::Agent(verdict)) => {
                 store.mark_processed(message.id)?;
+                let current_assistant_response = crate::spawn::latest_assistant_response(session);
+                if current_assistant_response.as_deref() != baseline_assistant_response.as_deref() {
+                    last_assistant_response = current_assistant_response;
+                } else {
+                    last_assistant_response = None;
+                }
                 match verdict {
                     TurnVerdict::Executed(_) => {}
                     TurnVerdict::Approved { .. } => {
@@ -106,7 +140,11 @@ where
                     }
                     TurnVerdict::Denied { reason, gate_id } => {
                         warn!(message_id = message.id, %gate_id, "turn denied");
-                        return Ok(Some(TurnVerdict::Denied { reason, gate_id }));
+                        return Ok((
+                            Some(TurnVerdict::Denied { reason, gate_id }),
+                            processed_any,
+                            last_assistant_response,
+                        ));
                     }
                 }
             }
@@ -129,7 +167,7 @@ where
         let _ = crate::spawn::enqueue_child_completion(store, session_id, session)?;
     }
 
-    Ok(None)
+    Ok((None, processed_any, last_assistant_response))
 }
 
 #[cfg(test)]
