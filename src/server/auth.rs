@@ -136,6 +136,7 @@ mod tests {
                 shell_policy: config::ShellPolicy::default(),
                 budget: None,
                 read: config::ReadToolConfig::default(),
+                subscriptions: config::SubscriptionsConfig::default(),
                 queue: config::QueueConfig::default(),
                 identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
                 skills_dir: std::path::PathBuf::from("skills"),

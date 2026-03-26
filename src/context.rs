@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs;
 use std::path::PathBuf;
+use std::time::UNIX_EPOCH;
 
 use crate::identity;
 use crate::llm::{ChatMessage, ChatRole, MessageContent};
 use crate::skills::SkillDefinition;
 use crate::skills::SkillSummary;
+use crate::subscription::{SubscriptionRecord, estimate_tokens};
 use tracing::warn;
 
 /// Source for messages inserted into each turn before model invocation.
@@ -174,6 +177,187 @@ impl ContextSource for SkillContext {
         }
 
         first.content.push(MessageContent::text(rendered));
+    }
+}
+
+/// Session-scoped file subscriptions materialized into the model context.
+pub struct SubscriptionContext {
+    subscriptions: Vec<SubscriptionRecord>,
+    token_budget: usize,
+}
+
+impl SubscriptionContext {
+    pub fn new(subscriptions: Vec<SubscriptionRecord>, token_budget: usize) -> Self {
+        Self {
+            subscriptions,
+            token_budget,
+        }
+    }
+
+    fn effective_timestamp(record: &SubscriptionRecord) -> &str {
+        record.effective_at()
+    }
+
+    fn provenance_tag(record: &SubscriptionRecord, mtime_unix: Option<u64>) -> String {
+        let filter = record.filter.label();
+        let mtime = mtime_unix
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        format!(
+            "[subscription path={} filter={} mtime={}]",
+            record.path.display(),
+            filter,
+            mtime
+        )
+    }
+
+    fn char_boundary_at_or_before(text: &str, index: usize) -> usize {
+        if text.is_char_boundary(index) {
+            return index;
+        }
+
+        text.char_indices()
+            .map(|(boundary, _)| boundary)
+            .take_while(|boundary| *boundary <= index)
+            .last()
+            .unwrap_or(0)
+    }
+
+    fn build_body(prefix: &str, rendered: &str, truncated: bool, rendered_len: usize) -> String {
+        let mut body = String::with_capacity(prefix.len() + rendered_len + 32);
+        body.push_str(prefix);
+        if rendered_len > 0 {
+            body.push('\n');
+            body.push_str(&rendered[..rendered_len]);
+        }
+        if truncated {
+            body.push('\n');
+            body.push_str("[truncated]");
+        }
+        body
+    }
+
+    fn fit_body(prefix: &str, rendered: &str, budget: usize) -> Option<(String, usize, bool)> {
+        let full = Self::build_body(prefix, rendered, false, rendered.len());
+        let full_tokens = estimate_tokens(&full);
+        if full_tokens <= budget {
+            return Some((full, full_tokens, false));
+        }
+
+        let truncated_marker = Self::build_body(prefix, rendered, true, 0);
+        if estimate_tokens(&truncated_marker) > budget {
+            return None;
+        }
+
+        let mut low = 0usize;
+        let mut high = rendered.len();
+        let mut best = truncated_marker;
+        let mut best_len = 0usize;
+
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            let boundary = Self::char_boundary_at_or_before(rendered, mid);
+            let candidate = Self::build_body(prefix, rendered, true, boundary);
+            let candidate_tokens = estimate_tokens(&candidate);
+            if candidate_tokens <= budget {
+                best = candidate;
+                best_len = boundary;
+                low = boundary.saturating_add(1);
+            } else if boundary == 0 {
+                break;
+            } else {
+                high = boundary.saturating_sub(1);
+            }
+        }
+
+        let tokens = estimate_tokens(&best);
+        Some((best, tokens, best_len < rendered.len()))
+    }
+
+    fn materialize_record(
+        &self,
+        record: &SubscriptionRecord,
+        remaining_budget: usize,
+    ) -> Option<(ChatMessage, usize)> {
+        let raw = match fs::read_to_string(&record.path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                warn!(
+                    path = %record.path.display(),
+                    error = %error,
+                    "failed to read subscription file; skipping"
+                );
+                return None;
+            }
+        };
+
+        let rendered = match record.filter.render(&raw) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                warn!(
+                    path = %record.path.display(),
+                    error = %error,
+                    "failed to render subscription file; skipping"
+                );
+                return None;
+            }
+        };
+
+        let mtime_unix = fs::metadata(&record.path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs());
+
+        let prefix = Self::provenance_tag(record, mtime_unix);
+        let (body, tokens, _was_truncated) = Self::fit_body(&prefix, &rendered, remaining_budget)?;
+        Some((
+            ChatMessage::system_with_principal(body, Some(crate::principal::Principal::System)),
+            tokens,
+        ))
+    }
+}
+
+impl ContextSource for SubscriptionContext {
+    fn name(&self) -> &str {
+        "subscriptions"
+    }
+
+    fn assemble(&self, messages: &mut Vec<ChatMessage>) {
+        if self.subscriptions.is_empty() {
+            return;
+        }
+
+        let mut subscriptions = self.subscriptions.clone();
+        subscriptions.sort_by(|left, right| {
+            Self::effective_timestamp(left)
+                .cmp(Self::effective_timestamp(right))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let insert_at = if messages
+            .first()
+            .is_some_and(|message| message.role == ChatRole::System)
+        {
+            1
+        } else {
+            0
+        };
+
+        let mut remaining = self.token_budget;
+        let mut offset = 0usize;
+        for record in subscriptions {
+            if remaining == 0 {
+                break;
+            }
+
+            let Some((message, tokens)) = self.materialize_record(&record, remaining) else {
+                continue;
+            };
+            messages.insert(insert_at + offset, message);
+            offset += 1;
+            remaining = remaining.saturating_sub(tokens);
+        }
     }
 }
 
@@ -373,8 +557,11 @@ impl History {
 mod tests {
     use super::*;
     use crate::Principal;
+    use crate::subscription::{SubscriptionFilter, SubscriptionRecord};
     use std::{
         env, fs,
+        io::Write,
+        sync::{Arc, Mutex},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -867,6 +1054,283 @@ mod tests {
             Some(MessageContent::Text { text }) => text,
             _ => panic!("expected text message content"),
         }
+    }
+
+    fn temp_file_dir(prefix: &str) -> std::path::PathBuf {
+        let path = env::temp_dir().join(format!(
+            "autopoiesis_context_subscription_test_{prefix}_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_temp_file(dir: &std::path::Path, name: &str, contents: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn subscription_record(
+        id: i64,
+        session_id: Option<&str>,
+        path: std::path::PathBuf,
+        filter: SubscriptionFilter,
+        activated_at: &str,
+        updated_at: &str,
+    ) -> SubscriptionRecord {
+        SubscriptionRecord {
+            id,
+            session_id: session_id.map(ToString::to_string),
+            topic: "_default".to_string(),
+            path,
+            filter,
+            activated_at: activated_at.to_string(),
+            updated_at: updated_at.to_string(),
+        }
+    }
+
+    fn capture_warnings<F>(f: F) -> String
+    where
+        F: FnOnce(),
+    {
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for SharedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let output = output.clone();
+                move || SharedWriter(output.clone())
+            })
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        f();
+
+        String::from_utf8(output.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn subscription_context_with_no_subscriptions_adds_no_messages() {
+        let mut messages = vec![ChatMessage::system("base")];
+        SubscriptionContext::new(Vec::new(), 100).assemble(&mut messages);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(message_text(&messages[0]), "base");
+    }
+
+    #[test]
+    fn subscription_context_materializes_file_content() {
+        let dir = temp_file_dir("materializes");
+        let path = write_temp_file(&dir, "notes.txt", "line one\nline two");
+        let record = subscription_record(
+            1,
+            Some("session-a"),
+            path.clone(),
+            SubscriptionFilter::Full,
+            "2026-03-25T00:00:00Z",
+            "2026-03-25T00:00:01Z",
+        );
+        let mut messages = vec![ChatMessage::system("identity")];
+        SubscriptionContext::new(vec![record], 200).assemble(&mut messages);
+
+        assert_eq!(messages.len(), 2);
+        let rendered = message_text(&messages[1]);
+        assert!(rendered.contains("line one"));
+        assert!(rendered.contains("line two"));
+        assert!(rendered.contains(&path.display().to_string()));
+        assert!(rendered.contains("filter=full"));
+    }
+
+    #[test]
+    fn subscription_context_applies_lines_regex_head_and_tail_filters() {
+        let dir = temp_file_dir("filters");
+        let path = write_temp_file(&dir, "data.txt", "one\ntwo\nthree\nfour\nfive");
+        let base = vec![ChatMessage::system("identity")];
+
+        let cases = vec![
+            (
+                SubscriptionFilter::Lines { start: 2, end: 4 },
+                "two\nthree\nfour",
+            ),
+            (
+                SubscriptionFilter::Regex {
+                    pattern: "^t".to_string(),
+                },
+                "two\nthree",
+            ),
+            (SubscriptionFilter::Head { count: 2 }, "one\ntwo"),
+            (SubscriptionFilter::Tail { count: 2 }, "four\nfive"),
+        ];
+
+        for (index, (filter, expected)) in cases.into_iter().enumerate() {
+            let record = subscription_record(
+                index as i64 + 1,
+                Some("session-a"),
+                path.clone(),
+                filter,
+                "2026-03-25T00:00:00Z",
+                "2026-03-25T00:00:01Z",
+            );
+            let mut messages = base.clone();
+            SubscriptionContext::new(vec![record], 200).assemble(&mut messages);
+            let rendered = message_text(&messages[1]);
+            assert!(
+                rendered.contains(expected),
+                "case {index} rendered {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_context_respects_token_budget_and_truncates_last_message() {
+        let dir = temp_file_dir("budget");
+        let path = write_temp_file(
+            &dir,
+            "big.txt",
+            &"alpha beta gamma delta epsilon ".repeat(200),
+        );
+        let record = subscription_record(
+            1,
+            Some("session-a"),
+            path,
+            SubscriptionFilter::Full,
+            "2026-03-25T00:00:00Z",
+            "2026-03-25T00:00:01Z",
+        );
+        let mut messages = vec![ChatMessage::system("identity")];
+        SubscriptionContext::new(vec![record], 40).assemble(&mut messages);
+
+        assert_eq!(messages.len(), 2);
+        let rendered = message_text(&messages[1]);
+        assert!(rendered.contains("[truncated]"));
+        assert!(estimate_tokens(rendered) <= 40);
+    }
+
+    #[test]
+    fn subscription_context_missing_file_warns_and_skips() {
+        let dir = temp_file_dir("missing");
+        let missing = dir.join("missing.txt");
+        let record = subscription_record(
+            1,
+            Some("session-a"),
+            missing.clone(),
+            SubscriptionFilter::Full,
+            "2026-03-25T00:00:00Z",
+            "2026-03-25T00:00:01Z",
+        );
+        let warnings = capture_warnings(|| {
+            let mut messages = vec![ChatMessage::system("identity")];
+            SubscriptionContext::new(vec![record], 100).assemble(&mut messages);
+            assert_eq!(messages.len(), 1);
+        });
+
+        assert!(warnings.contains("failed to read subscription file"));
+        assert!(warnings.contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn subscription_context_skips_bad_subscription_and_keeps_later_valid_ones() {
+        let dir = temp_file_dir("mixed");
+        let missing = dir.join("missing.txt");
+        let valid = write_temp_file(&dir, "valid.txt", "kept");
+        let records = vec![
+            subscription_record(
+                1,
+                Some("session-a"),
+                missing.clone(),
+                SubscriptionFilter::Full,
+                "2026-03-25T00:00:00Z",
+                "2026-03-25T00:00:01Z",
+            ),
+            subscription_record(
+                2,
+                Some("session-a"),
+                valid.clone(),
+                SubscriptionFilter::Full,
+                "2026-03-25T00:00:02Z",
+                "2026-03-25T00:00:03Z",
+            ),
+        ];
+
+        let warnings = capture_warnings(|| {
+            let mut messages = vec![ChatMessage::system("identity")];
+            SubscriptionContext::new(records, 100).assemble(&mut messages);
+            assert_eq!(messages.len(), 2);
+            assert!(message_text(&messages[1]).contains("kept"));
+        });
+
+        assert!(warnings.contains("failed to read subscription file"));
+        assert!(warnings.contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn subscription_context_includes_provenance_tags() {
+        let dir = temp_file_dir("provenance");
+        let path = write_temp_file(&dir, "prov.txt", "hello provenance");
+        let record = subscription_record(
+            1,
+            Some("session-a"),
+            path.clone(),
+            SubscriptionFilter::Tail { count: 1 },
+            "2026-03-25T00:00:00Z",
+            "2026-03-25T00:00:01Z",
+        );
+        let mut messages = vec![ChatMessage::system("identity")];
+        SubscriptionContext::new(vec![record], 200).assemble(&mut messages);
+
+        let rendered = message_text(&messages[1]);
+        assert!(rendered.contains(&path.display().to_string()));
+        assert!(rendered.contains("filter=tail"));
+        assert!(rendered.contains("mtime="));
+    }
+
+    #[test]
+    fn subscription_context_orders_messages_by_effective_timestamp() {
+        let dir = temp_file_dir("ordering");
+        let first = write_temp_file(&dir, "first.txt", "first");
+        let second = write_temp_file(&dir, "second.txt", "second");
+        let records = vec![
+            subscription_record(
+                2,
+                Some("session-a"),
+                second.clone(),
+                SubscriptionFilter::Full,
+                "2026-03-25T00:00:00Z",
+                "2026-03-25T00:00:10Z",
+            ),
+            subscription_record(
+                1,
+                Some("session-a"),
+                first.clone(),
+                SubscriptionFilter::Full,
+                "2026-03-25T00:00:00Z",
+                "2026-03-25T00:00:01Z",
+            ),
+        ];
+        let mut messages = vec![ChatMessage::system("identity")];
+        SubscriptionContext::new(records, 200).assemble(&mut messages);
+
+        assert_eq!(message_text(&messages[1]).contains("first"), true);
+        assert_eq!(message_text(&messages[2]).contains("second"), true);
     }
 
     #[test]

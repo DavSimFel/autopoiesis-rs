@@ -32,6 +32,8 @@ pub struct Config {
     pub budget: Option<BudgetConfig>,
     /// Optional structured read policy loaded from the optional `[read]` table.
     pub read: ReadToolConfig,
+    /// Optional subscription context policy loaded from the optional `[subscriptions]` table.
+    pub subscriptions: SubscriptionsConfig,
     /// Queue recovery settings loaded from the optional `[queue]` table.
     pub queue: QueueConfig,
     /// Resolved identity prompt files used to assemble the system prompt.
@@ -129,6 +131,14 @@ pub struct ReadToolConfig {
     pub max_read_bytes: usize,
 }
 
+/// Subscription context policy loaded from `[subscriptions]` in `agents.toml`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SubscriptionsConfig {
+    /// Maximum tokens to spend materializing subscription content into a turn.
+    pub context_token_budget: usize,
+}
+
 pub(crate) const DEFAULT_SHELL_MAX_OUTPUT_BYTES: usize = 1_048_576;
 pub(crate) const DEFAULT_SHELL_MAX_TIMEOUT_MS: u64 = 120_000;
 pub(crate) const DEFAULT_STALE_PROCESSING_TIMEOUT_SECS: u64 = 300;
@@ -176,6 +186,7 @@ impl Config {
             shell_policy: ShellPolicy::default(),
             budget: None,
             read: ReadToolConfig::default(),
+            subscriptions: SubscriptionsConfig::default(),
             queue: QueueConfig::default(),
             identity_files: identity::t1_identity_files("identity-templates", "silas"),
             agents: AgentsConfig::default(),
@@ -222,6 +233,10 @@ impl Config {
             ConfigError::validation_with_source("invalid [read] config", source)
         })?;
         config.read = file_config.read;
+        validate_subscriptions_config(&file_config.subscriptions).map_err(|source| {
+            ConfigError::validation_with_source("invalid [subscriptions] config", source)
+        })?;
+        config.subscriptions = file_config.subscriptions;
 
         if let Some(agents) = file_config.agents {
             let (active_name, active_agent) = select_active_agent(&agents).map_err(|source| {
@@ -740,6 +755,7 @@ mod tests {
             shell_policy: ShellPolicy::default(),
             budget: None,
             read: ReadToolConfig::default(),
+            subscriptions: SubscriptionsConfig::default(),
             queue: QueueConfig::default(),
             identity_files: vec![
                 PathBuf::from("identity-templates/constitution.md"),
@@ -1232,6 +1248,8 @@ struct RuntimeFileConfig {
     #[serde(default)]
     read: ReadToolConfig,
     #[serde(default)]
+    subscriptions: SubscriptionsConfig,
+    #[serde(default)]
     queue: QueueConfig,
 }
 
@@ -1641,6 +1659,14 @@ impl Default for ReadToolConfig {
     }
 }
 
+impl Default for SubscriptionsConfig {
+    fn default() -> Self {
+        Self {
+            context_token_budget: 4_096,
+        }
+    }
+}
+
 impl Config {
     /// Resolve the active agent definition, if v2 config loaded successfully.
     pub fn active_agent_definition(&self) -> Option<&AgentDefinition> {
@@ -1661,6 +1687,16 @@ fn validate_read_tool_config(read: &ReadToolConfig) -> Result<()> {
 
     if read.max_read_bytes == 0 {
         return Err(anyhow!("read.max_read_bytes must be greater than zero"));
+    }
+
+    Ok(())
+}
+
+fn validate_subscriptions_config(subscriptions: &SubscriptionsConfig) -> Result<()> {
+    if subscriptions.context_token_budget == 0 {
+        return Err(anyhow!(
+            "subscriptions.context_token_budget must be greater than zero"
+        ));
     }
 
     Ok(())

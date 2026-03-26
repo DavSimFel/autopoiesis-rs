@@ -105,16 +105,6 @@ async fn websocket_session(
         }
     }
 
-    let turn = match turn::build_turn_for_config(&state.config) {
-        Ok(turn) => turn,
-        Err(error) => {
-            let _ = tx.send(WsFrame::Error {
-                data: format!("failed to build websocket turn: {error}"),
-            });
-            let _ = tx.send(WsFrame::Done);
-            return;
-        }
-    };
     let mut approval_handler = WsApprovalHandler::new(tx.clone(), approval_rx);
 
     while let Some(content) = prompt_rx.recv().await {
@@ -133,6 +123,36 @@ async fn websocket_session(
             }
         }
 
+        let subscriptions = {
+            let store = state.store.lock().await;
+            match store.list_subscriptions_for_session(&session_id) {
+                Ok(subscriptions) => match subscriptions
+                    .into_iter()
+                    .map(crate::subscription::SubscriptionRecord::from_row)
+                    .collect::<Result<Vec<_>>>()
+                {
+                    Ok(subscriptions) => subscriptions,
+                    Err(error) => {
+                        let _ = tx.send(WsFrame::Error {
+                            data: format!("failed to load websocket subscriptions: {error}"),
+                        });
+                        let _ = tx.send(WsFrame::Done);
+                        continue;
+                    }
+                },
+                Err(error) => {
+                    let _ = tx.send(WsFrame::Error {
+                        data: format!("failed to load websocket subscriptions: {error}"),
+                    });
+                    let _ = tx.send(WsFrame::Done);
+                    continue;
+                }
+            }
+        };
+        let mut turn_builder = {
+            let config = state.config.clone();
+            move || turn::build_turn_for_config_with_subscriptions(&config, &subscriptions)
+        };
         let mut token_sink = WsTokenSink::new(tx.clone());
         let mut provider_factory = {
             let client = state.http_client.clone();
@@ -155,10 +175,10 @@ async fn websocket_session(
             }
         };
 
-        match queue::drain_session_queue(
+        match queue::drain_session_queue_with_turn_builder(
             state.clone(),
             session_id.clone(),
-            &turn,
+            &mut turn_builder,
             &mut provider_factory,
             &mut token_sink,
             &mut approval_handler,

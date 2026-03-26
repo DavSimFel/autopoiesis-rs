@@ -37,3 +37,6 @@ max_output_bytes = 1048576
 [read]
 allowed_paths = ["identity-templates"]
 max_read_bytes = 65536
+
+[subscriptions]
+context_token_budget = 4096

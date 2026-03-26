@@ -370,6 +370,7 @@ mod tests {
             shell_policy: crate::config::ShellPolicy::default(),
             budget: None,
             read: crate::config::ReadToolConfig::default(),
+            subscriptions: crate::config::SubscriptionsConfig::default(),
             queue: crate::config::QueueConfig::default(),
             identity_files: Vec::new(),
             skills_dir: std::path::PathBuf::from("skills"),

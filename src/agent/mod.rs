@@ -86,6 +86,60 @@ where
     .await
 }
 
+pub async fn process_message_with_turn_builder<F, Fut, P, TS, AH, TB>(
+    message: &QueuedMessage,
+    session: &mut Session,
+    turn_builder: &mut TB,
+    make_provider: &mut F,
+    token_sink: &mut TS,
+    approval_handler: &mut AH,
+) -> Result<QueueOutcome>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<P>>,
+    P: LlmProvider,
+    TS: TokenSink + Send + ?Sized,
+    AH: ApprovalHandler + ?Sized,
+    TB: FnMut() -> Result<Turn>,
+{
+    queue::process_queued_message_with_turn_builder(
+        message,
+        session,
+        turn_builder,
+        make_provider,
+        token_sink,
+        approval_handler,
+    )
+    .await
+}
+
+pub async fn drain_queue_with_stats_fresh_turns<F, Fut, P, TB>(
+    store: &mut Store,
+    session_id: &str,
+    session: &mut Session,
+    turn_builder: &mut TB,
+    make_provider: &mut F,
+    token_sink: &mut (dyn TokenSink + Send),
+    approval_handler: &mut (dyn ApprovalHandler + Send),
+) -> Result<(Option<TurnVerdict>, bool, Option<String>)>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<P>>,
+    P: LlmProvider,
+    TB: FnMut() -> Result<Turn>,
+{
+    queue::drain_queue_with_stats_fresh_turns(
+        store,
+        session_id,
+        session,
+        turn_builder,
+        make_provider,
+        token_sink,
+        approval_handler,
+    )
+    .await
+}
+
 #[cfg(test)]
 #[cfg(test)]
 pub(crate) mod tests;

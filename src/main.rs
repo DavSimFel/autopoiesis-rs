@@ -586,10 +586,10 @@ async fn main() -> Result<()> {
             queue.create_session(&session_id, Some(r#"{"source":"cli"}"#))?;
 
             let provider_config = config.clone();
-            let turn = turn::build_turn_for_config(&provider_config)?;
+            let provider_config_for_provider = provider_config.clone();
             let http_client = Client::new();
             let mut provider_factory = move || {
-                let provider_config = provider_config.clone();
+                let provider_config = provider_config_for_provider.clone();
                 let client = http_client.clone();
                 async move {
                     let api_key = auth::get_valid_token().await?;
@@ -628,17 +628,32 @@ async fn main() -> Result<()> {
                     }
 
                     queue.enqueue_message(&session_id, "user", prompt, "cli")?;
+                    let subscriptions = queue
+                        .list_subscriptions_for_session(&session_id)?
+                        .into_iter()
+                        .map(autopoiesis::subscription::SubscriptionRecord::from_row)
+                        .collect::<Result<Vec<_>>>()?;
+                    let mut turn_builder = {
+                        let provider_config = provider_config.clone();
+                        move || {
+                            turn::build_turn_for_config_with_subscriptions(
+                                &provider_config,
+                                &subscriptions,
+                            )
+                        }
+                    };
                     if let Some(agent::TurnVerdict::Denied { reason, gate_id }) =
-                        agent::drain_queue(
+                        agent::drain_queue_with_stats_fresh_turns(
                             &mut queue,
                             &session_id,
                             &mut history,
-                            &turn,
+                            &mut turn_builder,
                             &mut provider_factory,
                             &mut token_sink,
                             &mut approval_handler,
                         )
                         .await?
+                        .0
                     {
                         warn!(
                             target: STDERR_USER_OUTPUT_TARGET,
@@ -650,16 +665,32 @@ async fn main() -> Result<()> {
             } else {
                 let prompt = cli.prompt.join(" ");
                 queue.enqueue_message(&session_id, "user", &prompt, "cli")?;
-                if let Some(agent::TurnVerdict::Denied { reason, gate_id }) = agent::drain_queue(
-                    &mut queue,
-                    &session_id,
-                    &mut history,
-                    &turn,
-                    &mut provider_factory,
-                    &mut token_sink,
-                    &mut approval_handler,
-                )
-                .await?
+                let subscriptions = queue
+                    .list_subscriptions_for_session(&session_id)?
+                    .into_iter()
+                    .map(autopoiesis::subscription::SubscriptionRecord::from_row)
+                    .collect::<Result<Vec<_>>>()?;
+                let mut turn_builder = {
+                    let provider_config = provider_config.clone();
+                    move || {
+                        turn::build_turn_for_config_with_subscriptions(
+                            &provider_config,
+                            &subscriptions,
+                        )
+                    }
+                };
+                if let Some(agent::TurnVerdict::Denied { reason, gate_id }) =
+                    agent::drain_queue_with_stats_fresh_turns(
+                        &mut queue,
+                        &session_id,
+                        &mut history,
+                        &mut turn_builder,
+                        &mut provider_factory,
+                        &mut token_sink,
+                        &mut approval_handler,
+                    )
+                    .await?
+                    .0
                 {
                     warn!(
                         target: STDERR_USER_OUTPUT_TARGET,

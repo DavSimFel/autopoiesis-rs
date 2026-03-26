@@ -44,6 +44,7 @@ impl Drop for SessionLockLease {
     }
 }
 
+#[cfg(test)]
 #[tracing::instrument(level = "debug", skip(state, turn, make_provider, token_sink, approval_handler), fields(session_id = %session_id))]
 pub(super) async fn drain_session_queue<F, Fut, P, TS, AH>(
     state: ServerState,
@@ -155,30 +156,150 @@ where
     }
 }
 
-pub(super) fn spawn_http_queue_worker(state: ServerState, session_id: String) {
-    tokio::spawn(async move {
-        let turn = match turn::build_turn_for_config(&state.config) {
-            Ok(turn) => turn,
-            Err(error) => {
-                let mut store = state.store.lock().await;
-                loop {
-                    match store.dequeue_next_message(&session_id) {
-                        Ok(Some(message)) => {
-                            if let Err(mark_error) = store.mark_failed(message.id) {
-                                warn!(%session_id, %mark_error, "failed to mark queued message failed");
-                                break;
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(queue_error) => {
-                            warn!(%session_id, %queue_error, "failed to inspect queued messages");
-                            break;
+#[tracing::instrument(level = "debug", skip(state, turn_builder, make_provider, token_sink, approval_handler), fields(session_id = %session_id))]
+pub(super) async fn drain_session_queue_with_turn_builder<F, Fut, P, TS, AH, TB>(
+    state: ServerState,
+    session_id: String,
+    turn_builder: &mut TB,
+    make_provider: &mut F,
+    token_sink: &mut TS,
+    approval_handler: &mut AH,
+) -> Result<Option<agent::TurnVerdict>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<P>>,
+    P: llm::LlmProvider,
+    TS: agent::TokenSink + Send + ?Sized,
+    AH: agent::ApprovalHandler + ?Sized,
+    TB: FnMut() -> Result<turn::Turn>,
+{
+    let session_lock = state.session_lock(&session_id);
+    let _session_lock_lease = SessionLockLease {
+        state: state.clone(),
+        session_id: session_id.clone(),
+        lock: Arc::downgrade(&session_lock),
+    };
+    let _session_guard = session_lock.lock().await;
+
+    let mut history = session::Session::new(state.sessions_dir.join(&session_id))
+        .with_context(|| format!("failed to open session {session_id}"))?;
+    history.load_today()?;
+
+    let mut completed_agent_turn = false;
+    let mut first_denial: Option<agent::TurnVerdict> = None;
+    let mut last_assistant_response = None;
+
+    loop {
+        let message = {
+            let mut store = state.store.lock().await;
+            store.dequeue_next_message(&session_id)?
+        };
+
+        let Some(message) = message else {
+            break;
+        };
+
+        let outcome = agent::process_message_with_turn_builder(
+            &message,
+            &mut history,
+            turn_builder,
+            make_provider,
+            token_sink,
+            approval_handler,
+        )
+        .await;
+
+        match outcome {
+            Ok(agent::QueueOutcome::Agent(verdict)) => {
+                {
+                    let mut store = state.store.lock().await;
+                    store.mark_processed(message.id)?;
+                }
+
+                if !matches!(verdict, agent::TurnVerdict::Denied { .. }) {
+                    last_assistant_response = crate::spawn::latest_assistant_response(&history);
+                    completed_agent_turn = true;
+                }
+
+                match verdict {
+                    agent::TurnVerdict::Executed(_) => {}
+                    agent::TurnVerdict::Approved { .. } => {
+                        info!(
+                            message_id = message.id,
+                            "command approved by user and executed"
+                        );
+                    }
+                    agent::TurnVerdict::Denied { reason, gate_id } => {
+                        warn!(message_id = message.id, %gate_id, "turn denied");
+                        if first_denial.is_none() {
+                            first_denial = Some(agent::TurnVerdict::Denied { reason, gate_id });
                         }
                     }
                 }
-                warn!(%session_id, %error, "failed to build queue turn");
-                return;
             }
+            Ok(agent::QueueOutcome::Stored) => {
+                let mut store = state.store.lock().await;
+                store.mark_processed(message.id)?;
+            }
+            Ok(agent::QueueOutcome::UnsupportedRole(role)) => {
+                warn!(message_id = message.id, %role, "unsupported queued role");
+                let mut store = state.store.lock().await;
+                store.mark_processed(message.id)?;
+            }
+            Err(error) => {
+                let mut store = state.store.lock().await;
+                store.mark_failed(message.id)?;
+                return Err(error);
+            }
+        }
+    }
+
+    if crate::spawn::should_enqueue_child_completion(completed_agent_turn) {
+        let mut store = state.store.lock().await;
+        let _ = crate::spawn::enqueue_child_completion(
+            &mut store,
+            &session_id,
+            &history,
+            last_assistant_response.as_deref(),
+        )?;
+    }
+
+    if completed_agent_turn {
+        Ok(None)
+    } else {
+        Ok(first_denial)
+    }
+}
+
+pub(super) fn spawn_http_queue_worker(state: ServerState, session_id: String) {
+    tokio::spawn(async move {
+        let subscriptions = {
+            let store = state.store.lock().await;
+            match store.list_subscriptions_for_session(&session_id) {
+                Ok(subscriptions) => match subscriptions
+                    .into_iter()
+                    .map(crate::subscription::SubscriptionRecord::from_row)
+                    .collect::<Result<Vec<_>>>()
+                {
+                    Ok(subscriptions) => subscriptions,
+                    Err(error) => {
+                        warn!(
+                            %session_id,
+                            %error,
+                            "failed to materialize subscriptions for queue turn"
+                        );
+                        return;
+                    }
+                },
+                Err(error) => {
+                    warn!(%session_id, %error, "failed to load subscriptions for queue turn");
+                    return;
+                }
+            }
+        };
+        let mut turn_builder = {
+            let config = state.config.clone();
+            move || turn::build_turn_for_config_with_subscriptions(&config, &subscriptions)
         };
         let mut provider_factory = {
             let client = state.http_client.clone();
@@ -202,10 +323,10 @@ pub(super) fn spawn_http_queue_worker(state: ServerState, session_id: String) {
         };
         let mut token_sink = NoopTokenSink;
         let mut approval_handler = RejectApprovalHandler;
-        match drain_session_queue(
+        match drain_session_queue_with_turn_builder(
             state.clone(),
             session_id.clone(),
-            &turn,
+            &mut turn_builder,
             &mut provider_factory,
             &mut token_sink,
             &mut approval_handler,
@@ -288,6 +409,7 @@ mod tests {
                     shell_policy: config::ShellPolicy::default(),
                     budget: None,
                     read: config::ReadToolConfig::default(),
+                    subscriptions: config::SubscriptionsConfig::default(),
                     queue: config::QueueConfig::default(),
                     identity_files: crate::identity::t1_identity_files(
                         "identity-templates",
@@ -437,6 +559,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "processed");
+    }
+
+    #[tokio::test]
+    async fn fresh_turn_builder_is_invoked_for_each_user_message() {
+        let (state, queue_path) = test_state();
+        let session_id = "fresh-turn-session";
+        {
+            let mut store = state.store.lock().await;
+            store.create_session(session_id, None).unwrap();
+            store
+                .enqueue_message(session_id, "user", "first", "ws")
+                .unwrap();
+            store
+                .enqueue_message(session_id, "user", "second", "ws")
+                .unwrap();
+        }
+
+        let builder_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let builder_calls_for_closure = builder_calls.clone();
+        let mut turn_builder = move || {
+            builder_calls_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, anyhow::Error>(turn::Turn::new())
+        };
+        let mut provider_factory = || async {
+            Ok::<_, anyhow::Error>(StaticProvider {
+                turn: StreamedTurn {
+                    assistant_message: ChatMessage {
+                        role: llm::ChatRole::Assistant,
+                        principal: Principal::Agent,
+                        content: vec![llm::MessageContent::text("ok")],
+                    },
+                    tool_calls: vec![],
+                    meta: None,
+                    stop_reason: StopReason::Stop,
+                },
+            })
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+        assert!(
+            drain_session_queue_with_turn_builder(
+                state.clone(),
+                session_id.to_string(),
+                &mut turn_builder,
+                &mut provider_factory,
+                &mut token_sink,
+                &mut approval_handler,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        assert_eq!(builder_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let conn = rusqlite::Connection::open(queue_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND status = 'processed'",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[tokio::test]

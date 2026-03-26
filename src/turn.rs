@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::context::{ContextSource, Identity, SkillContext, SkillLoader};
+use crate::context::{ContextSource, Identity, SkillContext, SkillLoader, SubscriptionContext};
 use crate::gate::{
     BudgetGuard, ExfilDetector, Guard, GuardContext, GuardEvent, SecretRedactor, Severity,
     ShellSafety, Verdict,
@@ -10,6 +10,7 @@ use crate::gate::{
 use crate::llm::{ChatMessage, FunctionTool, ToolCall};
 use crate::read_tool::ReadFile;
 use crate::skills::SkillDefinition;
+use crate::subscription::SubscriptionRecord;
 use crate::tool::Tool;
 use tracing::{debug, warn};
 
@@ -287,6 +288,7 @@ fn build_turn_with_tool(
     include_delegation: bool,
     include_skills: bool,
     skill_loader: Option<Vec<crate::skills::SkillDefinition>>,
+    subscriptions: &[SubscriptionRecord],
 ) -> Result<Turn> {
     let tool_definition = tool.definition();
     let vars = identity_vars_for_turn(config, std::slice::from_ref(&tool_definition));
@@ -300,6 +302,10 @@ fn build_turn_with_tool(
     if let Some(skills) = skill_loader {
         turn = turn.context(SkillLoader::new(skills));
     }
+    turn = turn.context(SubscriptionContext::new(
+        subscriptions.to_vec(),
+        config.subscriptions.context_token_budget,
+    ));
     turn = turn.tool(tool);
     turn = add_budget_guard(turn, config).guard(SecretRedactor::default_catalog());
 
@@ -343,13 +349,33 @@ pub fn build_default_turn(config: &crate::config::Config) -> Result<Turn> {
         true,
         true,
         None,
+        &[],
     )
 }
 
 /// Build the active tier turn using the config's resolved agent tier.
 pub fn build_turn_for_config(config: &crate::config::Config) -> Result<Turn> {
+    build_turn_for_config_with_subscriptions(config, &[])
+}
+
+/// Build the active tier turn with explicit active subscriptions.
+pub fn build_turn_for_config_with_subscriptions(
+    config: &crate::config::Config,
+    subscriptions: &[SubscriptionRecord],
+) -> Result<Turn> {
     match resolve_tier(config) {
-        TurnTier::T1 => build_default_turn(config),
+        TurnTier::T1 => build_turn_with_tool(
+            config,
+            crate::tool::Shell::with_limits(
+                config.shell_policy.max_output_bytes,
+                config.shell_policy.max_timeout_ms,
+            ),
+            true,
+            true,
+            true,
+            None,
+            subscriptions,
+        ),
         TurnTier::T2 => build_t2_turn(config),
         TurnTier::T3 => build_t3_turn(config),
     }
@@ -370,6 +396,7 @@ pub fn build_t2_turn(config: &crate::config::Config) -> Result<Turn> {
         false,
         true,
         None,
+        &[],
     )
 }
 
@@ -385,6 +412,7 @@ pub fn build_t3_turn(config: &crate::config::Config) -> Result<Turn> {
         false,
         false,
         None,
+        &[],
     )
 }
 
@@ -402,6 +430,7 @@ pub fn build_spawned_t3_turn(
         false,
         false,
         Some(skills),
+        &[],
     )
 }
 
@@ -884,6 +913,125 @@ mod tests {
             .unwrap_or_default();
 
         assert!(system_text.contains("Available skills: code-review"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_input_includes_subscriptions() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct InspectingProvider {
+            observed_messages: Arc<Mutex<Option<Vec<ChatMessage>>>>,
+        }
+
+        impl crate::llm::LlmProvider for InspectingProvider {
+            async fn stream_completion(
+                &self,
+                messages: &[ChatMessage],
+                _tools: &[FunctionTool],
+                _on_token: &mut (dyn FnMut(String) + Send),
+            ) -> anyhow::Result<crate::llm::StreamedTurn> {
+                *self
+                    .observed_messages
+                    .lock()
+                    .expect("messages mutex poisoned") = Some(messages.to_vec());
+
+                Ok(crate::llm::StreamedTurn {
+                    assistant_message: ChatMessage::system("done"),
+                    tool_calls: vec![],
+                    meta: None,
+                    stop_reason: crate::llm::StopReason::Stop,
+                })
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "autopoiesis_turn_subscription_input_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut session = crate::session::Session::new(&root).unwrap();
+        session.add_user_message("hello").unwrap();
+
+        let subscriptions_dir = root.join("subscriptions");
+        std::fs::create_dir_all(&subscriptions_dir).unwrap();
+        let subscription_path = subscriptions_dir.join("notes.txt");
+        std::fs::write(&subscription_path, "subscribed content").unwrap();
+
+        let mut config = test_config(None);
+        config.subscriptions.context_token_budget = 256;
+        let turn = build_turn_for_config_with_subscriptions(
+            &config,
+            &[SubscriptionRecord {
+                id: 1,
+                session_id: None,
+                topic: "topic".to_string(),
+                path: subscription_path.clone(),
+                filter: crate::subscription::SubscriptionFilter::Full,
+                activated_at: "2026-03-25T00:00:00Z".to_string(),
+                updated_at: "2026-03-25T00:00:01Z".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let observed_messages = Arc::new(Mutex::new(None));
+        let mut make_provider = {
+            let provider = InspectingProvider {
+                observed_messages: observed_messages.clone(),
+            };
+            move || {
+                let provider = provider.clone();
+                async move { Ok::<_, anyhow::Error>(provider) }
+            }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler =
+            |_severity: &crate::gate::Severity, _reason: &str, _command: &str| true;
+
+        crate::agent::run_agent_loop(
+            &mut make_provider,
+            &mut session,
+            "continue".to_string(),
+            crate::principal::Principal::Operator,
+            &turn,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        let messages = observed_messages
+            .lock()
+            .expect("messages mutex poisoned")
+            .clone()
+            .expect("provider should observe messages");
+        let system_texts = messages
+            .iter()
+            .filter(|message| message.role == crate::llm::ChatRole::System)
+            .map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        MessageContent::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            system_texts
+                .iter()
+                .any(|text| text.contains("subscribed content"))
+        );
+        assert!(system_texts.iter().any(|text| text.contains("path=")));
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1394,6 +1542,7 @@ mod tests {
             shell_policy: ShellPolicy::default(),
             budget,
             read: crate::config::ReadToolConfig::default(),
+            subscriptions: crate::config::SubscriptionsConfig::default(),
             queue: crate::config::QueueConfig::default(),
             identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
             skills_dir: std::path::PathBuf::from("skills"),

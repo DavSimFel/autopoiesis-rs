@@ -182,3 +182,67 @@ max_tokens_per_day = 10
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test]
+async fn fresh_turn_builder_is_invoked_for_each_user_message() {
+    let root = temp_queue_root("fresh_turn_builder");
+    let store_path = root.join("store.sqlite");
+    let mut store = Store::new(&store_path).unwrap();
+    let session_dir = root.join("sessions");
+    let mut session = crate::session::Session::new(&session_dir).unwrap();
+    let session_id = "queue-session";
+
+    store
+        .enqueue_message(session_id, "user", "first", "cli")
+        .unwrap();
+    store
+        .enqueue_message(session_id, "user", "second", "cli")
+        .unwrap();
+
+    let builder_calls = Arc::new(AtomicUsize::new(0));
+    let builder_calls_for_closure = builder_calls.clone();
+    let mut turn_builder = move || {
+        builder_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+        Ok::<_, anyhow::Error>(Turn::new())
+    };
+
+    let provider = StaticProvider {
+        turn: StreamedTurn {
+            assistant_message: ChatMessage {
+                role: ChatRole::Assistant,
+                principal: Principal::Agent,
+                content: vec![MessageContent::text("ok")],
+            },
+            tool_calls: vec![],
+            meta: None,
+            stop_reason: StopReason::Stop,
+        },
+    };
+    let mut make_provider = {
+        let provider = provider.clone();
+        move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        }
+    };
+    let mut token_sink = |_token: String| {};
+    let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+    let (verdict, processed_any, _) = crate::agent::queue::drain_queue_with_stats_fresh_turns(
+        &mut store,
+        session_id,
+        &mut session,
+        &mut turn_builder,
+        &mut make_provider,
+        &mut token_sink,
+        &mut approval_handler,
+    )
+    .await
+    .unwrap();
+
+    assert!(processed_any);
+    assert!(verdict.is_none());
+    assert_eq!(builder_calls.load(Ordering::SeqCst), 2);
+
+    std::fs::remove_dir_all(&root).unwrap();
+}

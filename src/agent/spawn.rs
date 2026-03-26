@@ -8,7 +8,7 @@ use crate::plan::extract_plan_action;
 use crate::session::Session;
 use crate::store::Store;
 
-use super::queue::drain_queue_with_stats;
+use super::queue::drain_queue_with_stats_fresh_turns;
 use super::{ApprovalHandler, SpawnDrainResult, SpawnRequest, SpawnResult, TokenSink, TurnVerdict};
 
 pub(super) type SpawnedChildMetadata = crate::spawn::ChildSessionMetadata;
@@ -94,10 +94,24 @@ where
         &metadata.resolved_provider_model,
         metadata.reasoning_override.as_deref(),
     )?;
-    let turn = match metadata.tier.as_str() {
-        "t3" => crate::turn::build_spawned_t3_turn(&child_config, metadata.skills.clone()),
-        _ => crate::turn::build_turn_for_config(&child_config),
-    }?;
+    let tier = metadata.tier.clone();
+    let subscriptions = context
+        .store
+        .list_subscriptions_for_session(&context.spawn_result.child_session_id)?
+        .into_iter()
+        .map(crate::subscription::SubscriptionRecord::from_row)
+        .collect::<Result<Vec<_>>>()?;
+    let skills = metadata.skills.clone();
+    let mut turn_builder = {
+        let child_config = child_config.clone();
+        let tier = tier.clone();
+        move || match tier.as_str() {
+            "t3" => crate::turn::build_spawned_t3_turn(&child_config, skills.clone()),
+            _ => {
+                crate::turn::build_turn_for_config_with_subscriptions(&child_config, &subscriptions)
+            }
+        }
+    };
 
     let child_session_dir = context
         .session_dir
@@ -109,16 +123,17 @@ where
         .context("failed to load child session history")?;
 
     let mut make_provider_for_turn = || make_provider(&child_config);
-    let (drain_result, completed_agent_turn, current_assistant_response) = drain_queue_with_stats(
-        context.store,
-        &context.spawn_result.child_session_id,
-        &mut child_session,
-        &turn,
-        &mut make_provider_for_turn,
-        token_sink,
-        approval_handler,
-    )
-    .await?;
+    let (drain_result, completed_agent_turn, current_assistant_response) =
+        drain_queue_with_stats_fresh_turns(
+            context.store,
+            &context.spawn_result.child_session_id,
+            &mut child_session,
+            &mut turn_builder,
+            &mut make_provider_for_turn,
+            token_sink,
+            approval_handler,
+        )
+        .await?;
     match drain_result {
         Some(TurnVerdict::Denied { reason, gate_id }) => {
             return Err(anyhow::anyhow!(
@@ -138,7 +153,7 @@ where
         apply_t2_plan_handoff(
             context.store,
             &metadata.parent_session_id,
-            &metadata.tier,
+            &tier,
             last_assistant_response.as_deref(),
         )?;
     }

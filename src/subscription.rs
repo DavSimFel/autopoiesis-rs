@@ -22,6 +22,7 @@ pub enum SubscriptionFilter {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriptionRecord {
     pub id: i64,
+    pub session_id: Option<String>,
     pub topic: String,
     pub path: PathBuf,
     pub filter: SubscriptionFilter,
@@ -37,6 +38,17 @@ enum JqSegment {
 }
 
 impl SubscriptionFilter {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Lines { .. } => "lines",
+            Self::Regex { .. } => "regex",
+            Self::Head { .. } => "head",
+            Self::Tail { .. } => "tail",
+            Self::Jq { .. } => "jq",
+        }
+    }
+
     pub fn from_flags(
         lines: Option<&str>,
         regex: Option<&str>,
@@ -215,6 +227,7 @@ impl SubscriptionRecord {
     pub fn from_row(row: SubscriptionRow) -> Result<Self> {
         Ok(Self {
             id: row.id,
+            session_id: row.session_id,
             topic: row.topic,
             path: PathBuf::from(row.path),
             filter: SubscriptionFilter::from_storage(row.filter.as_deref())?,
@@ -243,10 +256,7 @@ impl SubscriptionRecord {
     }
 
     pub fn format_listing(&self) -> String {
-        let filter = self
-            .filter
-            .to_storage()
-            .unwrap_or_else(|| "full".to_string());
+        let filter = self.filter.label();
         format!(
             "{} | {} | {} | {}",
             self.topic,
