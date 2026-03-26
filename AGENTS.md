@@ -48,7 +48,7 @@ docs/                Architecture, specs, risks, vision, roadmap
 | `src/turn.rs` | Tier-aware turn assembly and guard composition |
 | `src/store.rs` | SQLite sessions, queue, subscriptions, and plan tables |
 | `src/plan/*.rs` | Plan execution, patching, notifications, recovery |
-| `src/config.rs` | `agents.toml` loading and policy/config validation |
+| `src/config/mod.rs` | `agents.toml` loading and policy/config validation across split submodules |
 | `src/context.rs` | Identity, skill, and history context assembly |
 | `src/subscription.rs` | Subscription records, filters, and token accounting |
 | `src/skills.rs` | Skill catalog loading and summaries |

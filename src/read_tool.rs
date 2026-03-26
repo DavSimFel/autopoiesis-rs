@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::config::ReadToolConfig;
-use crate::gate::secret_patterns::path_is_protected;
+use crate::gate::path_is_protected;
 use crate::llm::FunctionTool;
 use crate::tool::{Tool, ToolFuture};
 #[cfg(unix)]

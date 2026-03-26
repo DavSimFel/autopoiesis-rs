@@ -95,7 +95,9 @@ main.rs
 │  ├─ exfil_detector.rs
 │  ├─ output_cap.rs
 │  ├─ streaming_redact.rs
-│  └─ secret_patterns.rs
+│  ├─ secret_catalog.rs
+│  ├─ protected_paths.rs
+│  └─ command_path_analysis.rs
 ├─ llm/
 │  ├─ mod.rs
 │  └─ openai.rs

@@ -27,8 +27,8 @@ pub(crate) const DEFAULT_SHELL_MAX_OUTPUT_BYTES: usize = runtime::DEFAULT_SHELL_
 pub(crate) const DEFAULT_SHELL_MAX_TIMEOUT_MS: u64 = runtime::DEFAULT_SHELL_MAX_TIMEOUT_MS;
 pub(crate) const DEFAULT_STALE_PROCESSING_TIMEOUT_SECS: u64 =
     runtime::DEFAULT_STALE_PROCESSING_TIMEOUT_SECS;
-#[allow(unused_imports)]
-pub(crate) use spawn_runtime::validate_spawn_tier;
+#[cfg(test)]
+pub(crate) use load::with_config_load_lock;
 
 #[cfg(test)]
 mod tests;

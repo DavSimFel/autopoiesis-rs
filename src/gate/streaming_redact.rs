@@ -1,8 +1,5 @@
-use crate::gate::secret_patterns::{
-    SECRET_PATTERNS, SecretBodyKind, SecretPattern, SecretSuffixLen,
-};
-
 const REDACTION_MARKER: &str = "[REDACTED]";
+use super::secret_catalog::{SECRET_PATTERNS, SecretBodyKind, SecretPattern, SecretSuffixLen};
 
 enum StreamingSecretDecision {
     NeedMore,
@@ -248,8 +245,8 @@ impl StreamingTextBuffer {
 
 #[cfg(test)]
 mod tests {
+    use super::super::secret_catalog::SECRET_PATTERNS;
     use super::*;
-    use crate::gate::secret_patterns::SECRET_PATTERNS;
     use std::cell::RefCell;
 
     fn identity(segment: String) -> String {

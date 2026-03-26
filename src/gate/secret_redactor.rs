@@ -1,4 +1,4 @@
-use crate::gate::secret_patterns::SECRET_PATTERNS;
+use super::secret_catalog::SECRET_PATTERNS;
 use crate::gate::{Guard, GuardContext, GuardEvent, Verdict};
 use crate::llm::{ChatMessage, MessageContent};
 
@@ -105,9 +105,9 @@ impl Guard for SecretRedactor {
 
 #[cfg(test)]
 mod tests {
+    use super::super::secret_catalog::SECRET_PATTERNS;
     use super::*;
     use crate::gate::GuardEvent;
-    use crate::gate::secret_patterns::SECRET_PATTERNS;
     use crate::llm::{ChatMessage, ChatRole, MessageContent, ToolResult};
     use crate::principal::Principal;
 

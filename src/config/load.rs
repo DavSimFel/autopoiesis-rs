@@ -1,5 +1,9 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Mutex;
 
 use anyhow::{Result, anyhow};
 use thiserror::Error;
@@ -13,6 +17,40 @@ use super::file_schema::RuntimeFileConfig;
 use super::models::ModelsConfig;
 use super::policy::{ShellPolicy, validate_read_tool_config, validate_subscriptions_config};
 use super::runtime::{Config, QueueConfig, ReadToolConfig, SubscriptionsConfig};
+
+#[cfg(test)]
+static CONFIG_LOAD_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static SKIP_CONFIG_LOAD_LOCK: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_config_load_lock<T>(f: impl FnOnce() -> T) -> T {
+    struct ResetFlag<'a> {
+        cell: &'a Cell<bool>,
+        previous: bool,
+    }
+
+    impl Drop for ResetFlag<'_> {
+        fn drop(&mut self) {
+            self.cell.set(self.previous);
+        }
+    }
+
+    SKIP_CONFIG_LOAD_LOCK.with(|skip| {
+        let previous = skip.replace(true);
+        let _reset = ResetFlag {
+            cell: skip,
+            previous,
+        };
+        let _guard = CONFIG_LOAD_LOCK
+            .lock()
+            .expect("config load lock should be available");
+        f()
+    })
+}
 
 /// Typed boundary error for config loading and spawned-child runtime reconstruction.
 #[derive(Debug, Error)]
@@ -84,6 +122,19 @@ impl Config {
     pub fn from_file_typed(
         config_path: impl AsRef<Path>,
     ) -> std::result::Result<Self, ConfigError> {
+        #[cfg(test)]
+        let _guard = SKIP_CONFIG_LOAD_LOCK.with(|skip| {
+            if skip.get() {
+                None
+            } else {
+                Some(
+                    CONFIG_LOAD_LOCK
+                        .lock()
+                        .expect("config load lock should be available"),
+                )
+            }
+        });
+
         // Invariant: defaults are established first, then file values replace them, and env overrides win last.
         let mut config = Self {
             model: "gpt-5.4".to_string(),

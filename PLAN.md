@@ -1,293 +1,59 @@
-# Session 3 Plan: Validation Boundaries / Config Split
+# Session 4a Plan
 
 ## 1. Files Read
 
-- `AGENTS.md`
-- `CODE_STANDARD.md`
-- `Cargo.toml`
-- `agents.toml`
-- `docs/risks.md`
-- `docs/architecture/overview.md`
-- `xtask/lint.sh`
-- every file under `src/`, with focused review of:
-  - `src/config.rs`
-  - `src/subscription.rs`
-  - every in-tree `crate::config::*` consumer found during the full read
+- Repo guidance and verification entrypoints: `AGENTS.md`, `CODE_STANDARD.md`, `Cargo.toml`, `agents.toml`, `xtask/lint.sh`, `README.md`, `docs/risks.md`, `docs/architecture/overview.md`, and the relevant `src/gate/secret_patterns.rs` split sections in `docs/specs/restructure-plan.md`.
+- `src/agent`: `src/agent/loop_impl.rs`, `src/agent/loop_impl/tests.rs`, `src/agent/mod.rs`, `src/agent/queue.rs`, `src/agent/queue/tests.rs`, `src/agent/shell_execute.rs`, `src/agent/spawn.rs`, `src/agent/spawn/tests.rs`, `src/agent/tests.rs`, `src/agent/tests/common.rs`, `src/agent/tests/regression_tests.rs`.
+- `src/config`: `src/config/agents.rs`, `src/config/domains.rs`, `src/config/file_schema.rs`, `src/config/load.rs`, `src/config/mod.rs`, `src/config/models.rs`, `src/config/policy.rs`, `src/config/runtime.rs`, `src/config/spawn_runtime.rs`, `src/config/tests.rs`.
+- `src/gate`: `src/gate/budget.rs`, `src/gate/exfil_detector.rs`, `src/gate/mod.rs`, `src/gate/output_cap.rs`, `src/gate/secret_patterns.rs`, `src/gate/secret_redactor.rs`, `src/gate/shell_safety.rs`, `src/gate/streaming_redact.rs`.
+- `src/llm`: `src/llm/history_groups.rs`, `src/llm/mod.rs`, `src/llm/openai.rs`.
+- `src/plan`: `src/plan/executor.rs`, `src/plan/notify.rs`, `src/plan/patch.rs`, `src/plan/recovery.rs`, `src/plan/runner.rs`.
+- `src/server`: `src/server/auth.rs`, `src/server/http.rs`, `src/server/mod.rs`, `src/server/queue.rs`, `src/server/ws.rs`.
+- `src/session`: `src/session/budget.rs`, `src/session/delegation_hint.rs`, `src/session/jsonl.rs`, `src/session/mod.rs`, `src/session/tests.rs`, `src/session/trimming.rs`.
+- Top-level `src/` files: `src/auth.rs`, `src/cli.rs`, `src/context.rs`, `src/delegation.rs`, `src/identity.rs`, `src/lib.rs`, `src/main.rs`, `src/model_selection.rs`, `src/plan.rs`, `src/principal.rs`, `src/read_tool.rs`, `src/skills.rs`, `src/spawn.rs`, `src/store.rs`, `src/subscription.rs`, `src/template.rs`, `src/time.rs`, `src/tool.rs`, `src/turn.rs`, `src/util.rs`.
 
 ## 2. Exact Changes Per File
 
-### `src/config.rs`
-
-- Keep this file as the module root only during extraction.
-- Replace inline definitions with `mod ...` declarations, reexports, and thin facade glue as code moves into `src/config/*.rs`.
-- Remove moved definitions in the same patch that introduces their new owning submodule. Do not leave duplicate definitions behind.
-- While `src/config.rs` is still the active root, create `src/config/tests.rs`, move the existing facade-level / cross-module tests out of `src/config.rs` into that file, and add `#[cfg(test)] mod tests;` in the same patch.
-- Final state: once only module declarations, reexports, `#[cfg(test)] mod tests;`, and facade glue remain, move that glue verbatim to `src/config/mod.rs` and delete `src/config.rs` in the same patch.
-- Never leave both `src/config.rs` and `src/config/mod.rs` present as active roots at the same time.
-
-### `src/config/mod.rs`
-
-- Final module root for the split config module.
-- Declare:
-  - `mod runtime;`
-  - `mod load;`
-  - `mod spawn_runtime;`
-  - `mod agents;`
-  - `mod models;`
-  - `mod domains;`
-  - `mod policy;`
-  - `mod file_schema;`
-  - `#[cfg(test)] mod tests;`
-- Keep this file as a thin facade only. No moved business logic should remain here after the split.
-- Preserve this explicit facade inventory exactly, at the same public or crate-visible paths it has today:
-  - `Config`
-  - `ConfigError`
-  - `BudgetConfig`
-  - `QueueConfig`
-  - `ReadToolConfig`
-  - `SubscriptionsConfig`
-  - `AgentsConfig`
-  - `AgentDefinition`
-  - `AgentTierConfig`
-  - `ModelsConfig`
-  - `ModelDefinition`
-  - `ModelRoute`
-  - `DomainsConfig`
-  - `DomainConfig`
-  - `ShellDefaultAction`
-  - `ShellDefaultSeverity`
-  - `ShellPolicy`
-  - `load`
-  - `load_typed`
-  - `from_file`
-  - `from_file_typed`
-  - `with_spawned_child_runtime`
-  - `with_spawned_child_runtime_typed`
-  - `DEFAULT_SHELL_MAX_OUTPUT_BYTES`
-  - `DEFAULT_SHELL_MAX_TIMEOUT_MS`
-  - `DEFAULT_STALE_PROCESSING_TIMEOUT_SECS`
-- Preserve current visibilities exactly:
-  - public items stay public through `pub use`
-  - crate-visible items stay crate-visible through `pub(crate) use`
-  - specifically keep the three `DEFAULT_*` constants at `pub(crate)`, not `pub`
-- Add top-level comments:
-  - `Invariant:` summary of precedence ownership across `load.rs` and `spawn_runtime.rs`
-  - `Policy:` summary of path-safety ownership across `agents.rs`, `domains.rs`, and `load.rs`
-
-### `src/config/runtime.rs`
-
-- Move runtime-facing data structures and simple accessors here:
-  - `Config`
-  - queue/read/subscription/runtime structs
-  - crate-visible `DEFAULT_*` constants
-  - other runtime-only helpers that do not own load/validation policy
-- Keep inherent impls here when they are just accessors or resolved-runtime behavior.
-- Prefer `pub(super)` or private helpers over widening visibility for convenience.
-
-### `src/config/load.rs`
-
-- Move file loading, env application, merge/default resolution, and final validation orchestration here.
-- Make this the owning module for `ConfigError`, since load/merge/validation failures originate here and the type belongs with the load/validation boundary.
-- Keep precedence logic co-located here instead of scattering it across schema modules.
-- Add `Invariant:` comments on:
-  - env-over-file precedence where it exists today
-  - file-over-default precedence
-  - validation occurring after the fully merged config is assembled
-- Add `Policy:` comment on `skills_dir` path handling:
-  - relative values resolve against the config file directory
-  - absolute values remain absolute
-  - path handling must not silently normalize traversal into a different trusted root
-
-### `src/config/spawn_runtime.rs`
-
-- Move spawned-child runtime overlay/build logic and `validate_spawn_tier()` here.
-- Keep child-runtime precedence logic here.
-- Add `Invariant:` comments documenting the current order:
-  - explicit override
-  - child tier
-  - agent defaults
-  - parent runtime fallback
-- Keep helper-private tests here when they depend on private builders or validators.
-
-### `src/config/agents.rs`
-
-- Move agent/tier schema and selection helpers here.
-- Keep `validate_agent_identity()` here.
-- Add `Policy:` comment that agent identity is a logical path segment and must reject empty, dot, dot-dot, or separator-containing values.
-
-### `src/config/models.rs`
-
-- Move provider/model schema and related helpers here.
-- Keep this module focused on model metadata, not loading or policy.
-
-### `src/config/domains.rs`
-
-- Move domain schema and `validate_domain_context_extend()` here.
-- Add `Policy:` comment that `context_extend` must stay under `identity-templates/` and only use normal path components after that root.
-
-### `src/config/policy.rs`
-
-- Move shell/read/subscription validation and policy enums/structs here.
-- Keep fail-closed validation boundaries here instead of mixing them into file I/O.
-- Add `Policy:` comments on:
-  - deny/approve/allow expectations inherited from repo rules
-  - validation rejecting unsafe or ambiguous config instead of normalizing it
-- Keep private validation-helper tests here when they need direct access.
-
-### `src/config/file_schema.rs`
-
-- Move serde/TOML input-only structs and parsing-schema helpers here.
-- Keep this module free of runtime merge policy and free of spawned-child overlay logic.
-
-### `src/config/tests.rs`
-
-- Create this file while `src/config.rs` is still the active root.
-- Move the existing facade-level / cross-module tests here before the `src/config.rs` -> `src/config/mod.rs` cutover.
-- Keep only facade-level and cross-module tests here.
-- This file must compile using the `crate::config` facade surface and intentionally exposed items only.
-- Do not move helper-private assertions here if doing so would require widening production visibility.
-- If a current top-level test mixes facade behavior and private-helper behavior, split it:
-  - keep the facade assertion here
-  - move the helper-private assertion into the owning submodule
-
-### `src/subscription.rs`
-
-- Verification-only by default. No planned behavior change.
-- Audit against this pass/fail checklist derived from `CODE_STANDARD.md` and repo rules:
-  - no `.unwrap()` in non-test code
-  - error handling still uses the repo’s expected style with context where needed
-  - logging still follows repo severity guidance
-  - policy/state mutation/I/O boundaries remain readable and not newly mixed together
-  - public types and async entrypoints still have the expected docs/comments
-  - non-obvious invariants or policy boundaries still have comments where needed
-- If every checklist item passes, leave `src/subscription.rs` untouched and explicitly record that the audit passed with no code change.
-- Only edit `src/subscription.rs` if this audit finds a real standard mismatch.
-
-### Downstream Consumer Sweep
-
-- Verify that the facade split does not require consumer-path churn. Expected no code changes outside `src/config/**` unless an import truly breaks.
-- Explicit verification targets include:
-  - `src/lib.rs`
-  - `src/main.rs`
-  - `src/cli.rs`
-  - `src/model_selection.rs`
-  - `src/turn.rs`
-  - `src/context.rs`
-  - `src/skills.rs`
-  - `src/server/auth.rs`
-  - `src/server/http.rs`
-  - `src/server/mod.rs`
-  - `src/server/queue.rs`
-  - `src/server/ws.rs`
-  - any tests importing `crate::config::*`
-- Target state is no consumer-path churn. If a consumer needs a direct submodule import, treat that as a facade regression.
-
-### Docs / Metadata
-
-- Review docs for both:
-  - literal `src/config.rs` references
-  - higher-level prose that describes config loading/validation as a single-file responsibility
-- This doc sweep is not limited to grep hits for `src/config.rs`; it also includes architecture/risk/overview prose that would become stale if config ownership, validation boundaries, or public API descriptions still imply a single-file module.
-- Update any stale architecture/risk/overview references in the same change set.
-- Keep the completion step in the implementation plan:
-  - `openclaw system event --text 'Session 3 done: config split' --mode now`
+- `src/gate/secret_catalog.rs`: create a focused metadata module that owns only the secret catalog constants and types now sitting at the top of `secret_patterns.rs`: `OPENAI_SECRET_*`, `GITHUB_PAT_*`, `AWS_ACCESS_KEY_*`, `SecretBodyKind`, `SecretSuffixLen`, `SecretPattern`, and `SECRET_PATTERNS`. If `SECRET_PATTERN_COUNT` becomes redundant after the move, delete it rather than carrying a dead compatibility constant.
+- `src/gate/protected_paths.rs`: create a focused protected-path module that owns the protected-path catalog data and normalized path classification helpers: `PROTECTED_PATH_FRAGMENTS`, `PROTECTED_HOME_PATHS`, `PROTECTED_ENV_FILENAMES`, `PROTECTED_GIT_PATHS`, `protected_path_fragments()`, `path_is_protected()`, `home_prefix()`, `strip_prefix_with_boundary()`, `expand_home_prefix()`, `normalize_lexical_path()`, `is_protected_env_filename()`, `is_protected_path_value()`, and `is_protected_git_pathspec_value()`. Move the existing path-classification tests here. Add a module-level threat-model comment explaining that these lists are a deny-first credential protection layer for high-value secrets and that false positives are preferable to missing a real credential path.
+- `src/gate/command_path_analysis.rs`: create a focused command-analysis module that owns the shell-command heuristics now mixed into `secret_patterns.rs`: the identity-template and target-path write detection helpers, env-wrapper normalization, grep and git pathspec/config heuristics, target-path rewrite helpers, `command_writes_identity_template_path()`, `command_writes_target_path()`, `simple_command_reads_protected_path()`, and `simple_command_reads_target_path()`. Keep internal helpers such as `command_references_protected_path()`, `git_path_spec_argument()`, `resolve_path_like()`, and `path_matches_target()` private to this file. Import shared normalized-path helpers from `super::protected_paths` instead of reintroducing a second path-normalization implementation. Move `env_wrapper_regression_tests`, the main command-heuristic test block, and `identity_template_guard_tests` from `secret_patterns.rs` into this file. Add a module-level threat-model comment explaining that this logic is heuristic shell analysis, not sandboxing, and that it exists to hard-deny obvious protected-path reads/writes before policy allowlists or approvals can widen access.
+- `src/gate/mod.rs`: replace `pub(crate) mod secret_patterns;` with the three focused modules, keep `output_cap` and `streaming_redact` private, and make `mod.rs` the only public facade for callers outside `src/gate/`. Reexport only the moved items that non-gate modules still need after the split, and do that with `pub(crate) use` rather than broader `pub use`: `SECRET_PATTERNS` for `turn.rs` tests and `path_is_protected()` for `read_tool.rs`. Keep `command_path_analysis` helpers off the public facade unless a non-gate caller actually requires them after the refactor. Sibling gate modules should use `super::secret_catalog`, `super::protected_paths`, and `super::command_path_analysis` directly instead of depending on the parent facade.
+- `src/gate/secret_redactor.rs`: change the catalog import from `crate::gate::secret_patterns::SECRET_PATTERNS` to `super::secret_catalog::SECRET_PATTERNS`. No behavior change.
+- `src/gate/streaming_redact.rs`: change the catalog imports from `crate::gate::secret_patterns::{...}` to `super::secret_catalog::{...}`. No behavior change.
+- `src/gate/shell_safety.rs`: change the moved helper imports from `crate::gate::secret_patterns::{...}` to `super::command_path_analysis::{...}`. Preserve the current test-only helper visibility at the bottom of the file so the identity-template shell-safety tests continue to compile.
+- `src/gate/exfil_detector.rs`: change the moved helper imports from `crate::gate::secret_patterns::{...}` to `super::command_path_analysis::{...}`. Do not change the current “read + send in one batch requires approval” semantics.
+- `src/read_tool.rs`: change the protected-path import from `crate::gate::secret_patterns::path_is_protected` to the gate facade reexport. Keep `ReadFile::path_is_explicitly_denied()` behavior identical.
+- `src/turn.rs`: change the test-only `SECRET_PATTERNS` import to the gate facade reexport.
+- `src/gate/secret_patterns.rs`: if a compatibility phase is needed to keep the tree green, reduce this file to a pure `pub(crate) use ...` shim that forwards to the new modules. Do not leave duplicated logic or duplicated constants in place. Final state: file removed.
+- `README.md`: replace the `gate/secret_patterns.rs` tree entry with `gate/secret_catalog.rs`, `gate/protected_paths.rs`, and `gate/command_path_analysis.rs`.
+- `docs/architecture/overview.md`: replace the single `src/gate/secret_patterns.rs` description with three focused module descriptions that match the new file layout.
+- `docs/specs/restructure-plan.md`: update the current-state table and any still-current wording that says `src/gate/secret_patterns.rs` is the live module. Keep the historical rationale, but make the document describe the repo as it actually exists after the split.
 
 ## 3. What Tests To Write
 
-### Preserve Existing Coverage
-
-- Move or split existing tests; do not silently drop assertions.
-- Keep helper-private tests in the module that owns the helper.
-
-### Facade / API Coverage
-
-- In `src/config/tests.rs`, add or preserve tests that exercise the explicit `crate::config` facade inventory from `src/config/mod.rs`.
-- Verify the split keeps the same facade names reachable through the same public paths.
-- Keep wrapper-equivalence tests for any top-level config helpers that remain part of the facade.
-
-### Visibility Coverage
-
-- Add in-crate tests that `crate::config::DEFAULT_*` constants remain reachable where `pub(crate)` access is expected.
-- Do not claim this proves they are not `pub`; treat “not widened beyond `pub(crate)`” as a code-review invariant checked against the explicit reexport inventory in `src/config/mod.rs`.
-
-### Precedence Coverage
-
-- Preserve or add tests for load precedence:
-  - env-over-file behavior where it exists today
-  - file-over-default behavior
-- Preserve or add tests for spawned-child precedence:
-  - reasoning override wins over child tier / agent / parent
-  - child `provider_model` replaces the parent model
-  - child tier `base_url`, `system_prompt`, and `session_name` keep the current fallback order
-  - identity retargeting behavior for child tiers stays unchanged
-
-### Path-Safety Coverage
-
-- In `src/config/agents.rs`, keep or add helper-private tests that `validate_agent_identity()` rejects:
-  - empty string
-  - `.`
-  - `..`
-  - separator-containing values
-- In `src/config/domains.rs`, keep or add helper-private tests that `validate_domain_context_extend()` rejects:
-  - absolute paths
-  - traversal paths
-  - roots outside `identity-templates/`
-  - any non-`Normal` component after the allowed root
-- In `src/config/load.rs`, keep or add tests that:
-  - relative `skills_dir` resolves against the config file directory
-  - absolute `skills_dir` stays absolute
-
-### Validation Helper Coverage
-
-- Keep or add private-helper tests in:
-  - `src/config/policy.rs` for read/subscription validation helpers
-  - `src/config/spawn_runtime.rs` for `validate_spawn_tier()`
-  - any other submodule-local validator that should remain private
-
-### `subscription.rs`
-
-- No new `subscription.rs` tests unless the audit reveals an actual mismatch that requires a regression test.
+- Catalog invariants in `src/gate/secret_catalog.rs`: assert the secret catalog remains three entries, prefixes stay stable, and the regex strings required by `SecretRedactor::default_catalog()` still compile.
+- Protected-path invariants in `src/gate/protected_paths.rs`: keep the current assertions that `~/.autopoiesis/auth.json`, `~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, `~/.aws/credentials`, `.env`, `.env.local`, and `.env.production.local` are protected, while `config/auth.json` and `.env.example` remain allowed. Add explicit coverage for `$HOME`, `${HOME}`, and lexical `.` / `..` normalization because that logic will move files.
+- Command-analysis invariants in `src/gate/command_path_analysis.rs`: preserve the existing `env -S`, `env --split-string`, `git -c alias.show=!cat ...`, `git show HEAD:.env.production.local`, grep `-f`, symlink-alias write detection, and identity-template write regressions. Explicitly keep the negative git-config cases for `include.path=config/auth.json` and `core.attributesfile=.env.example`, the non-matching target-path cases for `myskills/...` and `vendor/skills/...`, the allowed read-only copy case `cp identity-templates/context.md /tmp/x`, and the false-positive guards where a command only mentions a protected path or `.env` pattern as data, such as `printf '%s' ~/.autopoiesis/auth.json`, `grep '.env' README.md`, and `git grep '.env' README.md`.
+- Consumer invariants in existing tests: `ShellSafety` must still hard-deny protected credential reads and protected prompt/skills writes before allowlists or standing approvals apply; `ExfilDetector` must still treat protected-path and target-path reads as sensitive; `ReadFile` must still deny protected paths through the shared `path_is_protected()` helper.
+- Facade invariants: add or keep a cheap grep-style assertion that `secret_patterns.rs` no longer exists and that non-gate modules do not import `crate::gate::secret_catalog`, `crate::gate::protected_paths`, or `crate::gate::command_path_analysis` directly. Do not forbid sibling imports inside `src/gate/`; the public-facade rule applies to outside consumers.
+- Full-suite verification: run `cargo build --release`, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and `xtask/lint.sh`. If `~/.autopoiesis/auth.json` exists, also run the integration test path already encoded in `xtask/lint.sh`.
 
 ## 4. Order Of Operations
 
-1. Create `src/config/` submodules and move the most self-contained code first:
-   - `file_schema`
-   - `models`
-   - `domains`
-   - `agents`
-   - `policy`
-   - `runtime`
-   Keep `src/config.rs` as the root during this phase.
-2. As each responsibility moves, remove the old inline definition in the same patch and keep the facade wired through `src/config.rs`. Do not leave duplicate definitions in both places.
-3. While `src/config.rs` is still the active root, create `src/config/tests.rs`, move every existing facade-level / cross-module test into it, and add `#[cfg(test)] mod tests;` in that same patch so no top-level facade assertion is lost or duplicated during the later cutover.
-4. Move helper-private tests with their owning modules as those moves happen. Do not widen production visibility just to preserve old test locations.
-5. Move `load` and `spawn_runtime` last, because they depend on the extracted schema/runtime/policy pieces and carry the key precedence comments.
-6. Once `src/config.rs` contains only module declarations, reexports, `#[cfg(test)] mod tests;`, and facade glue, move that file verbatim to `src/config/mod.rs` and delete `src/config.rs` in the same patch.
-7. Run the downstream consumer sweep and the explicit `src/subscription.rs` standards audit.
-8. Run the broader docs sync pass:
-   - literal filename/path references
-   - conceptual ownership and architecture prose
-9. Run the full required verification suite:
-   - `cargo build --release`
-   - `cargo test`
-   - `cargo fmt --check`
-   - `cargo clippy -- -D warnings`
-   - `xtask/lint.sh`
-   - `cargo test --features integration` if credentials are configured
-10. Only after the full verification suite passes, run:
-   - `openclaw system event --text 'Session 3 done: config split' --mode now`
+1. Add `src/gate/secret_catalog.rs` first and move only the secret metadata types/constants. Update `src/gate/mod.rs` in the same step to add the minimal `pub(crate) use secret_catalog::SECRET_PATTERNS` reexport that the `turn.rs` test will need, then update `secret_redactor.rs`, `streaming_redact.rs`, and the `turn.rs` test import so those paths use the new source of truth. If `secret_patterns.rs` needs to stay briefly, make its catalog surface a pure forwarding shim rather than a second copy of the constants.
+2. Add `src/gate/protected_paths.rs` second and move only the protected-path catalogs, normalization helpers, and path tests. Update `src/gate/mod.rs` in the same step to add the minimal `pub(crate) use protected_paths::path_is_protected` reexport that `read_tool.rs` needs, then update `read_tool.rs` to the final `crate::gate::path_is_protected` import. If `secret_patterns.rs` still exists, forward its protected-path surface to `protected_paths.rs` so there is still only one implementation.
+3. Add `src/gate/command_path_analysis.rs` third and move the remaining command heuristics and their tests from `secret_patterns.rs`. Have this new module import `super::protected_paths` directly. Only after this file exists should `shell_safety.rs` and `exfil_detector.rs` switch away from `secret_patterns.rs`.
+4. Once `command_path_analysis.rs` is in place, update `shell_safety.rs` and `exfil_detector.rs` to import from sibling modules, narrow `src/gate/mod.rs` to the public facade needed outside `src/gate/`, and reduce `secret_patterns.rs` to a pure forwarding shim if any references still remain.
+5. Delete `src/gate/secret_patterns.rs` once every caller and test is building against the new modules. This is the delete step that proves the old mixed boundary is gone.
+6. Update the docs that still name `secret_patterns.rs`: `README.md`, `docs/architecture/overview.md`, and `docs/specs/restructure-plan.md`.
+7. Run targeted checks while moving code so failures stay local: the new `protected_paths.rs` tests, the new `command_path_analysis.rs` tests, `shell_safety` tests, `exfil_detector` tests, `read_tool` tests, `turn` tests, and any compile failures caused by stale imports. After the tree is stable, run the full verification stack: `cargo build --release`, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and `xtask/lint.sh`.
+8. After all checks pass and the tree is clean, run `openclaw system event --text 'Session 4a done: secret_patterns split' --mode now`.
 
 ## 5. Risk Assessment
 
-- Highest risk: precedence drift while moving load/spawn code.
-  - Mitigation: keep precedence logic co-located, document it with `Invariant:` comments, and preserve/add explicit precedence tests.
-- High risk: root-module cutover from `src/config.rs` to `src/config/mod.rs`.
-  - Mitigation: keep `src/config.rs` as the root until it is only facade glue, move facade tests out before the cutover, then do a same-patch move/delete with no dual-root state.
-- High risk: facade visibility drift.
-  - Mitigation: use the explicit symbol inventory in `src/config/mod.rs`, preserve `pub(crate)` constant visibility, and verify against that inventory during implementation and review.
-- Medium risk: helper-private tests forcing visibility widening.
-  - Mitigation: move those tests into the owning submodule instead of changing production visibility.
-- Medium risk: docs drift even when no literal filename reference changes.
-  - Mitigation: review architecture/risk prose for responsibility-boundary drift, not just string matches.
-- Low risk: unnecessary churn in `src/subscription.rs`.
-  - Mitigation: use the explicit audit checklist and leave the file untouched unless a concrete standard mismatch is found.
+- The main risk is a silent security regression while moving helper functions between files. `secret_patterns.rs` currently mixes pure catalogs with heuristic path analysis, so a bad move can accidentally widen `ShellSafety`, `ExfilDetector`, or `ReadFile` behavior even if the crate still compiles.
+- The highest-risk helpers are the env-wrapper parsers, git config/pathspec handling, grep `-f` operand checks, target-path rewrite logic, and symlink-aware target matching. They should move with minimal textual edits first, then be cleaned up only after tests pass.
+- `protected_paths.rs` and `command_path_analysis.rs` will share normalization assumptions. If they diverge, the shell guard and the read tool can start disagreeing about what counts as protected. The mitigation is one owner for normalized path classification, with command heuristics importing that owner instead of copying path logic.
+- The facade requirement is easy to violate accidentally. If callers start importing the new submodules directly, the split helps file shape but fails the “gate/mod.rs is the only public gate facade” requirement. The mitigation is a final repo-wide grep for direct imports before deleting `secret_patterns.rs`.
+- Docs drift is a real merge blocker in this repo. Search already shows stale references in `README.md`, `docs/architecture/overview.md`, and `docs/specs/restructure-plan.md`, so those updates must ship in the same merge as the code move.
+- Verification is expensive because `xtask/lint.sh` runs the full build, fmt, clippy, and test stack. The mitigation is targeted test runs after each move, followed by one final full run when the delete step and docs updates are done.

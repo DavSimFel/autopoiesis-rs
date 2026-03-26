@@ -12,7 +12,7 @@ Counting note: `prod` means code outside `#[cfg(test)]` modules and dedicated te
 | --- | ---: | ---: | --- |
 | `src/auth.rs` | 364 | 49 | Runs local OpenAI device-code auth, token refresh, token persistence, and auth HTTP helpers. |
 | `src/cli.rs` | 118 | 64 | Implements terminal token streaming, approval prompts, and denial formatting; it is terminal UI, not CLI argument parsing. |
-| `src/config.rs` | 770 | 940 | Loads `agents.toml`, resolves the active agent/tier/domain/model, validates read/subscription/spawn settings, loads skills, and retargets runtime config for spawned children. |
+| `src/config/mod.rs` | split | split | Facade reexports for the split config module. |
 | `src/context.rs` | 555 | 791 | Defines context providers for identity, skills, subscriptions, and history, and also contains token-bounded history replay logic. |
 | `src/delegation.rs` | 60 | 129 | Holds delegation thresholds and the logic that decides when to suggest T2 delegation. |
 | `src/identity.rs` | 42 | 150 | Loads identity markdown files and picks the T1 vs T2 identity file list. |
@@ -56,7 +56,9 @@ Counting note: `prod` means code outside `#[cfg(test)]` modules and dedicated te
 | `src/gate/exfil_detector.rs` | 159 | 152 | Detects read-then-send exfiltration sequences across tool-call batches. |
 | `src/gate/mod.rs` | 135 | 189 | Defines guard traits, verdict/context types, reexports guards, and applies guard checks to outbound text/tool arguments. |
 | `src/gate/output_cap.rs` | 72 | 143 | Spills oversized tool output to a session artifact file and returns a bounded pointer message. |
-| `src/gate/secret_patterns.rs` | 1599 | 549 | Stores secret regex/prefix catalogs and also implements protected-path detection plus command heuristics for reads/writes to protected paths. |
+| `src/gate/secret_catalog.rs` | split | split | Stores secret regex/prefix catalogs and streaming-redaction metadata only. |
+| `src/gate/protected_paths.rs` | split | split | Stores protected-path catalogs and normalized path checks only. |
+| `src/gate/command_path_analysis.rs` | split | split | Implements shell command heuristics for reads/writes to protected or target paths. |
 | `src/gate/secret_redactor.rs` | 105 | 178 | Redacts secrets in inbound/outbound text using the static secret catalog. |
 | `src/gate/shell_safety.rs` | 256 | 626 | Applies shell allow/approve/deny policy, standing approvals, and protected-path/identity-template write checks. |
 | `src/gate/streaming_redact.rs` | 248 | 98 | Performs incremental secret redaction while the model is streaming text. |
@@ -100,10 +102,10 @@ Counting note: `prod` means code outside `#[cfg(test)]` modules and dedicated te
   - Direct duplication: the dynamic SQL builders in `src/store.rs:473-566` and `src/store.rs:832-919`
   - Direct duplication: the pending-plan claim query in `src/store.rs:575-624` and `src/store.rs:1250-1294`
 
-- **`src/config.rs` mixes runtime state, file schema, defaults, validation, active-agent selection, domain extension, and child-runtime retargeting.**
-  - Initial active-agent/domain/tier resolution is in `src/config.rs:241-324`
-  - Spawned-child retargeting repeats the same shape in `src/config.rs:382-489`
-  - Policy type defaults/validation live in the same file as parsing and runtime assembly (`src/config.rs:1609-1710`)
+- **`src/config/*` now separates runtime state, file schema, defaults, validation, active-agent selection, domain extension, and child-runtime retargeting.**
+  - Initial active-agent/domain/tier resolution lives in `src/config/load.rs` and `src/config/agents.rs`
+  - Spawned-child retargeting lives in `src/config/spawn_runtime.rs`
+  - Policy type defaults/validation live in `src/config/runtime.rs` and `src/config/policy.rs`
 
 - **`src/context.rs` is five modules wearing one name.**
   - Identity prompt injection: `src/context.rs:21-95`
@@ -156,10 +158,9 @@ Counting note: `prod` means code outside `#[cfg(test)]` modules and dedicated te
   - Spawn-step lifecycle branch: `src/plan/runner.rs:766-989`
   - The shell and spawn branches repeat: attempt creation, initial summary serialization, failure conversion, plan advancement, and attempt finalization.
 
-- **`src/gate/secret_patterns.rs` is overloaded and misnamed.**
-  - Secret catalog types/constants live beside path protection and command-analysis heuristics.
-  - It is imported by redaction, streaming redaction, shell safety, exfil detection, the read tool, and turn tests.
-  - A change to “secret patterns” can unintentionally change filesystem policy behavior.
+- **`src/gate/secret_catalog.rs`, `src/gate/protected_paths.rs`, and `src/gate/command_path_analysis.rs` are split responsibilities.**
+  - Secret catalog types/constants now live apart from path protection and command-analysis heuristics.
+  - Path-policy changes can no longer hide inside the redaction catalog, which makes security review narrower and safer.
 
 - **Naming problems hide responsibilities.**
   - `src/spawn.rs` and `src/agent/spawn.rs` do different jobs but share the same module name.
@@ -172,7 +173,7 @@ Counting note: `prod` means code outside `#[cfg(test)]` modules and dedicated te
   - UTC formatting logic is duplicated between `src/util.rs:55-92` and `src/store.rs:1936-2015`
 
 - **Large inline test blocks still dominate several production files.**
-  - Biggest offenders: `src/store.rs`, `src/config.rs`, `src/context.rs`, `src/session.rs`, `src/turn.rs`, `src/plan/runner.rs`
+  - Biggest offenders: `src/store.rs`, `src/config/mod.rs`, `src/context.rs`, `src/session.rs`, `src/turn.rs`, `src/plan/runner.rs`
   - The agent area already follows the better pattern: separate test modules/files next to the production module.
 
 ## 3. Target Structure
@@ -323,7 +324,7 @@ src/
 | `src/config/agents.rs` | Defines agent/tier config and active-agent selection rules. | `AgentsConfig`, `AgentDefinition`, `AgentTierConfig`, `select_active_agent()`, and `validate_agent_identity()`. |
 | `src/config/models.rs` | Defines model catalog and route config types. | `ModelsConfig`, `ModelDefinition`, `ModelRoute`. |
 | `src/config/domains.rs` | Defines domain packs and validates domain prompt extensions. | `DomainsConfig`, `DomainConfig`, and `validate_domain_context_extend()`. |
-| `src/config/policy.rs` | Defines shell/read/subscription policy types and validation. | `BudgetConfig`, `QueueConfig`, `ReadToolConfig`, `SubscriptionsConfig`, `ShellPolicy`, defaults, and validators. |
+| `src/config/policy.rs` | Defines shell policy types and validation. | `ShellPolicy`, `ShellDefaultAction`, `ShellDefaultSeverity`, `validate_read_tool_config()`, and `validate_subscriptions_config()`. |
 | `src/config/file_schema.rs` | Defines the raw TOML file schema. | `RuntimeFileConfig` and `AuthFileSection`. |
 | `src/store/mod.rs` | Keeps `Store` as the facade and owns shared transaction/reexport wiring. | `Store`, `with_transaction()`, and public reexports from current `src/store.rs`. |
 | `src/store/migrations.rs` | Initializes and migrates SQLite schema. | `Store::new()` schema bootstrap plus `ensure_*`, `cleanup_legacy_plan_rows()`, and related helpers from `src/store.rs:103-170` and `src/store.rs:1590-1862`. |
@@ -372,9 +373,9 @@ src/
 | `src/plan/runner/spawn_step.rs` | Executes spawn steps and finalizes their attempts. | The spawn branch from `src/plan/runner.rs:766-989`. |
 | `src/plan/runner/tick.rs` | Claims runnable plan runs, delegates to `run_plan_step`, and releases claims. | `tick_plan_runner()` from `src/plan/runner.rs:993-1068`. |
 | `src/plan/runner/mod.rs` | Owns shared runner types and `run_plan_step()`. | `StepOutcome`, check outcome types, `run_plan_step()`, and high-level shared helpers from `src/plan/runner.rs`. |
-| `src/gate/secret_catalog.rs` | Secret prefixes, regexes, and streaming-redaction metadata only. | `SecretPattern`, `SecretBodyKind`, `SecretSuffixLen`, and `SECRET_PATTERNS` from the top of `src/gate/secret_patterns.rs`. |
-| `src/gate/protected_paths.rs` | Protected-path catalogs and normalized path checks. | `protected_path_fragments()`, `path_is_protected()`, and related protected-path helpers from `src/gate/secret_patterns.rs`. |
-| `src/gate/command_path_analysis.rs` | Shell command heuristics for reads/writes to protected or target paths. | `simple_command_reads_*()`, `command_writes_*()`, and supporting argv/script helpers from `src/gate/secret_patterns.rs`. |
+| `src/gate/secret_catalog.rs` | Secret prefixes, regexes, and streaming-redaction metadata only. | `SecretPattern`, `SecretBodyKind`, `SecretSuffixLen`, and `SECRET_PATTERNS`. |
+| `src/gate/protected_paths.rs` | Protected-path catalogs and normalized path checks. | `protected_path_fragments()`, `path_is_protected()`, and related protected-path helpers. |
+| `src/gate/command_path_analysis.rs` | Shell command heuristics for reads/writes to protected or target paths. | `simple_command_reads_*()`, `command_writes_*()`, and supporting argv/script helpers. |
 | `src/llm/openai/request.rs` | Shapes internal messages/tools into OpenAI Responses API request payloads. | `build_input()` and `build_tools()` from `src/llm/openai.rs:60-154`. |
 | `src/llm/openai/sse.rs` | Parses SSE lines and maintains incremental stream state. | `SseEvent`, `parse_sse_line()`, state structs, and `apply_sse_event()` from `src/llm/openai.rs:157-477`. |
 | `src/llm/openai/mod.rs` | Owns provider construction and network transport only. | `OpenAIProvider` construction and `stream_completion()` transport loop from current `src/llm/openai.rs`, after request/SSE logic move out. |
@@ -414,7 +415,7 @@ Each step below is intended to keep the crate green after `cargo build --release
    - Safe independently: yes, if the public API stays stable.
    - Depends on: step 1 only for `time.rs`.
 
-3. **Split `src/config.rs` behind the same `config::Config` API.**
+3. **Split `src/config/mod.rs` behind the same `config::Config` API.**
    - Create `config/mod.rs`, `runtime.rs`, `load.rs`, `spawn_runtime.rs`, `agents.rs`, `models.rs`, `domains.rs`, `policy.rs`, and `file_schema.rs`.
    - Preserve the existing constructors/accessors so callers do not change yet.
    - Safe independently: yes.
@@ -462,7 +463,7 @@ Each step below is intended to keep the crate green after `cargo build --release
    - Depends on: steps 6 and 8.
 
 10. **Finish the remaining overloaded internals.**
-    - Split `src/gate/secret_patterns.rs` into `secret_catalog.rs`, `protected_paths.rs`, and `command_path_analysis.rs`.
+    - Split the mixed gate helper file into `secret_catalog.rs`, `protected_paths.rs`, and `command_path_analysis.rs`.
     - Split `src/llm/openai.rs` into `openai/{mod,request,sse}.rs`.
     - Move any remaining large inline tests into sibling `tests.rs` files.
     - Safe independently: yes, but do it last because these paths are behavior-sensitive.
@@ -491,8 +492,8 @@ Each step below is intended to keep the crate green after `cargo build --release
 - **The child-session rename touches multiple boundaries at once.**
   - Stored metadata format, latest-assistant-response extraction, and T2 plan handoff all depend on both the parent and child runtime paths.
 
-- **`src/gate/secret_patterns.rs` is security-sensitive.**
-  - Splitting it must not widen protected-path access or weaken identity-template write detection for shell commands and `read_file`.
+- **`src/gate/protected_paths.rs` and `src/gate/command_path_analysis.rs` are security-sensitive.**
+  - Splitting them must not widen protected-path access or weaken identity-template write detection for shell commands and `read_file`.
 
 - **`src/llm/openai.rs` is protocol-sensitive.**
   - The SSE parser must keep handling chunk boundaries, terminal events, and tool-call assembly exactly as it does now.

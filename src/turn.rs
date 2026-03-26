@@ -439,7 +439,7 @@ mod tests {
     use super::*;
     use crate::config::{AgentDefinition, AgentTierConfig, BudgetConfig, Config, ShellPolicy};
     use crate::context::{History, Identity};
-    use crate::gate::secret_patterns::SECRET_PATTERNS;
+    use crate::gate::SECRET_PATTERNS;
     use crate::gate::{
         BudgetSnapshot, GuardContext, GuardEvent, SecretRedactor, Verdict as GuardResult,
     };

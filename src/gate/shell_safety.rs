@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use tracing::debug;
 
-use crate::config::ShellPolicy;
-use crate::config::{ShellDefaultAction, ShellDefaultSeverity};
-use crate::gate::secret_patterns::{
+use super::command_path_analysis::{
     command_writes_identity_template_path, command_writes_target_path,
     simple_command_reads_protected_path, simple_command_reads_target_path,
 };
+use crate::config::ShellPolicy;
+use crate::config::{ShellDefaultAction, ShellDefaultSeverity};
 use crate::gate::{Guard, GuardContext, GuardEvent, Severity, Verdict};
 use crate::llm::ToolCall;
 

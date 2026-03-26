@@ -1,110 +1,18 @@
+//! Heuristic shell analysis for obvious protected-path reads and writes.
+//!
+//! This is not sandboxing. It exists to fail closed on direct credential and
+//! prompt-path access before broader allowlists or approvals can widen access.
+
 use std::path::{Path, PathBuf};
 
-pub(crate) const SECRET_PATTERN_COUNT: usize = 3;
-
-pub(crate) const OPENAI_SECRET_PREFIX: &str = "sk-";
-pub(crate) const OPENAI_SECRET_REGEX: &str = r"sk-[a-zA-Z0-9_-]{20,}";
-pub(crate) const OPENAI_SECRET_MIN_SUFFIX_LEN: usize = 20;
-
-pub(crate) const GITHUB_PAT_PREFIX: &str = "ghp_";
-pub(crate) const GITHUB_PAT_REGEX: &str = r"ghp_[a-zA-Z0-9]{36}";
-pub(crate) const GITHUB_PAT_SUFFIX_LEN: usize = 36;
-
-pub(crate) const AWS_ACCESS_KEY_PREFIX: &str = "AKIA";
-pub(crate) const AWS_ACCESS_KEY_REGEX: &str = r"AKIA[0-9A-Z]{16}";
-pub(crate) const AWS_ACCESS_KEY_SUFFIX_LEN: usize = 16;
-
-const PROTECTED_PATH_FRAGMENTS: [&str; 8] = [
-    "~/.autopoiesis/auth.json",
-    "auth.json",
-    ".env.",
-    ".env",
-    ".ssh/",
-    "id_rsa",
-    "id_ed25519",
-    ".aws/credentials",
-];
-
-const PROTECTED_HOME_PATHS: [&str; 4] = [
-    "HOME/.autopoiesis/auth.json",
-    "HOME/.ssh/id_rsa",
-    "HOME/.ssh/id_ed25519",
-    "HOME/.aws/credentials",
-];
-
-const PROTECTED_ENV_FILENAMES: [&str; 7] = [
-    ".env",
-    ".env.local",
-    ".env.production",
-    ".env.production.local",
-    ".env.development",
-    ".env.development.local",
-    ".env.test",
-];
-
-const PROTECTED_GIT_PATHS: [&str; 7] = [
-    "auth.json",
-    ".autopoiesis/auth.json",
-    "id_rsa",
-    "id_ed25519",
-    ".ssh/id_rsa",
-    ".ssh/id_ed25519",
-    ".aws/credentials",
-];
+use super::protected_paths::{
+    is_protected_git_pathspec_value, is_protected_path_value, normalize_lexical_path,
+    protected_path_fragments,
+};
 
 const READ_ONLY_GIT_SUBCOMMANDS: [&str; 4] = ["diff", "show", "grep", "cat-file"];
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SecretBodyKind {
-    OpenAiToken,
-    LowercaseAlphanumeric,
-    UppercaseAlphanumeric,
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SecretSuffixLen {
-    Minimum(usize),
-    Exact(usize),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SecretPattern {
-    pub prefix: &'static str,
-    pub regex: &'static str,
-    pub body_kind: SecretBodyKind,
-    pub suffix_len: SecretSuffixLen,
-}
-
-pub(crate) const SECRET_PATTERNS: [SecretPattern; SECRET_PATTERN_COUNT] = [
-    SecretPattern {
-        prefix: OPENAI_SECRET_PREFIX,
-        regex: OPENAI_SECRET_REGEX,
-        body_kind: SecretBodyKind::OpenAiToken,
-        suffix_len: SecretSuffixLen::Minimum(OPENAI_SECRET_MIN_SUFFIX_LEN),
-    },
-    SecretPattern {
-        prefix: GITHUB_PAT_PREFIX,
-        regex: GITHUB_PAT_REGEX,
-        body_kind: SecretBodyKind::LowercaseAlphanumeric,
-        suffix_len: SecretSuffixLen::Exact(GITHUB_PAT_SUFFIX_LEN),
-    },
-    SecretPattern {
-        prefix: AWS_ACCESS_KEY_PREFIX,
-        regex: AWS_ACCESS_KEY_REGEX,
-        body_kind: SecretBodyKind::UppercaseAlphanumeric,
-        suffix_len: SecretSuffixLen::Exact(AWS_ACCESS_KEY_SUFFIX_LEN),
-    },
-];
-
-pub(crate) fn protected_path_fragments() -> &'static [&'static str] {
-    &PROTECTED_PATH_FRAGMENTS
-}
-
-pub(crate) fn path_is_protected(path: impl AsRef<std::path::Path>) -> bool {
-    let path = path.as_ref().to_string_lossy();
-    is_protected_path_value(path.as_ref())
-}
-
-pub(crate) fn command_references_protected_path(command: &str) -> bool {
+fn command_references_protected_path(command: &str) -> bool {
     let command = command.to_lowercase();
     protected_path_fragments()
         .iter()
@@ -989,37 +897,6 @@ fn strip_quoted_literals(script: &str) -> String {
     output
 }
 
-fn home_prefix() -> Option<String> {
-    std::env::var_os("HOME")
-        .and_then(|home| home.into_string().ok())
-        .filter(|home| !home.is_empty())
-}
-
-fn strip_prefix_with_boundary<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
-    path.strip_prefix(prefix)
-        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
-}
-
-fn expand_home_prefix(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("${HOME}") {
-        format!("HOME{rest}")
-    } else if let Some(rest) = path.strip_prefix("$HOME") {
-        format!("HOME{rest}")
-    } else if let Some(home) = home_prefix() {
-        if let Some(rest) = strip_prefix_with_boundary(path, &home) {
-            format!("HOME{rest}")
-        } else if let Some(rest) = path.strip_prefix('~') {
-            format!("HOME{rest}")
-        } else {
-            path.to_string()
-        }
-    } else if let Some(rest) = path.strip_prefix('~') {
-        format!("HOME{rest}")
-    } else {
-        path.to_string()
-    }
-}
-
 fn is_env_assignment_token(token: &str) -> bool {
     let Some((key, _value)) = token.split_once('=') else {
         return false;
@@ -1097,33 +974,6 @@ fn strip_env_wrapper(argv: &[String]) -> &[String] {
     &argv[start..]
 }
 
-fn normalize_lexical_path(path: &str) -> String {
-    let path = expand_home_prefix(path.trim());
-    let mut segments = Vec::new();
-    let is_absolute = path.starts_with('/');
-
-    for component in std::path::Path::new(&path).components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                let _ = segments.pop();
-            }
-            std::path::Component::RootDir => {}
-            std::path::Component::Normal(part) => {
-                segments.push(part.to_string_lossy().to_string());
-            }
-            std::path::Component::Prefix(_) => {}
-        }
-    }
-
-    let mut normalized = String::new();
-    if is_absolute {
-        normalized.push('/');
-    }
-    normalized.push_str(&segments.join("/"));
-    normalized
-}
-
 fn env_split_string_command(argv: &[String]) -> Option<Vec<String>> {
     let argv = strip_leading_env_assignments(argv);
     let first = argv.first()?;
@@ -1160,32 +1010,6 @@ fn env_split_string_command(argv: &[String]) -> Option<Vec<String>> {
     }
 
     None
-}
-
-fn is_protected_env_filename(filename: &str) -> bool {
-    PROTECTED_ENV_FILENAMES.contains(&filename)
-}
-
-fn is_protected_path_value(path: &str) -> bool {
-    let normalized = normalize_lexical_path(path);
-    let basename = std::path::Path::new(&normalized)
-        .file_name()
-        .and_then(|file_name| file_name.to_str());
-
-    PROTECTED_HOME_PATHS
-        .iter()
-        .any(|protected| normalized == *protected)
-        || basename.is_some_and(is_protected_env_filename)
-}
-
-fn is_protected_git_pathspec_value(path: &str) -> bool {
-    let normalized = normalize_lexical_path(path);
-    let basename = std::path::Path::new(&normalized)
-        .file_name()
-        .and_then(|file_name| file_name.to_str());
-
-    PROTECTED_GIT_PATHS.contains(&normalized.as_str())
-        || basename.is_some_and(is_protected_env_filename)
 }
 
 fn git_path_spec_argument(token: &str) -> Option<&str> {
@@ -1632,19 +1456,6 @@ mod tests {
     }
 
     #[test]
-    fn path_is_protected_matches_known_fragments() {
-        assert!(path_is_protected("~/.autopoiesis/auth.json"));
-        assert!(path_is_protected(".env"));
-        assert!(path_is_protected(".env.local"));
-        assert!(path_is_protected(".env.production.local"));
-        assert!(path_is_protected("~/.ssh/id_rsa"));
-        assert!(path_is_protected("~/.ssh/id_ed25519"));
-        assert!(path_is_protected("~/.aws/credentials"));
-        assert!(!path_is_protected("config/auth.json"));
-        assert!(!path_is_protected(".env.example"));
-    }
-
-    #[test]
     fn simple_command_reads_protected_path_matches_readers() {
         assert!(simple_command_reads_protected_path(&[
             "cat".to_string(),
@@ -2088,7 +1899,7 @@ mod tests {
     #[test]
     fn command_writes_target_path_follows_symlink_alias_for_new_files() {
         let root = std::env::temp_dir().join(format!(
-            "autopoiesis_secret_patterns_symlink_{}",
+            "autopoiesis_gate_symlink_{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

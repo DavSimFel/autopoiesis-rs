@@ -29,7 +29,9 @@
 - `src/gate/exfil_detector.rs` - cross-call read/send detection.
 - `src/gate/output_cap.rs` - shell output cap and artifact storage.
 - `src/gate/streaming_redact.rs` - streaming redaction during SSE output.
-- `src/gate/secret_patterns.rs` - protected path and secret pattern catalog.
+- `src/gate/secret_catalog.rs` - secret prefixes, regexes, and streaming-redaction metadata.
+- `src/gate/protected_paths.rs` - protected-path catalogs and normalized path checks.
+- `src/gate/command_path_analysis.rs` - shell command heuristics for reads/writes to protected or target paths.
 - `src/plan/runner.rs` - plan scheduler and execution loop.
 - `src/plan/executor.rs` - step execution helpers.
 - `src/plan/notify.rs` - notifications back to T2.

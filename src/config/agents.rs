@@ -80,3 +80,21 @@ pub fn validate_agent_identity(identity: &str) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::validate_agent_identity;
+
+    #[test]
+    fn rejects_empty_and_reserved_and_separator_containing_identity_segments() {
+        assert!(validate_agent_identity("").is_err());
+        assert!(validate_agent_identity(".").is_err());
+        assert!(validate_agent_identity("..").is_err());
+        assert!(validate_agent_identity("silas/nested").is_err());
+    }
+
+    #[test]
+    fn accepts_single_path_segment_identity() {
+        assert!(validate_agent_identity("silas").is_ok());
+    }
+}

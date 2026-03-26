@@ -1,7 +1,7 @@
 use serde_json::{Value, from_str};
 use std::path::PathBuf;
 
-use crate::gate::secret_patterns::{
+use super::command_path_analysis::{
     simple_command_reads_protected_path, simple_command_reads_target_path,
 };
 use crate::gate::{Guard, GuardContext, GuardEvent, Severity, Verdict};

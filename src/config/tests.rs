@@ -557,6 +557,43 @@ fn loads_operator_key_from_auth_section() {
 }
 
 #[test]
+fn operator_key_env_overrides_file_value() {
+    let path = temp_toml_path(
+        "operator_key_env",
+        "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-auth'\n[auth]\noperator_key='operator-from-file'\n",
+    );
+
+    super::with_config_load_lock(|| {
+        let original = std::env::var("AUTOPOIESIS_OPERATOR_KEY").ok();
+        struct EnvGuard {
+            original: Option<String>,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                if let Some(value) = self.original.as_ref() {
+                    unsafe {
+                        std::env::set_var("AUTOPOIESIS_OPERATOR_KEY", value);
+                    }
+                } else {
+                    unsafe {
+                        std::env::remove_var("AUTOPOIESIS_OPERATOR_KEY");
+                    }
+                }
+            }
+        }
+
+        let _env_guard = EnvGuard { original };
+        unsafe {
+            std::env::set_var("AUTOPOIESIS_OPERATOR_KEY", "operator-from-env");
+        }
+
+        let config = Config::load(&path).expect("expected config to load");
+        assert_eq!(config.operator_key, Some("operator-from-env".to_string()));
+    });
+}
+
+#[test]
 fn loads_skills_catalog_even_when_config_file_is_missing() {
     let config = Config::load("/does/not/exist.toml").expect("expected defaults to be used");
     assert!(!config.skills.is_empty());
@@ -594,6 +631,38 @@ fn loads_skills_catalog_from_configured_directory() {
         config.skills.get("code-review").unwrap().description,
         "Reviews code changes"
     );
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn loads_skills_catalog_from_absolute_directory_without_rebasing() {
+    let root = std::env::temp_dir().join(format!(
+        "autopoiesis_config_skills_absolute_test_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let skills_dir = root.join("absolute-skills");
+    std::fs::create_dir_all(&skills_dir).unwrap();
+    std::fs::write(
+        skills_dir.join("code-review.toml"),
+        "[skill]\nname='code-review'\ndescription='Reviews code changes'\nrequired_caps=['code']\ntoken_estimate=500\ninstructions='full prompt'\n",
+    )
+    .unwrap();
+
+    let config_path = root.join("agents.toml");
+    let config_contents = format!(
+        "skills_dir='{}'\n[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-skills'\n",
+        skills_dir.display()
+    );
+    std::fs::write(&config_path, config_contents).unwrap();
+
+    let config = Config::load(&config_path).expect("expected config to load");
+    assert_eq!(config.skills_dir, skills_dir);
+    assert_eq!(config.skills_dir_resolved, skills_dir);
+    assert_eq!(config.skills.browse().len(), 1);
 
     std::fs::remove_dir_all(&root).unwrap();
 }

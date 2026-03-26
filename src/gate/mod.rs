@@ -1,7 +1,9 @@
 pub mod budget;
+mod command_path_analysis;
 pub mod exfil_detector;
 pub(crate) mod output_cap;
-pub(crate) mod secret_patterns;
+mod protected_paths;
+mod secret_catalog;
 pub mod secret_redactor;
 pub mod shell_safety;
 pub(crate) mod streaming_redact;
@@ -12,6 +14,9 @@ use crate::turn::Turn;
 pub use budget::BudgetGuard;
 pub use exfil_detector::ExfilDetector;
 pub(crate) use output_cap::{DEFAULT_OUTPUT_CAP_BYTES, cap_tool_output};
+pub(crate) use protected_paths::path_is_protected;
+#[cfg(test)]
+pub(crate) use secret_catalog::SECRET_PATTERNS;
 pub use secret_redactor::SecretRedactor;
 pub use shell_safety::ShellSafety;
 pub(crate) use streaming_redact::StreamingTextBuffer;
