@@ -117,10 +117,6 @@ pub(super) fn make_denial_verdict(
     }
 }
 
-pub fn format_denial_message(reason: &str, gate_id: &str) -> String {
-    format!("Command hard-denied by {gate_id}: {reason}")
-}
-
 fn inbound_verdict_name(verdict: &Verdict) -> &'static str {
     match verdict {
         Verdict::Allow => "allow",

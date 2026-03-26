@@ -1,13 +1,23 @@
 //! SQLite-backed session registry and per-session message queue.
 
+mod message_queue;
+mod migrations;
+mod plan_runs;
+mod sessions;
+mod step_attempts;
+mod subscriptions;
+
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params, types::ToSql};
+use rusqlite::Connection;
 
+#[cfg(test)]
 use crate::util::utc_timestamp;
+#[cfg(test)]
+use rusqlite::params;
 
 #[derive(Debug, Clone)]
 pub struct QueuedMessage {
@@ -151,34 +161,27 @@ impl Store {
             "#,
         )
         .context("failed to initialize sqlite schema")?;
-        ensure_sessions_parent_session_id_column(&conn)?;
+        migrations::ensure_sessions_parent_session_id_column(&conn)?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_parent_session_id_created_at
              ON sessions(parent_session_id, created_at, id)",
             [],
         )
         .context("failed to initialize parent session index")?;
-        ensure_messages_claimed_at_column(&conn)?;
+        migrations::ensure_messages_claimed_at_column(&conn)?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_status_claimed_at
              ON messages(status, claimed_at, id)",
             [],
         )
         .context("failed to initialize claimed_at index")?;
-        ensure_plan_runs_table(&conn)?;
+        migrations::ensure_plan_runs_table(&conn)?;
 
         Ok(Self { conn })
     }
 
     pub fn create_session(&mut self, session_id: &str, metadata: Option<&str>) -> Result<()> {
-        let metadata = metadata.unwrap_or("{}");
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO sessions (id, created_at, metadata) VALUES (?1, ?2, ?3)",
-                params![session_id, utc_timestamp(), metadata],
-            )
-            .context("failed to create session")?;
-        Ok(())
+        sessions::create_session(&self.conn, session_id, metadata)
     }
 
     /// Insert a child session that records its parent session id.
@@ -188,14 +191,7 @@ impl Store {
         child_id: &str,
         metadata: Option<&str>,
     ) -> Result<()> {
-        let metadata = metadata.unwrap_or("{}");
-        self.conn
-            .execute(
-                "INSERT INTO sessions (id, created_at, metadata, parent_session_id) VALUES (?1, ?2, ?3, ?4)",
-                params![child_id, utc_timestamp(), metadata, parent_id],
-            )
-            .context("failed to create child session")?;
-        Ok(())
+        sessions::create_child_session(&self.conn, parent_id, child_id, metadata)
     }
 
     /// Insert a child session and queue its initial task atomically.
@@ -207,77 +203,26 @@ impl Store {
         task: &str,
         source: &str,
     ) -> Result<()> {
-        let metadata = metadata.unwrap_or("{}");
-        self.with_transaction(|tx| {
-            tx.execute(
-                "INSERT INTO sessions (id, created_at, metadata, parent_session_id) VALUES (?1, ?2, ?3, ?4)",
-                params![child_id, utc_timestamp(), metadata, parent_id],
-            )
-            .context("failed to create child session")?;
-            tx.execute(
-                "INSERT INTO messages (session_id, role, content, source, status, created_at) VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
-                params![child_id, "user", task, source, utc_timestamp()],
-            )
-            .context("failed to enqueue child task")?;
-            Ok(())
-        })
+        sessions::create_child_session_with_task(self, parent_id, child_id, metadata, task, source)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<String>> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT id FROM sessions ORDER BY created_at ASC, id ASC")
-            .context("failed to prepare list_sessions query")?;
-        let sessions = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .context("failed to query sessions")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to collect sessions")?;
-
-        Ok(sessions)
+        sessions::list_sessions(&self.conn)
     }
 
     /// Return the parent session id for a child session, if one exists.
     pub fn get_parent_session(&self, child_id: &str) -> Result<Option<String>> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT parent_session_id FROM sessions WHERE id = ?1")
-            .context("failed to prepare get_parent_session query")?;
-        match statement.query_row(params![child_id], |row| row.get::<_, Option<String>>(0)) {
-            Ok(parent_id) => Ok(parent_id),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(error) => Err(error).context("failed to read parent session"),
-        }
+        sessions::get_parent_session(&self.conn, child_id)
     }
 
     /// Return the stored metadata for a session, if the session exists.
     pub fn get_session_metadata(&self, session_id: &str) -> Result<Option<String>> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT metadata FROM sessions WHERE id = ?1")
-            .context("failed to prepare get_session_metadata query")?;
-        match statement.query_row(params![session_id], |row| row.get::<_, Option<String>>(0)) {
-            Ok(metadata) => Ok(metadata),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(error) => Err(error).context("failed to read session metadata"),
-        }
+        sessions::get_session_metadata(&self.conn, session_id)
     }
 
     /// Return child session ids ordered by creation time.
     pub fn list_child_sessions(&self, parent_id: &str) -> Result<Vec<String>> {
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT id FROM sessions WHERE parent_session_id = ?1 ORDER BY created_at ASC, id ASC",
-            )
-            .context("failed to prepare list_child_sessions query")?;
-        let sessions = statement
-            .query_map(params![parent_id], |row| row.get::<_, String>(0))
-            .context("failed to query child sessions")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to collect child sessions")?;
-
-        Ok(sessions)
+        sessions::list_child_sessions(&self.conn, parent_id)
     }
 
     /// Run a SQLite transaction and commit only if the closure succeeds.
@@ -301,13 +246,7 @@ impl Store {
         content: &str,
         source: &str,
     ) -> Result<i64> {
-        self.conn
-            .execute(
-                "INSERT INTO messages (session_id, role, content, source, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![session_id, role, content, source, utc_timestamp()],
-            )
-            .context("failed to enqueue message")?;
-        Ok(self.conn.last_insert_rowid())
+        message_queue::enqueue_message(&self.conn, session_id, role, content, source)
     }
 
     pub(crate) fn enqueue_message_in_transaction(
@@ -317,86 +256,25 @@ impl Store {
         content: &str,
         source: &str,
     ) -> Result<()> {
-        tx.execute(
-            "INSERT INTO messages (session_id, role, content, source, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_id, role, content, source, utc_timestamp()],
-        )
-        .context("failed to enqueue message")?;
-        Ok(())
+        message_queue::enqueue_message_in_transaction(tx, session_id, role, content, source)
     }
 
     pub fn dequeue_next_message(&mut self, session_id: &str) -> Result<Option<QueuedMessage>> {
-        let claimed_at = unix_timestamp();
-        let mut statement = self
-            .conn
-            .prepare(
-                "UPDATE messages
-                 SET status = 'processing', claimed_at = ?2
-                 WHERE id = (
-                     SELECT id
-                     FROM messages
-                     WHERE session_id = ?1 AND status = 'pending'
-                     ORDER BY created_at ASC, id ASC
-                     LIMIT 1
-                 )
-                 AND status = 'pending'
-                 RETURNING id, session_id, role, content, source, status, created_at",
-            )
-            .context("failed to prepare dequeue query")?;
-
-        match statement.query_row(params![session_id, claimed_at], |row| {
-            Ok(QueuedMessage {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                role: row.get(2)?,
-                content: row.get(3)?,
-                source: row.get(4)?,
-                status: row.get(5)?,
-                created_at: row.get(6)?,
-            })
-        }) {
-            Ok(message) => Ok(Some(message)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(error) => Err(error).context("failed to dequeue message"),
-        }
+        message_queue::dequeue_next_message(&self.conn, session_id)
     }
 
     pub fn mark_processed(&mut self, message_id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE messages SET status = 'processed' WHERE id = ?1",
-                params![message_id],
-            )
-            .context("failed to mark message processed")?;
-        Ok(())
+        message_queue::mark_processed(&self.conn, message_id)
     }
 
     pub fn mark_failed(&mut self, message_id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE messages SET status = 'failed' WHERE id = ?1",
-                params![message_id],
-            )
-            .context("failed to mark message failed")?;
-        Ok(())
+        message_queue::mark_failed(&self.conn, message_id)
     }
 
     /// Recover messages stuck in 'processing' state (e.g., after a crash).
     /// Resets them to 'pending' so they can be retried once they are stale.
     pub fn recover_stale_messages(&mut self, stale_after_secs: u64) -> Result<u64> {
-        let stale_after_secs = stale_after_secs.min(i64::MAX as u64) as i64;
-        let stale_before = unix_timestamp().saturating_sub(stale_after_secs);
-        let count = self
-            .conn
-            .execute(
-                "UPDATE messages
-                 SET status = 'pending', claimed_at = NULL
-                 WHERE status = 'processing'
-                   AND (claimed_at IS NULL OR claimed_at <= ?1)",
-                params![stale_before],
-            )
-            .context("failed to recover stale messages")?;
-        Ok(count as u64)
+        message_queue::recover_stale_messages(&self.conn, stale_after_secs)
     }
 
     pub fn create_plan_run(
@@ -407,67 +285,18 @@ impl Store {
         topic: Option<&str>,
         trigger_source: Option<&str>,
     ) -> Result<()> {
-        if definition_json.is_empty() {
-            return Err(anyhow::anyhow!(
-                "invalid plan run definition json: definition_json must not be empty"
-            ));
-        }
-        let created_at = utc_timestamp();
-        self.conn
-            .execute(
-                "INSERT INTO plan_runs (
-                    id,
-                    owner_session_id,
-                    topic,
-                    trigger_source,
-                    status,
-                    revision,
-                    current_step_index,
-                    definition_json,
-                    created_at,
-                    updated_at
-                ) VALUES (?1, ?2, ?3, ?4, 'pending', 1, 0, ?5, ?6, ?6)",
-                params![
-                    id,
-                    owner_session_id,
-                    topic,
-                    trigger_source,
-                    definition_json,
-                    created_at
-                ],
-            )
-            .context("failed to create plan run")?;
-        Ok(())
+        plan_runs::create_plan_run(
+            &self.conn,
+            id,
+            owner_session_id,
+            definition_json,
+            topic,
+            trigger_source,
+        )
     }
 
     pub fn get_plan_run(&self, id: &str) -> Result<Option<PlanRun>> {
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT
-                    id,
-                    owner_session_id,
-                    topic,
-                    trigger_source,
-                    status,
-                    revision,
-                    current_step_index,
-                    active_child_session_id,
-                    definition_json,
-                    last_failure_json,
-                    claimed_at,
-                    created_at,
-                    updated_at
-                 FROM plan_runs
-                 WHERE id = ?1",
-            )
-            .context("failed to prepare get_plan_run query")?;
-
-        match statement.query_row(params![id], plan_run_from_row) {
-            Ok(plan_run) => Ok(Some(plan_run)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(error) => Err(error).context("failed to read plan run"),
-        }
+        plan_runs::get_plan_run(&self.conn, id)
     }
 
     pub fn update_plan_run_status(
@@ -476,357 +305,49 @@ impl Store {
         status: &str,
         updated_fields: PlanRunUpdateFields,
     ) -> Result<()> {
-        validate_plan_run_status(status)?;
-        if let Some(revision) = updated_fields.revision
-            && revision <= 0
-        {
-            return Err(anyhow::anyhow!("invalid plan run revision: {revision}"));
-        }
-        if let Some(current_step_index) = updated_fields.current_step_index
-            && current_step_index < 0
-        {
-            return Err(anyhow::anyhow!(
-                "invalid plan run current step index: {current_step_index}"
-            ));
-        }
-        let updated_at = utc_timestamp();
-        let mut sql = String::from("UPDATE plan_runs SET status = ?1, updated_at = ?2");
-        let mut bindings: Vec<Box<dyn ToSql>> =
-            vec![Box::new(status.to_string()), Box::new(updated_at)];
-        let mut next_index = 3usize;
-
-        if let Some(revision) = updated_fields.revision {
-            sql.push_str(&format!(", revision = ?{next_index}"));
-            bindings.push(Box::new(revision));
-            next_index += 1;
-        }
-
-        if let Some(current_step_index) = updated_fields.current_step_index {
-            sql.push_str(&format!(", current_step_index = ?{next_index}"));
-            bindings.push(Box::new(current_step_index));
-            next_index += 1;
-        }
-
-        if let Some(definition_json) = updated_fields.definition_json {
-            if definition_json.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "invalid plan run definition json: definition_json must not be empty"
-                ));
-            }
-            sql.push_str(&format!(", definition_json = ?{next_index}"));
-            bindings.push(Box::new(definition_json));
-            next_index += 1;
-        }
-
-        match updated_fields.active_child_session_id {
-            NullableUpdate::Unchanged => {}
-            NullableUpdate::Null => {
-                sql.push_str(&format!(", active_child_session_id = ?{next_index}"));
-                bindings.push(Box::new(Option::<String>::None));
-                next_index += 1;
-            }
-            NullableUpdate::Value(value) => {
-                sql.push_str(&format!(", active_child_session_id = ?{next_index}"));
-                bindings.push(Box::new(Some(value)));
-                next_index += 1;
-            }
-        }
-
-        match updated_fields.last_failure_json {
-            NullableUpdate::Unchanged => {}
-            NullableUpdate::Null => {
-                sql.push_str(&format!(", last_failure_json = ?{next_index}"));
-                bindings.push(Box::new(Option::<String>::None));
-                next_index += 1;
-            }
-            NullableUpdate::Value(value) => {
-                sql.push_str(&format!(", last_failure_json = ?{next_index}"));
-                bindings.push(Box::new(Some(value)));
-                next_index += 1;
-            }
-        }
-
-        sql.push_str(&format!(" WHERE id = ?{next_index}"));
-        bindings.push(Box::new(id.to_string()));
-
-        let changed = self
-            .conn
-            .execute(
-                &sql,
-                rusqlite::params_from_iter(bindings.iter().map(|value| value.as_ref())),
-            )
-            .context("failed to update plan run status")?;
-        if changed == 0 {
-            return Err(anyhow::anyhow!(
-                "failed to update plan run status: plan run not found"
-            ));
-        }
-
-        Ok(())
+        plan_runs::update_plan_run_status(&self.conn, id, status, updated_fields)
     }
 
     pub fn claim_next_pending_plan_run(
         &mut self,
         stale_after_secs: u64,
     ) -> Result<Option<PlanRun>> {
-        self.claim_pending_plan_run(stale_after_secs)
+        plan_runs::claim_next_pending_plan_run(self, stale_after_secs)
     }
 
     pub fn claim_next_runnable_plan_run(
         &mut self,
         stale_after_secs: u64,
     ) -> Result<Option<PlanRun>> {
-        let stale_after_secs = stale_after_secs.min(i64::MAX as u64) as i64;
-        let stale_before = unix_timestamp().saturating_sub(stale_after_secs);
-        let claimed_at = unix_timestamp();
-        let updated_at = utc_timestamp();
-        let mut statement = self
-            .conn
-            .prepare(
-                "UPDATE plan_runs
-                 SET status = 'running', claimed_at = ?2, updated_at = ?3
-                 WHERE id = (
-                     SELECT id
-                     FROM plan_runs
-                     WHERE status = 'pending'
-                       AND (claimed_at IS NULL OR claimed_at <= ?1)
-                     ORDER BY
-                         created_at ASC,
-                         id ASC
-                     LIMIT 1
-                 )
-                 AND status = 'pending'
-                 AND (claimed_at IS NULL OR claimed_at <= ?1)
-                 RETURNING
-                    id,
-                    owner_session_id,
-                    topic,
-                    trigger_source,
-                    status,
-                    revision,
-                    current_step_index,
-                    active_child_session_id,
-                    definition_json,
-                    last_failure_json,
-                    claimed_at,
-                    created_at,
-                    updated_at",
-            )
-            .context("failed to prepare runnable plan run claim query")?;
-
-        match statement.query_row(
-            params![stale_before, claimed_at, updated_at],
-            plan_run_from_row,
-        ) {
-            Ok(plan_run) => Ok(Some(plan_run)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(error) => Err(error).context("failed to claim runnable plan run"),
-        }
+        plan_runs::claim_next_runnable_plan_run(&self.conn, stale_after_secs)
     }
 
     pub fn release_plan_run_claim(&mut self, id: &str) -> Result<()> {
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE plan_runs
-                 SET claimed_at = NULL,
-                     updated_at = ?2
-                 WHERE id = ?1
-                   AND status != 'running'",
-                params![id, utc_timestamp()],
-            )
-            .context("failed to release plan run claim")?;
-        if changed == 0 {
-            let current_status: Option<String> = self
-                .conn
-                .query_row(
-                    "SELECT status FROM plan_runs WHERE id = ?1",
-                    params![id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .context("failed to read plan run status before release")?;
-
-            let Some(current_status) = current_status else {
-                return Err(anyhow::anyhow!(
-                    "failed to release plan run claim: plan run not found"
-                ));
-            };
-            if current_status == "running" {
-                return Err(anyhow::anyhow!(
-                    "failed to release plan run claim: plan run is still running"
-                ));
-            }
-            validate_plan_run_status(&current_status)?;
-            return Err(anyhow::anyhow!(
-                "failed to release plan run claim: plan run claim was not updated"
-            ));
-        }
-        Ok(())
+        plan_runs::release_plan_run_claim(&self.conn, id)
     }
 
     pub fn list_plan_runs_by_session(&self, owner_session_id: &str) -> Result<Vec<PlanRun>> {
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT
-                    id,
-                    owner_session_id,
-                    topic,
-                    trigger_source,
-                    status,
-                    revision,
-                    current_step_index,
-                    active_child_session_id,
-                    definition_json,
-                    last_failure_json,
-                    claimed_at,
-                    created_at,
-                    updated_at
-                 FROM plan_runs
-                 WHERE owner_session_id = ?1
-                 ORDER BY created_at ASC, id ASC",
-            )
-            .context("failed to prepare list_plan_runs_by_session query")?;
-
-        let plan_runs = statement
-            .query_map(params![owner_session_id], plan_run_from_row)
-            .context("failed to query plan runs")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to collect plan runs")?;
-
-        Ok(plan_runs)
+        plan_runs::list_plan_runs_by_session(&self.conn, owner_session_id)
     }
 
     pub fn list_recent_plan_runs(&self, limit: usize) -> Result<Vec<PlanRun>> {
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT
-                    id,
-                    owner_session_id,
-                    topic,
-                    trigger_source,
-                    status,
-                    revision,
-                    current_step_index,
-                    active_child_session_id,
-                    definition_json,
-                    last_failure_json,
-                    claimed_at,
-                    created_at,
-                    updated_at
-                 FROM plan_runs
-                 ORDER BY updated_at DESC, created_at DESC, id DESC
-                 LIMIT ?1",
-            )
-            .context("failed to prepare list_recent_plan_runs query")?;
-
-        let plan_runs = statement
-            .query_map(params![limit as i64], plan_run_from_row)
-            .context("failed to query recent plan runs")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to collect recent plan runs")?;
-
-        Ok(plan_runs)
+        plan_runs::list_recent_plan_runs(&self.conn, limit)
     }
 
     pub fn list_recent_active_plan_runs(&self, limit: usize) -> Result<Vec<PlanRun>> {
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT
-                    id,
-                    owner_session_id,
-                    topic,
-                    trigger_source,
-                    status,
-                    revision,
-                    current_step_index,
-                    active_child_session_id,
-                    definition_json,
-                    last_failure_json,
-                    claimed_at,
-                    created_at,
-                    updated_at
-                 FROM plan_runs
-                 WHERE status IN ('pending', 'running', 'waiting_t2')
-                 ORDER BY updated_at DESC, created_at DESC, id DESC
-                 LIMIT ?1",
-            )
-            .context("failed to prepare list_recent_active_plan_runs query")?;
-
-        let plan_runs = statement
-            .query_map(params![limit as i64], plan_run_from_row)
-            .context("failed to query recent active plan runs")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to collect recent active plan runs")?;
-
-        Ok(plan_runs)
+        plan_runs::list_recent_active_plan_runs(&self.conn, limit)
     }
 
     pub fn recover_stale_plan_runs(&mut self, stale_after_secs: u64) -> Result<u64> {
-        let stale_after_secs = stale_after_secs.min(i64::MAX as u64) as i64;
-        let stale_before = unix_timestamp().saturating_sub(stale_after_secs);
-        self.with_transaction(|tx| {
-            let pending_count = tx
-                .execute(
-                    "UPDATE plan_runs
-                     SET claimed_at = NULL,
-                         updated_at = ?2
-                     WHERE status = 'pending'
-                       AND claimed_at IS NOT NULL
-                       AND claimed_at <= ?1",
-                    params![stale_before, utc_timestamp()],
-                )
-                .context("failed to recover stale pending plan runs")?;
-            let leaked_count = tx
-                .execute(
-                    "UPDATE plan_runs
-                     SET claimed_at = NULL,
-                         updated_at = ?2
-                     WHERE status IN ('waiting_t2', 'completed', 'failed')
-                       AND claimed_at IS NOT NULL
-                       AND claimed_at <= ?1",
-                    params![stale_before, utc_timestamp()],
-                )
-                .context("failed to clear stale plan run claims")?;
-            Ok((pending_count + leaked_count) as u64)
-        })
+        plan_runs::recover_stale_plan_runs(self, stale_after_secs)
     }
 
     pub fn resume_waiting_plan_run(&mut self, id: &str) -> Result<bool> {
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE plan_runs
-                 SET status = 'pending',
-                     claimed_at = NULL,
-                     last_failure_json = NULL,
-                     updated_at = ?2
-                 WHERE id = ?1
-                   AND status = 'waiting_t2'",
-                params![id, utc_timestamp()],
-            )
-            .context("failed to resume waiting plan run")?;
-        Ok(changed > 0)
+        plan_runs::resume_waiting_plan_run(&self.conn, id)
     }
 
     pub fn cancel_plan_run(&mut self, id: &str) -> Result<bool> {
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE plan_runs
-                 SET status = 'failed',
-                     claimed_at = NULL,
-                     last_failure_json = NULL,
-                     updated_at = ?2
-                 WHERE id = ?1
-                   AND status IN ('pending', 'running', 'waiting_t2')",
-                params![id, utc_timestamp()],
-            )
-            .context("failed to cancel plan run")?;
-        Ok(changed > 0)
+        plan_runs::cancel_plan_run(&self.conn, id)
     }
 
     pub fn update_plan_run_status_preserving_failed(
@@ -835,269 +356,37 @@ impl Store {
         status: &str,
         updated_fields: PlanRunUpdateFields,
     ) -> Result<bool> {
-        validate_plan_run_status(status)?;
-        if let Some(revision) = updated_fields.revision
-            && revision <= 0
-        {
-            return Err(anyhow::anyhow!("invalid plan run revision: {revision}"));
-        }
-        if let Some(current_step_index) = updated_fields.current_step_index
-            && current_step_index < 0
-        {
-            return Err(anyhow::anyhow!(
-                "invalid plan run current step index: {current_step_index}"
-            ));
-        }
-        let updated_at = utc_timestamp();
-        let mut sql = String::from("UPDATE plan_runs SET status = ?1, updated_at = ?2");
-        let mut bindings: Vec<Box<dyn ToSql>> =
-            vec![Box::new(status.to_string()), Box::new(updated_at)];
-        let mut next_index = 3usize;
-
-        if let Some(revision) = updated_fields.revision {
-            sql.push_str(&format!(", revision = ?{next_index}"));
-            bindings.push(Box::new(revision));
-            next_index += 1;
-        }
-
-        if let Some(current_step_index) = updated_fields.current_step_index {
-            sql.push_str(&format!(", current_step_index = ?{next_index}"));
-            bindings.push(Box::new(current_step_index));
-            next_index += 1;
-        }
-
-        if let Some(definition_json) = updated_fields.definition_json {
-            if definition_json.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "invalid plan run definition json: definition_json must not be empty"
-                ));
-            }
-            sql.push_str(&format!(", definition_json = ?{next_index}"));
-            bindings.push(Box::new(definition_json));
-            next_index += 1;
-        }
-
-        match updated_fields.active_child_session_id {
-            NullableUpdate::Unchanged => {}
-            NullableUpdate::Null => {
-                sql.push_str(&format!(", active_child_session_id = ?{next_index}"));
-                bindings.push(Box::new(Option::<String>::None));
-                next_index += 1;
-            }
-            NullableUpdate::Value(value) => {
-                sql.push_str(&format!(", active_child_session_id = ?{next_index}"));
-                bindings.push(Box::new(Some(value)));
-                next_index += 1;
-            }
-        }
-
-        match updated_fields.last_failure_json {
-            NullableUpdate::Unchanged => {}
-            NullableUpdate::Null => {
-                sql.push_str(&format!(", last_failure_json = ?{next_index}"));
-                bindings.push(Box::new(Option::<String>::None));
-                next_index += 1;
-            }
-            NullableUpdate::Value(value) => {
-                sql.push_str(&format!(", last_failure_json = ?{next_index}"));
-                bindings.push(Box::new(Some(value)));
-                next_index += 1;
-            }
-        }
-
-        sql.push_str(&format!(" WHERE id = ?{next_index} AND status != 'failed'"));
-        bindings.push(Box::new(id.to_string()));
-
-        let changed = self
-            .conn
-            .execute(
-                &sql,
-                rusqlite::params_from_iter(bindings.iter().map(|value| value.as_ref())),
-            )
-            .context("failed to update plan run status")?;
-        Ok(changed > 0)
+        plan_runs::update_plan_run_status_preserving_failed(&self.conn, id, status, updated_fields)
     }
 
     pub fn list_stale_running_plan_runs(&self, stale_after_secs: u64) -> Result<Vec<PlanRun>> {
-        let stale_after_secs = stale_after_secs.min(i64::MAX as u64) as i64;
-        let stale_before = unix_timestamp().saturating_sub(stale_after_secs);
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT
-                    id,
-                    owner_session_id,
-                    topic,
-                    trigger_source,
-                    status,
-                    revision,
-                    current_step_index,
-                    active_child_session_id,
-                    definition_json,
-                    last_failure_json,
-                    claimed_at,
-                    created_at,
-                    updated_at
-                 FROM plan_runs
-                 WHERE status = 'running'
-                   AND claimed_at IS NOT NULL
-                   AND claimed_at <= ?1
-                 ORDER BY claimed_at ASC, created_at ASC, id ASC",
-            )
-            .context("failed to prepare list_stale_running_plan_runs query")?;
-
-        let plan_runs = statement
-            .query_map(params![stale_before], plan_run_from_row)
-            .context("failed to query stale running plan runs")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to collect stale running plan runs")?;
-
-        Ok(plan_runs)
+        plan_runs::list_stale_running_plan_runs(&self.conn, stale_after_secs)
     }
 
     pub fn next_step_attempt_index_for_run(&self, plan_run: &PlanRun) -> Result<i64> {
-        let attempts = self.get_step_attempts(&plan_run.id, plan_run.current_step_index)?;
-        Ok(attempts
-            .into_iter()
-            .filter(|attempt| attempt.revision == plan_run.revision)
-            .map(|attempt| attempt.attempt)
-            .max()
-            .map(|attempt| attempt + 1)
-            .unwrap_or(0))
+        step_attempts::next_step_attempt_index_for_run(&self.conn, plan_run)
     }
 
     pub fn max_step_attempt_index_for_run(&self, plan_run_id: &str) -> Result<i64> {
-        let max_attempt: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT MAX(attempt) FROM plan_step_attempts WHERE plan_run_id = ?1",
-                params![plan_run_id],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .context("failed to query maximum plan step attempt")?;
-        Ok(max_attempt.unwrap_or(-1))
+        step_attempts::max_step_attempt_index_for_run(&self.conn, plan_run_id)
     }
 
     pub fn crash_running_step_attempts_for_run(
         &mut self,
         plan_run_id: &str,
     ) -> Result<Vec<StepAttempt>> {
-        self.with_transaction(|tx| {
-            Self::crash_running_step_attempts_for_run_in_transaction(tx, plan_run_id)
-        })
+        step_attempts::crash_running_step_attempts_for_run(self, plan_run_id)
     }
 
     pub(crate) fn crash_running_step_attempts_for_run_in_transaction(
         tx: &rusqlite::Transaction<'_>,
         plan_run_id: &str,
     ) -> Result<Vec<StepAttempt>> {
-        let attempts = {
-            let mut statement = tx
-                .prepare(
-                    "SELECT
-                        id,
-                        plan_run_id,
-                        revision,
-                        step_index,
-                        step_id,
-                        attempt,
-                        status,
-                        child_session_id,
-                        summary_json,
-                        checks_json,
-                        started_at,
-                        finished_at
-                     FROM plan_step_attempts
-                     WHERE plan_run_id = ?1
-                       AND status = 'running'
-                       AND finished_at IS NULL
-                     ORDER BY revision DESC, step_index DESC, attempt DESC, id DESC",
-                )
-                .context("failed to prepare crashed step attempt recovery query")?;
-            statement
-                .query_map(params![plan_run_id], step_attempt_from_row)
-                .context("failed to query crashed step attempts")?
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .context("failed to collect crashed step attempts")?
-        };
-
-        for attempt in &attempts {
-            let changed = tx
-                .execute(
-                    "UPDATE plan_step_attempts
-                     SET status = 'crashed',
-                         finished_at = ?2
-                     WHERE id = ?1
-                       AND status = 'running'
-                       AND finished_at IS NULL",
-                    params![attempt.id, utc_timestamp()],
-                )
-                .context("failed to crash plan step attempt")?;
-            if changed == 0 {
-                return Err(anyhow::anyhow!(
-                    "failed to crash plan step attempt: attempt not found or already finalized"
-                ));
-            }
-        }
-
-        Ok(attempts)
+        step_attempts::crash_running_step_attempts_for_run_in_transaction(tx, plan_run_id)
     }
 
     pub fn record_step_attempt(&mut self, record: StepAttemptRecord) -> Result<i64> {
-        validate_step_attempt_start_status(&record.status)?;
-        if record.revision <= 0 {
-            return Err(anyhow::anyhow!(
-                "invalid plan step attempt revision: {}",
-                record.revision
-            ));
-        }
-        if record.step_index < 0 {
-            return Err(anyhow::anyhow!(
-                "invalid plan step attempt step index: {}",
-                record.step_index
-            ));
-        }
-        if record.step_id.is_empty() {
-            return Err(anyhow::anyhow!(
-                "invalid plan step attempt step id: step_id must not be empty"
-            ));
-        }
-        if record.attempt < 0 {
-            return Err(anyhow::anyhow!(
-                "invalid plan step attempt index: {}",
-                record.attempt
-            ));
-        }
-        self.conn
-            .execute(
-                "INSERT INTO plan_step_attempts (
-                    plan_run_id,
-                    revision,
-                    step_index,
-                    step_id,
-                    attempt,
-                    status,
-                    child_session_id,
-                    summary_json,
-                    checks_json,
-                    started_at,
-                    finished_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
-                params![
-                    record.plan_run_id,
-                    record.revision,
-                    record.step_index,
-                    record.step_id,
-                    record.attempt,
-                    record.status,
-                    record.child_session_id,
-                    record.summary_json,
-                    record.checks_json,
-                    utc_timestamp(),
-                ],
-            )
-            .context("failed to record plan step attempt")?;
-        Ok(self.conn.last_insert_rowid())
+        step_attempts::record_step_attempt(&self.conn, record)
     }
 
     pub fn update_step_attempt_status(
@@ -1106,30 +395,7 @@ impl Store {
         status: &str,
         finished_at: &str,
     ) -> Result<()> {
-        validate_step_attempt_terminal_status(status)?;
-        if finished_at.is_empty() {
-            return Err(anyhow::anyhow!(
-                "invalid plan step attempt finished_at: finished_at must not be empty"
-            ));
-        }
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE plan_step_attempts
-                 SET status = ?2,
-                     finished_at = ?3
-                 WHERE id = ?1
-                   AND status = 'running'
-                   AND finished_at IS NULL",
-                params![attempt_id, status, finished_at],
-            )
-            .context("failed to update plan step attempt")?;
-        if changed == 0 {
-            return Err(anyhow::anyhow!(
-                "failed to update plan step attempt: attempt not found or already finalized"
-            ));
-        }
-        Ok(())
+        step_attempts::update_step_attempt_status(&self.conn, attempt_id, status, finished_at)
     }
 
     pub fn update_step_attempt_child_session(
@@ -1137,23 +403,7 @@ impl Store {
         attempt_id: i64,
         child_session_id: Option<&str>,
     ) -> Result<()> {
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE plan_step_attempts
-                 SET child_session_id = ?2
-                 WHERE id = ?1
-                   AND status = 'running'
-                   AND finished_at IS NULL",
-                params![attempt_id, child_session_id],
-            )
-            .context("failed to update plan step attempt child session")?;
-        if changed == 0 {
-            return Err(anyhow::anyhow!(
-                "failed to update plan step attempt child session: attempt not found or already finalized"
-            ));
-        }
-        Ok(())
+        step_attempts::update_step_attempt_child_session(&self.conn, attempt_id, child_session_id)
     }
 
     pub fn finalize_step_attempt(
@@ -1164,42 +414,14 @@ impl Store {
         summary_json: &str,
         checks_json: &str,
     ) -> Result<()> {
-        validate_step_attempt_terminal_status(status)?;
-        if finished_at.is_empty() {
-            return Err(anyhow::anyhow!(
-                "invalid plan step attempt finished_at: finished_at must not be empty"
-            ));
-        }
-        if summary_json.is_empty() {
-            return Err(anyhow::anyhow!(
-                "invalid plan step attempt summary_json: summary_json must not be empty"
-            ));
-        }
-        if checks_json.is_empty() {
-            return Err(anyhow::anyhow!(
-                "invalid plan step attempt checks_json: checks_json must not be empty"
-            ));
-        }
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE plan_step_attempts
-                 SET status = ?2,
-                     summary_json = ?3,
-                     checks_json = ?4,
-                     finished_at = ?5
-                 WHERE id = ?1
-                   AND status = 'running'
-                   AND finished_at IS NULL",
-                params![attempt_id, status, summary_json, checks_json, finished_at],
-            )
-            .context("failed to finalize plan step attempt")?;
-        if changed == 0 {
-            return Err(anyhow::anyhow!(
-                "failed to finalize plan step attempt: attempt not found or already finalized"
-            ));
-        }
-        Ok(())
+        step_attempts::finalize_step_attempt(
+            &self.conn,
+            attempt_id,
+            status,
+            finished_at,
+            summary_json,
+            checks_json,
+        )
     }
 
     pub fn finalize_stale_step_attempts(
@@ -1207,91 +429,7 @@ impl Store {
         plan_run_id: &str,
         revision: i64,
     ) -> Result<u64> {
-        let attempts = {
-            let mut statement = self
-                .conn
-                .prepare(
-                    "SELECT id, summary_json, checks_json
-                     FROM plan_step_attempts
-                     WHERE plan_run_id = ?1
-                       AND revision = ?2
-                       AND status = 'running'
-                       AND finished_at IS NULL",
-                )
-                .context("failed to prepare stale step attempt recovery query")?;
-            statement
-                .query_map(params![plan_run_id, revision], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })
-                .context("failed to query stale step attempts")?
-                .collect::<Result<Vec<_>, _>>()
-                .context("failed to read stale step attempts")?
-        };
-
-        let mut finalized = 0;
-        for attempt in attempts {
-            let (attempt_id, summary_json, checks_json) = attempt;
-            self.finalize_step_attempt(
-                attempt_id,
-                "crashed",
-                &utc_timestamp(),
-                &summary_json,
-                &checks_json,
-            )?;
-            finalized += 1;
-        }
-        Ok(finalized)
-    }
-
-    fn claim_pending_plan_run(&mut self, stale_after_secs: u64) -> Result<Option<PlanRun>> {
-        let stale_after_secs = stale_after_secs.min(i64::MAX as u64) as i64;
-        let stale_before = unix_timestamp().saturating_sub(stale_after_secs);
-        let claimed_at = unix_timestamp();
-        let updated_at = utc_timestamp();
-        let mut statement = self
-            .conn
-            .prepare(
-                "UPDATE plan_runs
-                 SET status = 'running', claimed_at = ?2, updated_at = ?3
-                 WHERE id = (
-                     SELECT id
-                     FROM plan_runs
-                     WHERE status = 'pending'
-                       AND (claimed_at IS NULL OR claimed_at <= ?1)
-                     ORDER BY created_at ASC, id ASC
-                     LIMIT 1
-                 )
-                 AND status = 'pending'
-                 AND (claimed_at IS NULL OR claimed_at <= ?1)
-                 RETURNING
-                    id,
-                    owner_session_id,
-                    topic,
-                    trigger_source,
-                    status,
-                    revision,
-                    current_step_index,
-                    active_child_session_id,
-                    definition_json,
-                    last_failure_json,
-                    claimed_at,
-                    created_at,
-                    updated_at",
-            )
-            .context("failed to prepare plan run claim query")?;
-
-        match statement.query_row(
-            params![stale_before, claimed_at, updated_at],
-            plan_run_from_row,
-        ) {
-            Ok(plan_run) => Ok(Some(plan_run)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(error) => Err(error).context("failed to claim plan run"),
-        }
+        step_attempts::finalize_stale_step_attempts(&self.conn, plan_run_id, revision)
     }
 
     pub fn get_step_attempts(
@@ -1299,35 +437,7 @@ impl Store {
         plan_run_id: &str,
         step_index: i64,
     ) -> Result<Vec<StepAttempt>> {
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT
-                    id,
-                    plan_run_id,
-                    revision,
-                    step_index,
-                    step_id,
-                    attempt,
-                    status,
-                    child_session_id,
-                    summary_json,
-                    checks_json,
-                    started_at,
-                    finished_at
-                 FROM plan_step_attempts
-                 WHERE plan_run_id = ?1 AND step_index = ?2
-                 ORDER BY revision ASC, attempt ASC, id ASC",
-            )
-            .context("failed to prepare get_step_attempts query")?;
-
-        let attempts = statement
-            .query_map(params![plan_run_id, step_index], step_attempt_from_row)
-            .context("failed to query plan step attempts")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to collect plan step attempts")?;
-
-        Ok(attempts)
+        step_attempts::get_step_attempts(&self.conn, plan_run_id, step_index)
     }
 
     pub fn create_subscription_for_session(
@@ -1337,15 +447,7 @@ impl Store {
         path: &str,
         filter: Option<&str>,
     ) -> Result<i64> {
-        let timestamp = format_system_time(std::time::SystemTime::now());
-        self.conn
-            .execute(
-                "INSERT INTO subscriptions (session_id, topic, path, filter, activated_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![session_id, topic, path, filter, timestamp, timestamp],
-            )
-            .context("failed to insert subscription")?;
-        Ok(self.conn.last_insert_rowid())
+        subscriptions::create_subscription_for_session(&self.conn, session_id, topic, path, filter)
     }
 
     pub fn create_subscription(
@@ -1364,29 +466,7 @@ impl Store {
         path: &str,
         filter: Option<&str>,
     ) -> Result<usize> {
-        let count = if filter.is_some() {
-            self.conn
-                .execute(
-                    "DELETE FROM subscriptions
-                     WHERE COALESCE(session_id, '') = COALESCE(?1, '')
-                       AND topic = ?2
-                       AND path = ?3
-                       AND COALESCE(filter, '') = COALESCE(?4, '')",
-                    params![session_id, topic, path, filter],
-                )
-                .context("failed to delete subscription")?
-        } else {
-            self.conn
-                .execute(
-                    "DELETE FROM subscriptions
-                     WHERE COALESCE(session_id, '') = COALESCE(?1, '')
-                       AND topic = ?2
-                       AND path = ?3",
-                    params![session_id, topic, path],
-                )
-                .context("failed to delete subscription")?
-        };
-        Ok(count)
+        subscriptions::delete_subscription_for_session(&self.conn, session_id, topic, path, filter)
     }
 
     pub fn delete_subscription(&mut self, topic: &str, path: &str) -> Result<usize> {
@@ -1394,189 +474,35 @@ impl Store {
     }
 
     pub fn list_subscriptions(&self, topic: Option<&str>) -> Result<Vec<SubscriptionRow>> {
-        let mut statement = if topic.is_some() {
-            self.conn
-                .prepare(
-                    "SELECT id, session_id, topic, path, filter, activated_at, updated_at
-                     FROM subscriptions
-                     WHERE topic = ?1
-                     ORDER BY CASE WHEN updated_at > activated_at THEN updated_at ELSE activated_at END ASC, id ASC",
-                )
-                .context("failed to prepare list_subscriptions query")?
-        } else {
-            self.conn
-                .prepare(
-                    "SELECT id, session_id, topic, path, filter, activated_at, updated_at
-                     FROM subscriptions
-                     ORDER BY CASE WHEN updated_at > activated_at THEN updated_at ELSE activated_at END ASC, id ASC",
-                )
-                .context("failed to prepare list_subscriptions query")?
-        };
-
-        let rows = if let Some(topic) = topic {
-            statement
-                .query_map(params![topic], |row| {
-                    Ok(SubscriptionRow {
-                        id: row.get(0)?,
-                        session_id: row.get(1)?,
-                        topic: row.get(2)?,
-                        path: row.get(3)?,
-                        filter: row.get(4)?,
-                        activated_at: row.get(5)?,
-                        updated_at: row.get(6)?,
-                    })
-                })
-                .context("failed to query subscriptions")?
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .context("failed to collect subscriptions")?
-        } else {
-            statement
-                .query_map([], |row| {
-                    Ok(SubscriptionRow {
-                        id: row.get(0)?,
-                        session_id: row.get(1)?,
-                        topic: row.get(2)?,
-                        path: row.get(3)?,
-                        filter: row.get(4)?,
-                        activated_at: row.get(5)?,
-                        updated_at: row.get(6)?,
-                    })
-                })
-                .context("failed to query subscriptions")?
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .context("failed to collect subscriptions")?
-        };
-
-        Ok(rows)
+        subscriptions::list_subscriptions(&self.conn, topic)
     }
 
     pub fn list_subscriptions_for_session(&self, session_id: &str) -> Result<Vec<SubscriptionRow>> {
-        let mut rows = self.list_subscriptions(None)?;
-        rows.retain(|row| {
-            row.session_id
-                .as_deref()
-                .is_none_or(|value| value == session_id)
-        });
-        rows.sort_by(|left, right| {
-            let left_effective = if left.updated_at >= left.activated_at {
-                &left.updated_at
-            } else {
-                &left.activated_at
-            };
-            let right_effective = if right.updated_at >= right.activated_at {
-                &right.updated_at
-            } else {
-                &right.activated_at
-            };
-            left_effective
-                .cmp(right_effective)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-
-        let mut deduped = Vec::new();
-        use std::collections::HashMap;
-        let mut chosen: HashMap<(String, Option<String>), SubscriptionRow> = HashMap::new();
-        for row in rows {
-            let key = (row.path.clone(), row.filter.clone());
-            let replace = match chosen.get(&key) {
-                None => true,
-                Some(existing) => {
-                    let existing_is_global = existing.session_id.is_none();
-                    let row_is_session = row.session_id.as_deref() == Some(session_id);
-                    row_is_session && existing_is_global
-                }
-            };
-            if replace {
-                chosen.insert(key, row);
-            }
-        }
-        deduped.extend(chosen.into_values());
-        deduped.sort_by(|left, right| {
-            let left_effective = if left.updated_at >= left.activated_at {
-                &left.updated_at
-            } else {
-                &left.activated_at
-            };
-            let right_effective = if right.updated_at >= right.activated_at {
-                &right.updated_at
-            } else {
-                &right.activated_at
-            };
-            left_effective
-                .cmp(right_effective)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        Ok(deduped)
+        subscriptions::list_subscriptions_for_session(&self.conn, session_id)
     }
 
     pub fn refresh_subscription_timestamps(&mut self) -> Result<u64> {
         #[cfg(test)]
         {
-            self.refresh_subscription_timestamps_with(|path| {
+            return self.refresh_subscription_timestamps_with(|path| {
                 std::fs::metadata(path)
                     .and_then(|metadata| metadata.modified())
                     .ok()
-            })
+            });
         }
 
         #[cfg(not(test))]
         {
-            let rows = self.list_subscriptions(None)?;
-            let mut refreshed = 0u64;
-
-            for row in rows {
-                let path = std::path::Path::new(&row.path);
-                let Ok(metadata) = std::fs::metadata(path) else {
-                    continue;
-                };
-                let Ok(modified) = metadata.modified() else {
-                    continue;
-                };
-                let updated_at = format_system_time(modified);
-                if updated_at > row.updated_at {
-                    self.conn
-                        .execute(
-                            "UPDATE subscriptions SET updated_at = ?1 WHERE id = ?2",
-                            params![updated_at, row.id],
-                        )
-                        .context("failed to update subscription timestamp")?;
-                    refreshed += 1;
-                }
-            }
-
-            Ok(refreshed)
+            subscriptions::refresh_subscription_timestamps(&self.conn)
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn refresh_subscription_timestamps_with<F>(
-        &mut self,
-        mut modified_for: F,
-    ) -> Result<u64>
+    pub(crate) fn refresh_subscription_timestamps_with<F>(&mut self, modified_for: F) -> Result<u64>
     where
         F: FnMut(&Path) -> Option<SystemTime>,
     {
-        let rows = self.list_subscriptions(None)?;
-        let mut refreshed = 0u64;
-
-        for row in rows {
-            let path = std::path::Path::new(&row.path);
-            let Some(modified) = modified_for(path) else {
-                continue;
-            };
-            let updated_at = format_system_time(modified);
-            if updated_at > row.updated_at {
-                self.conn
-                    .execute(
-                        "UPDATE subscriptions SET updated_at = ?1 WHERE id = ?2",
-                        params![updated_at, row.id],
-                    )
-                    .context("failed to update subscription timestamp")?;
-                refreshed += 1;
-            }
-        }
-
-        Ok(refreshed)
+        subscriptions::refresh_subscription_timestamps_with(&self.conn, modified_for)
     }
 }
 
@@ -1585,173 +511,6 @@ fn unix_timestamp() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
-}
-
-fn ensure_messages_claimed_at_column(conn: &Connection) -> Result<()> {
-    if has_column(conn, "messages", "claimed_at")? {
-        return Ok(());
-    }
-
-    if let Err(error) = conn.execute("ALTER TABLE messages ADD COLUMN claimed_at INTEGER", [])
-        && !has_column(conn, "messages", "claimed_at")?
-    {
-        return Err(error).context("failed to migrate messages.claimed_at column");
-    }
-
-    Ok(())
-}
-
-fn ensure_sessions_parent_session_id_column(conn: &Connection) -> Result<()> {
-    if has_column(conn, "sessions", "parent_session_id")? {
-        return Ok(());
-    }
-
-    if let Err(error) = conn.execute(
-        "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT REFERENCES sessions(id)",
-        [],
-    ) && !has_column(conn, "sessions", "parent_session_id")?
-    {
-        return Err(error).context("failed to migrate sessions.parent_session_id column");
-    }
-
-    Ok(())
-}
-
-fn ensure_plan_runs_table(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS plan_runs (
-            id TEXT PRIMARY KEY,
-            owner_session_id TEXT NOT NULL,
-            topic TEXT,
-            trigger_source TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
-            revision INTEGER NOT NULL DEFAULT 1,
-            current_step_index INTEGER NOT NULL DEFAULT 0,
-            active_child_session_id TEXT,
-            definition_json TEXT NOT NULL,
-            last_failure_json TEXT,
-            claimed_at INTEGER,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY(owner_session_id) REFERENCES sessions(id)
-        );
-        CREATE TABLE IF NOT EXISTS plan_step_attempts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            plan_run_id TEXT NOT NULL,
-            revision INTEGER NOT NULL,
-            step_index INTEGER NOT NULL,
-            step_id TEXT NOT NULL,
-            attempt INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            child_session_id TEXT,
-            summary_json TEXT NOT NULL,
-            checks_json TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            finished_at TEXT,
-            FOREIGN KEY(plan_run_id) REFERENCES plan_runs(id) ON DELETE CASCADE
-        );
-        "#,
-    )
-    .context("failed to initialize plan engine tables")?;
-    ensure_plan_run_column(conn, "owner_session_id", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_plan_run_column(conn, "topic", "TEXT")?;
-    ensure_plan_run_column(conn, "trigger_source", "TEXT")?;
-    ensure_plan_run_column(conn, "status", "TEXT NOT NULL DEFAULT 'pending'")?;
-    ensure_plan_run_column(conn, "revision", "INTEGER NOT NULL DEFAULT 1")?;
-    ensure_plan_run_column(conn, "current_step_index", "INTEGER NOT NULL DEFAULT 0")?;
-    ensure_plan_run_column(conn, "active_child_session_id", "TEXT")?;
-    ensure_plan_run_column(conn, "definition_json", "TEXT NOT NULL DEFAULT '{}'")?;
-    ensure_plan_run_column(conn, "last_failure_json", "TEXT")?;
-    ensure_plan_run_column(conn, "claimed_at", "INTEGER")?;
-    ensure_plan_run_column(conn, "created_at", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_plan_run_column(conn, "updated_at", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_plan_step_attempt_column(conn, "plan_run_id", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_plan_step_attempt_column(conn, "revision", "INTEGER NOT NULL DEFAULT 1")?;
-    ensure_plan_step_attempt_column(conn, "step_index", "INTEGER NOT NULL DEFAULT 0")?;
-    ensure_plan_step_attempt_column(conn, "step_id", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_plan_step_attempt_column(conn, "attempt", "INTEGER NOT NULL DEFAULT 0")?;
-    ensure_plan_step_attempt_column(conn, "status", "TEXT NOT NULL DEFAULT 'running'")?;
-    ensure_plan_step_attempt_column(conn, "child_session_id", "TEXT")?;
-    ensure_plan_step_attempt_column(conn, "summary_json", "TEXT NOT NULL DEFAULT '{}'")?;
-    ensure_plan_step_attempt_column(conn, "checks_json", "TEXT NOT NULL DEFAULT '[]'")?;
-    ensure_plan_step_attempt_column(conn, "started_at", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_plan_step_attempt_column(conn, "finished_at", "TEXT")?;
-    cleanup_legacy_plan_rows(conn)?;
-    conn.execute_batch(
-        r#"
-        CREATE INDEX IF NOT EXISTS idx_plan_runs_owner_session_created_at
-            ON plan_runs(owner_session_id, created_at, id);
-        CREATE INDEX IF NOT EXISTS idx_plan_runs_status_claimed_at
-            ON plan_runs(status, claimed_at, id);
-        DROP INDEX IF EXISTS idx_plan_step_attempts_run_step_attempt;
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_step_attempts_run_step_attempt
-            ON plan_step_attempts(plan_run_id, revision, step_index, attempt);
-        CREATE TRIGGER IF NOT EXISTS trg_plan_runs_owner_session_fk
-            BEFORE INSERT ON plan_runs
-            WHEN NOT EXISTS (
-                SELECT 1 FROM sessions WHERE id = NEW.owner_session_id
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'foreign key constraint failed');
-            END;
-        CREATE TRIGGER IF NOT EXISTS trg_plan_runs_owner_session_update_fk
-            BEFORE UPDATE OF owner_session_id ON plan_runs
-            WHEN NOT EXISTS (
-                SELECT 1 FROM sessions WHERE id = NEW.owner_session_id
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'foreign key constraint failed');
-            END;
-        CREATE TRIGGER IF NOT EXISTS trg_plan_runs_restrict_update_id
-            BEFORE UPDATE OF id ON plan_runs
-            WHEN EXISTS (
-                SELECT 1 FROM plan_step_attempts WHERE plan_run_id = OLD.id
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'foreign key constraint failed');
-            END;
-        CREATE TRIGGER IF NOT EXISTS trg_plan_step_attempts_plan_run_fk
-            BEFORE INSERT ON plan_step_attempts
-            WHEN NOT EXISTS (
-                SELECT 1 FROM plan_runs WHERE id = NEW.plan_run_id
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'foreign key constraint failed');
-            END;
-        CREATE TRIGGER IF NOT EXISTS trg_plan_step_attempts_plan_run_update_fk
-            BEFORE UPDATE OF plan_run_id ON plan_step_attempts
-            WHEN NOT EXISTS (
-                SELECT 1 FROM plan_runs WHERE id = NEW.plan_run_id
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'foreign key constraint failed');
-            END;
-        CREATE TRIGGER IF NOT EXISTS trg_sessions_restrict_delete_plan_runs
-            BEFORE DELETE ON sessions
-            WHEN EXISTS (
-                SELECT 1 FROM plan_runs WHERE owner_session_id = OLD.id
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'foreign key constraint failed');
-            END;
-        CREATE TRIGGER IF NOT EXISTS trg_sessions_restrict_update_id
-            BEFORE UPDATE OF id ON sessions
-            WHEN NEW.id != OLD.id AND EXISTS (
-                SELECT 1 FROM plan_runs WHERE owner_session_id = OLD.id
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'foreign key constraint failed');
-            END;
-        CREATE TRIGGER IF NOT EXISTS trg_plan_runs_step_attempts_cascade
-            AFTER DELETE ON plan_runs
-            BEGIN
-                DELETE FROM plan_step_attempts WHERE plan_run_id = OLD.id;
-            END;
-        "#,
-    )
-    .context("failed to initialize plan engine indexes")?;
-    Ok(())
 }
 
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -1775,92 +534,6 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(false)
 }
 
-fn ensure_plan_run_column(conn: &Connection, column: &str, declaration: &str) -> Result<()> {
-    if !has_column(conn, "plan_runs", column)? {
-        conn.execute(
-            &format!("ALTER TABLE plan_runs ADD COLUMN {column} {declaration}"),
-            [],
-        )
-        .with_context(|| format!("failed to add plan_runs.{column} column"))?;
-    }
-    Ok(())
-}
-
-fn ensure_plan_step_attempt_column(
-    conn: &Connection,
-    column: &str,
-    declaration: &str,
-) -> Result<()> {
-    if !has_column(conn, "plan_step_attempts", column)? {
-        conn.execute(
-            &format!("ALTER TABLE plan_step_attempts ADD COLUMN {column} {declaration}"),
-            [],
-        )
-        .with_context(|| format!("failed to add plan_step_attempts.{column} column"))?;
-    }
-    Ok(())
-}
-
-fn cleanup_legacy_plan_rows(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        r#"
-        DELETE FROM plan_step_attempts
-         WHERE plan_run_id NOT IN (SELECT id FROM plan_runs)
-            OR revision <= 0
-            OR step_index < 0
-            OR attempt < 0
-            OR step_id = ''
-            OR started_at = ''
-            OR status NOT IN ('running', 'passed', 'failed', 'crashed')
-            OR (status = 'running' AND finished_at IS NOT NULL)
-            OR (status IN ('passed', 'failed', 'crashed') AND (finished_at IS NULL OR finished_at = ''));
-        DELETE FROM plan_runs
-         WHERE owner_session_id NOT IN (SELECT id FROM sessions)
-            OR revision <= 0
-            OR current_step_index < 0
-            OR created_at = ''
-            OR updated_at = ''
-            OR definition_json = ''
-            OR status NOT IN ('pending', 'running', 'waiting_t2', 'completed', 'failed');
-        DELETE FROM plan_step_attempts
-         WHERE plan_run_id NOT IN (SELECT id FROM plan_runs)
-            OR revision <= 0
-            OR step_index < 0
-            OR attempt < 0
-            OR step_id = ''
-            OR started_at = ''
-            OR status NOT IN ('running', 'passed', 'failed', 'crashed')
-            OR (status = 'running' AND finished_at IS NOT NULL)
-            OR (status IN ('passed', 'failed', 'crashed') AND (finished_at IS NULL OR finished_at = ''));
-        DELETE FROM plan_step_attempts
-         WHERE rowid NOT IN (
-             SELECT rowid
-             FROM (
-                 SELECT
-                     rowid,
-                     ROW_NUMBER() OVER (
-                         PARTITION BY plan_run_id, revision, step_index, attempt
-                         ORDER BY
-                             CASE
-                                 WHEN status IN ('passed', 'failed', 'crashed') THEN 1
-                                 ELSE 0
-                             END DESC,
-                             CASE
-                                 WHEN finished_at IS NOT NULL AND finished_at != '' THEN 1
-                                 ELSE 0
-                             END DESC,
-                             rowid DESC
-                     ) AS row_number
-                 FROM plan_step_attempts
-             )
-             WHERE row_number = 1
-         );
-        "#,
-    )
-    .context("failed to clean legacy plan rows")?;
-    Ok(())
-}
-
 #[cfg(test)]
 fn has_table(conn: &Connection, table: &str) -> Result<bool> {
     let mut statement = conn
@@ -1871,24 +544,6 @@ fn has_table(conn: &Connection, table: &str) -> Result<bool> {
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
         Err(error) => Err(error).context("failed to inspect sqlite table catalog"),
     }
-}
-
-fn plan_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanRun> {
-    Ok(PlanRun {
-        id: row.get(0)?,
-        owner_session_id: row.get(1)?,
-        topic: row.get(2)?,
-        trigger_source: row.get(3)?,
-        status: row.get(4)?,
-        revision: row.get(5)?,
-        current_step_index: row.get(6)?,
-        active_child_session_id: row.get(7)?,
-        definition_json: row.get(8)?,
-        last_failure_json: row.get(9)?,
-        claimed_at: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
-    })
 }
 
 fn step_attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepAttempt> {
@@ -1906,31 +561,6 @@ fn step_attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepAttemp
         started_at: row.get(10)?,
         finished_at: row.get(11)?,
     })
-}
-
-fn validate_plan_run_status(status: &str) -> Result<()> {
-    match status {
-        "pending" | "running" | "waiting_t2" | "completed" | "failed" => Ok(()),
-        other => Err(anyhow::anyhow!("invalid plan run status: {other}")),
-    }
-}
-
-fn validate_step_attempt_start_status(status: &str) -> Result<()> {
-    match status {
-        "running" => Ok(()),
-        other => Err(anyhow::anyhow!(
-            "invalid plan step attempt start status: {other}"
-        )),
-    }
-}
-
-fn validate_step_attempt_terminal_status(status: &str) -> Result<()> {
-    match status {
-        "passed" | "failed" | "crashed" => Ok(()),
-        other => Err(anyhow::anyhow!(
-            "invalid plan step attempt terminal status: {other}"
-        )),
-    }
 }
 
 pub fn format_system_time(time: SystemTime) -> String {
@@ -2132,7 +762,7 @@ mod tests {
             .unwrap();
         assert!(store.get_plan_run("plan-1").unwrap().is_none());
         assert!(store.get_step_attempts("plan-1", 0).unwrap().is_empty());
-        ensure_plan_runs_table(&store.conn).unwrap();
+        migrations::ensure_plan_runs_table(&store.conn).unwrap();
         assert!(has_table(&store.conn, "plan_runs").unwrap());
         assert!(has_table(&store.conn, "plan_step_attempts").unwrap());
 

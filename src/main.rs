@@ -6,7 +6,10 @@ use autopoiesis::subscription::{self, SubscriptionFilter, SubscriptionRecord};
 use autopoiesis::util::{
     PlainMessageFormatter, STDERR_USER_OUTPUT_TARGET, STDOUT_USER_OUTPUT_TARGET,
 };
-use autopoiesis::{agent, auth, cli, config, llm, session, store, turn};
+use autopoiesis::{
+    agent, auth, build_openai_provider_factory, build_turn_builder_for_subscriptions, cli, config,
+    load_subscriptions_for_session, session, store,
+};
 use clap::{Args, Parser, Subcommand};
 use reqwest::Client;
 use tracing::{info, warn};
@@ -586,24 +589,9 @@ async fn main() -> Result<()> {
             queue.create_session(&session_id, Some(r#"{"source":"cli"}"#))?;
 
             let provider_config = config.clone();
-            let provider_config_for_provider = provider_config.clone();
             let http_client = Client::new();
-            let mut provider_factory = move || {
-                let provider_config = provider_config_for_provider.clone();
-                let client = http_client.clone();
-                async move {
-                    let api_key = auth::get_valid_token().await?;
-                    Ok::<llm::openai::OpenAIProvider, anyhow::Error>(
-                        llm::openai::OpenAIProvider::with_client(
-                            client,
-                            api_key,
-                            provider_config.base_url,
-                            provider_config.model,
-                            provider_config.reasoning_effort,
-                        ),
-                    )
-                }
-            };
+            let mut provider_factory =
+                build_openai_provider_factory(http_client, provider_config.clone());
 
             let mut token_sink = cli::CliTokenSink::new();
             let mut approval_handler = cli::CliApprovalHandler::new();
@@ -628,20 +616,11 @@ async fn main() -> Result<()> {
                     }
 
                     queue.enqueue_message(&session_id, "user", prompt, "cli")?;
-                    let subscriptions = queue
-                        .list_subscriptions_for_session(&session_id)?
-                        .into_iter()
-                        .map(autopoiesis::subscription::SubscriptionRecord::from_row)
-                        .collect::<Result<Vec<_>>>()?;
-                    let mut turn_builder = {
-                        let provider_config = provider_config.clone();
-                        move || {
-                            turn::build_turn_for_config_with_subscriptions(
-                                &provider_config,
-                                &subscriptions,
-                            )
-                        }
-                    };
+                    let subscriptions = load_subscriptions_for_session(&mut queue, &session_id)?;
+                    let mut turn_builder = build_turn_builder_for_subscriptions(
+                        provider_config.clone(),
+                        subscriptions,
+                    );
                     if let Some(agent::TurnVerdict::Denied { reason, gate_id }) =
                         agent::drain_queue_with_stats_fresh_turns(
                             &mut queue,
@@ -658,27 +637,16 @@ async fn main() -> Result<()> {
                         warn!(
                             target: STDERR_USER_OUTPUT_TARGET,
                             "{}",
-                            cli::format_denial_message(&reason, &gate_id)
+                            agent::format_denial_message(&reason, &gate_id)
                         );
                     }
                 }
             } else {
                 let prompt = cli.prompt.join(" ");
                 queue.enqueue_message(&session_id, "user", &prompt, "cli")?;
-                let subscriptions = queue
-                    .list_subscriptions_for_session(&session_id)?
-                    .into_iter()
-                    .map(autopoiesis::subscription::SubscriptionRecord::from_row)
-                    .collect::<Result<Vec<_>>>()?;
-                let mut turn_builder = {
-                    let provider_config = provider_config.clone();
-                    move || {
-                        turn::build_turn_for_config_with_subscriptions(
-                            &provider_config,
-                            &subscriptions,
-                        )
-                    }
-                };
+                let subscriptions = load_subscriptions_for_session(&mut queue, &session_id)?;
+                let mut turn_builder =
+                    build_turn_builder_for_subscriptions(provider_config.clone(), subscriptions);
                 if let Some(agent::TurnVerdict::Denied { reason, gate_id }) =
                     agent::drain_queue_with_stats_fresh_turns(
                         &mut queue,
@@ -695,7 +663,7 @@ async fn main() -> Result<()> {
                     warn!(
                         target: STDERR_USER_OUTPUT_TARGET,
                         "{}",
-                        cli::format_denial_message(&reason, &gate_id)
+                        agent::format_denial_message(&reason, &gate_id)
                     );
                 }
             }

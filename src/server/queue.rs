@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::warn;
 
-use crate::auth as root_auth;
+use crate::session_runtime::drain::{self, SharedStoreDrainBackend};
+use crate::session_runtime::factory;
 use crate::{agent, llm, session, turn};
 
 use super::ServerState;
@@ -55,11 +56,11 @@ pub(super) async fn drain_session_queue<F, Fut, P, TS, AH>(
     approval_handler: &mut AH,
 ) -> Result<Option<agent::TurnVerdict>>
 where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<P>>,
-    P: llm::LlmProvider,
-    TS: agent::TokenSink + Send + ?Sized,
-    AH: agent::ApprovalHandler + ?Sized,
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<P>> + Send,
+    P: llm::LlmProvider + Send,
+    TS: agent::TokenSink + Send,
+    AH: agent::ApprovalHandler + Send,
 {
     let session_lock = state.session_lock(&session_id);
     let _session_lock_lease = SessionLockLease {
@@ -68,92 +69,21 @@ where
         lock: Arc::downgrade(&session_lock),
     };
     let _session_guard = session_lock.lock().await;
-    let mut completed_agent_turn = false;
-    let mut first_denial: Option<agent::TurnVerdict> = None;
-    let mut last_assistant_response = None;
 
     let mut history = session::Session::new(state.sessions_dir.join(&session_id))
         .with_context(|| format!("failed to open session {session_id}"))?;
     history.load_today()?;
-    loop {
-        let message = {
-            let mut store = state.store.lock().await;
-            store.dequeue_next_message(&session_id)?
-        };
-
-        let Some(message) = message else {
-            break;
-        };
-        let outcome = agent::process_message(
-            &message,
-            &mut history,
-            turn,
-            make_provider,
-            token_sink,
-            approval_handler,
-        )
-        .await;
-
-        match outcome {
-            Ok(agent::QueueOutcome::Agent(verdict)) => {
-                {
-                    let mut store = state.store.lock().await;
-                    store.mark_processed(message.id)?;
-                }
-
-                if !matches!(verdict, agent::TurnVerdict::Denied { .. }) {
-                    last_assistant_response = crate::spawn::latest_assistant_response(&history);
-                    completed_agent_turn = true;
-                }
-
-                match verdict {
-                    agent::TurnVerdict::Executed(_) => {}
-                    agent::TurnVerdict::Approved { .. } => {
-                        info!(
-                            message_id = message.id,
-                            "command approved by user and executed"
-                        );
-                    }
-                    agent::TurnVerdict::Denied { reason, gate_id } => {
-                        warn!(message_id = message.id, %gate_id, "turn denied");
-                        if first_denial.is_none() {
-                            first_denial = Some(agent::TurnVerdict::Denied { reason, gate_id });
-                        }
-                    }
-                }
-            }
-            Ok(agent::QueueOutcome::Stored) => {
-                let mut store = state.store.lock().await;
-                store.mark_processed(message.id)?;
-            }
-            Ok(agent::QueueOutcome::UnsupportedRole(role)) => {
-                warn!(message_id = message.id, %role, "unsupported queued role");
-                let mut store = state.store.lock().await;
-                store.mark_processed(message.id)?;
-            }
-            Err(error) => {
-                let mut store = state.store.lock().await;
-                store.mark_failed(message.id)?;
-                return Err(error);
-            }
-        }
-    }
-
-    if crate::spawn::should_enqueue_child_completion(completed_agent_turn) {
-        let mut store = state.store.lock().await;
-        let _ = crate::spawn::enqueue_child_completion(
-            &mut store,
-            &session_id,
-            &history,
-            last_assistant_response.as_deref(),
-        )?;
-    }
-
-    if completed_agent_turn {
-        Ok(None)
-    } else {
-        Ok(first_denial)
-    }
+    let mut backend = SharedStoreDrainBackend::new(state.store.clone());
+    drain::drain_queue(
+        &mut backend,
+        &session_id,
+        &mut history,
+        turn,
+        make_provider,
+        token_sink,
+        approval_handler,
+    )
+    .await
 }
 
 #[tracing::instrument(level = "debug", skip(state, turn_builder, make_provider, token_sink, approval_handler), fields(session_id = %session_id))]
@@ -166,12 +96,12 @@ pub(super) async fn drain_session_queue_with_turn_builder<F, Fut, P, TS, AH, TB>
     approval_handler: &mut AH,
 ) -> Result<Option<agent::TurnVerdict>>
 where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<P>>,
-    P: llm::LlmProvider,
-    TS: agent::TokenSink + Send + ?Sized,
-    AH: agent::ApprovalHandler + ?Sized,
-    TB: FnMut() -> Result<turn::Turn>,
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<P>> + Send,
+    P: llm::LlmProvider + Send,
+    TS: agent::TokenSink + Send,
+    AH: agent::ApprovalHandler + Send,
+    TB: FnMut() -> Result<turn::Turn> + Send,
 {
     let session_lock = state.session_lock(&session_id);
     let _session_lock_lease = SessionLockLease {
@@ -184,143 +114,36 @@ where
     let mut history = session::Session::new(state.sessions_dir.join(&session_id))
         .with_context(|| format!("failed to open session {session_id}"))?;
     history.load_today()?;
-
-    let mut completed_agent_turn = false;
-    let mut first_denial: Option<agent::TurnVerdict> = None;
-    let mut last_assistant_response = None;
-
-    loop {
-        let message = {
-            let mut store = state.store.lock().await;
-            store.dequeue_next_message(&session_id)?
-        };
-
-        let Some(message) = message else {
-            break;
-        };
-
-        let outcome = agent::process_message_with_turn_builder(
-            &message,
-            &mut history,
-            turn_builder,
-            make_provider,
-            token_sink,
-            approval_handler,
-        )
-        .await;
-
-        match outcome {
-            Ok(agent::QueueOutcome::Agent(verdict)) => {
-                {
-                    let mut store = state.store.lock().await;
-                    store.mark_processed(message.id)?;
-                }
-
-                if !matches!(verdict, agent::TurnVerdict::Denied { .. }) {
-                    last_assistant_response = crate::spawn::latest_assistant_response(&history);
-                    completed_agent_turn = true;
-                }
-
-                match verdict {
-                    agent::TurnVerdict::Executed(_) => {}
-                    agent::TurnVerdict::Approved { .. } => {
-                        info!(
-                            message_id = message.id,
-                            "command approved by user and executed"
-                        );
-                    }
-                    agent::TurnVerdict::Denied { reason, gate_id } => {
-                        warn!(message_id = message.id, %gate_id, "turn denied");
-                        if first_denial.is_none() {
-                            first_denial = Some(agent::TurnVerdict::Denied { reason, gate_id });
-                        }
-                    }
-                }
-            }
-            Ok(agent::QueueOutcome::Stored) => {
-                let mut store = state.store.lock().await;
-                store.mark_processed(message.id)?;
-            }
-            Ok(agent::QueueOutcome::UnsupportedRole(role)) => {
-                warn!(message_id = message.id, %role, "unsupported queued role");
-                let mut store = state.store.lock().await;
-                store.mark_processed(message.id)?;
-            }
-            Err(error) => {
-                let mut store = state.store.lock().await;
-                store.mark_failed(message.id)?;
-                return Err(error);
-            }
-        }
-    }
-
-    if crate::spawn::should_enqueue_child_completion(completed_agent_turn) {
-        let mut store = state.store.lock().await;
-        let _ = crate::spawn::enqueue_child_completion(
-            &mut store,
-            &session_id,
-            &history,
-            last_assistant_response.as_deref(),
-        )?;
-    }
-
-    if completed_agent_turn {
-        Ok(None)
-    } else {
-        Ok(first_denial)
-    }
+    let mut backend = SharedStoreDrainBackend::new(state.store.clone());
+    let (verdict, _, _) = drain::drain_queue_with_stats_fresh_turns(
+        &mut backend,
+        &session_id,
+        &mut history,
+        turn_builder,
+        make_provider,
+        token_sink,
+        approval_handler,
+    )
+    .await?;
+    Ok(verdict)
 }
 
 pub(super) fn spawn_http_queue_worker(state: ServerState, session_id: String) {
     tokio::spawn(async move {
         let subscriptions = {
-            let store = state.store.lock().await;
-            match store.list_subscriptions_for_session(&session_id) {
-                Ok(subscriptions) => match subscriptions
-                    .into_iter()
-                    .map(crate::subscription::SubscriptionRecord::from_row)
-                    .collect::<Result<Vec<_>>>()
-                {
-                    Ok(subscriptions) => subscriptions,
-                    Err(error) => {
-                        warn!(
-                            %session_id,
-                            %error,
-                            "failed to materialize subscriptions for queue turn"
-                        );
-                        return;
-                    }
-                },
+            let mut store = state.store.lock().await;
+            match factory::load_subscriptions_for_session(&mut store, &session_id) {
+                Ok(subscriptions) => subscriptions,
                 Err(error) => {
                     warn!(%session_id, %error, "failed to load subscriptions for queue turn");
                     return;
                 }
             }
         };
-        let mut turn_builder = {
-            let config = state.config.clone();
-            move || turn::build_turn_for_config_with_subscriptions(&config, &subscriptions)
-        };
-        let mut provider_factory = {
-            let client = state.http_client.clone();
-            let config = state.config.clone();
-            move || {
-                let client = client.clone();
-                let config = config.clone();
-                async move {
-                    let api_key = root_auth::get_valid_token().await?;
-                    Ok::<llm::openai::OpenAIProvider, anyhow::Error>(
-                        llm::openai::OpenAIProvider::with_client(
-                            client,
-                            api_key,
-                            config.base_url,
-                            config.model,
-                            config.reasoning_effort,
-                        ),
-                    )
-                }
-            }
-        };
+        let mut turn_builder =
+            factory::build_turn_builder_for_subscriptions(state.config.clone(), subscriptions);
+        let mut provider_factory =
+            factory::build_openai_provider_factory(state.http_client.clone(), state.config.clone());
         let mut token_sink = NoopTokenSink;
         let mut approval_handler = RejectApprovalHandler;
         match drain_session_queue_with_turn_builder(

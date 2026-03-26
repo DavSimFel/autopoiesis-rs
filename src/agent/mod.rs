@@ -16,7 +16,8 @@ mod queue;
 pub(crate) mod shell_execute;
 mod spawn;
 
-pub use loop_impl::{QueueOutcome, TurnVerdict, format_denial_message, run_agent_loop};
+pub use crate::session_runtime::drain::format_denial_message;
+pub use loop_impl::{QueueOutcome, TurnVerdict, run_agent_loop};
 pub use queue::drain_queue;
 pub use spawn::spawn_and_drain;
 pub(crate) use spawn::{SpawnDrainContext, finish_spawned_child_drain};
@@ -69,11 +70,11 @@ pub async fn process_message<F, Fut, P, TS, AH>(
     approval_handler: &mut AH,
 ) -> Result<QueueOutcome>
 where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<P>>,
-    P: LlmProvider,
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<P>> + Send,
+    P: LlmProvider + Send,
     TS: TokenSink + Send + ?Sized,
-    AH: ApprovalHandler + ?Sized,
+    AH: ApprovalHandler + Send + ?Sized,
 {
     queue::process_queued_message(
         message,
@@ -95,12 +96,12 @@ pub async fn process_message_with_turn_builder<F, Fut, P, TS, AH, TB>(
     approval_handler: &mut AH,
 ) -> Result<QueueOutcome>
 where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<P>>,
-    P: LlmProvider,
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<P>> + Send,
+    P: LlmProvider + Send,
     TS: TokenSink + Send + ?Sized,
-    AH: ApprovalHandler + ?Sized,
-    TB: FnMut() -> Result<Turn>,
+    AH: ApprovalHandler + Send + ?Sized,
+    TB: FnMut() -> Result<Turn> + Send,
 {
     queue::process_queued_message_with_turn_builder(
         message,
@@ -123,10 +124,10 @@ pub async fn drain_queue_with_stats_fresh_turns<F, Fut, P, TB>(
     approval_handler: &mut (dyn ApprovalHandler + Send),
 ) -> Result<(Option<TurnVerdict>, bool, Option<String>)>
 where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<P>>,
-    P: LlmProvider,
-    TB: FnMut() -> Result<Turn>,
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<P>> + Send,
+    P: LlmProvider + Send,
+    TB: FnMut() -> Result<Turn> + Send,
 {
     queue::drain_queue_with_stats_fresh_turns(
         store,

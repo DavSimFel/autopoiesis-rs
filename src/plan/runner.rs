@@ -280,7 +280,7 @@ async fn run_check(
     call_id_prefix: &str,
     check: &ShellCheckSpec,
     session: &Session,
-    approval_handler: &mut (dyn ApprovalHandler + Send),
+    approval_handler: &mut dyn ApprovalHandler,
 ) -> CheckOutcome {
     let call = build_shell_call(
         &check.command,
@@ -341,7 +341,7 @@ pub(crate) async fn run_checks(
     call_id_prefix: &str,
     checks: &[ShellCheckSpec],
     session: &Session,
-    approval_handler: &mut (dyn ApprovalHandler + Send),
+    approval_handler: &mut dyn ApprovalHandler,
 ) -> Vec<CheckOutcome> {
     let mut outcomes = Vec::with_capacity(checks.len());
     for check in checks {
@@ -519,9 +519,9 @@ pub async fn run_plan_step<F, Fut, P, TS>(
     approval_handler: &mut (dyn ApprovalHandler + Send),
 ) -> Result<StepOutcome>
 where
-    F: FnMut(&Config) -> Fut,
-    Fut: std::future::Future<Output = Result<P>>,
-    P: crate::llm::LlmProvider,
+    F: FnMut(&Config) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<P>> + Send,
+    P: crate::llm::LlmProvider + Send,
     TS: TokenSink + Send,
 {
     let plan_action = plan_action_from_run(plan_run)?;
@@ -1010,9 +1010,9 @@ pub async fn tick_plan_runner<F, Fut, P, TS>(
     approval_handler: &mut (dyn ApprovalHandler + Send),
 ) -> Result<Option<StepOutcome>>
 where
-    F: FnMut(&Config) -> Fut,
-    Fut: std::future::Future<Output = Result<P>>,
-    P: crate::llm::LlmProvider,
+    F: FnMut(&Config) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<P>> + Send,
+    P: crate::llm::LlmProvider + Send,
     TS: TokenSink + Send,
 {
     let Some(plan_run) =

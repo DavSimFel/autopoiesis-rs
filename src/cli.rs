@@ -115,13 +115,14 @@ impl ApprovalHandler for CliApprovalHandler {
 
 /// Format a denial message for CLI and server output.
 pub fn format_denial_message(reason: &str, gate_id: &str) -> String {
-    format!("Command hard-denied by {gate_id}: {reason}")
+    crate::session_runtime::drain::format_denial_message(reason, gate_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gate::Severity;
+    use crate::session_runtime::drain::format_denial_message;
 
     #[test]
     fn format_denial_message_uses_gate_and_reason() {

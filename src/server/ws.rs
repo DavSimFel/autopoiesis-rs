@@ -12,10 +12,10 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use crate::auth as root_auth;
+use crate::agent;
 use crate::gate::Severity;
 use crate::principal::Principal;
-use crate::{agent, llm, turn};
+use crate::session_runtime::factory;
 
 use super::{HttpError, ServerState, queue, validate_session_id};
 
@@ -124,22 +124,9 @@ async fn websocket_session(
         }
 
         let subscriptions = {
-            let store = state.store.lock().await;
-            match store.list_subscriptions_for_session(&session_id) {
-                Ok(subscriptions) => match subscriptions
-                    .into_iter()
-                    .map(crate::subscription::SubscriptionRecord::from_row)
-                    .collect::<Result<Vec<_>>>()
-                {
-                    Ok(subscriptions) => subscriptions,
-                    Err(error) => {
-                        let _ = tx.send(WsFrame::Error {
-                            data: format!("failed to load websocket subscriptions: {error}"),
-                        });
-                        let _ = tx.send(WsFrame::Done);
-                        continue;
-                    }
-                },
+            let mut store = state.store.lock().await;
+            match factory::load_subscriptions_for_session(&mut store, &session_id) {
+                Ok(subscriptions) => subscriptions,
                 Err(error) => {
                     let _ = tx.send(WsFrame::Error {
                         data: format!("failed to load websocket subscriptions: {error}"),
@@ -149,31 +136,11 @@ async fn websocket_session(
                 }
             }
         };
-        let mut turn_builder = {
-            let config = state.config.clone();
-            move || turn::build_turn_for_config_with_subscriptions(&config, &subscriptions)
-        };
+        let mut turn_builder =
+            factory::build_turn_builder_for_subscriptions(state.config.clone(), subscriptions);
         let mut token_sink = WsTokenSink::new(tx.clone());
-        let mut provider_factory = {
-            let client = state.http_client.clone();
-            let config = state.config.clone();
-            move || {
-                let client = client.clone();
-                let config = config.clone();
-                async move {
-                    let api_key = root_auth::get_valid_token().await?;
-                    Ok::<llm::openai::OpenAIProvider, anyhow::Error>(
-                        llm::openai::OpenAIProvider::with_client(
-                            client,
-                            api_key,
-                            config.base_url,
-                            config.model,
-                            config.reasoning_effort,
-                        ),
-                    )
-                }
-            }
-        };
+        let mut provider_factory =
+            factory::build_openai_provider_factory(state.http_client.clone(), state.config.clone());
 
         match queue::drain_session_queue_with_turn_builder(
             state.clone(),

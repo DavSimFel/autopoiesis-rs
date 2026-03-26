@@ -27,9 +27,9 @@ pub(super) async fn spawn_and_drain_with_provider<F, Fut, P, TS>(
     approval_handler: &mut (dyn ApprovalHandler + Send),
 ) -> Result<SpawnDrainResult>
 where
-    F: FnMut(&crate::config::Config) -> Fut,
-    Fut: std::future::Future<Output = Result<P>>,
-    P: LlmProvider,
+    F: FnMut(&crate::config::Config) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<P>> + Send,
+    P: LlmProvider + Send,
     TS: TokenSink + Send,
 {
     let parent_session_dir = session_dir.join(&request.parent_session_id);
@@ -77,9 +77,9 @@ pub(crate) async fn finish_spawned_child_drain<F, Fut, P, TS>(
     approval_handler: &mut (dyn ApprovalHandler + Send),
 ) -> Result<SpawnDrainResult>
 where
-    F: FnMut(&crate::config::Config) -> Fut,
-    Fut: std::future::Future<Output = Result<P>>,
-    P: LlmProvider,
+    F: FnMut(&crate::config::Config) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<P>> + Send,
+    P: LlmProvider + Send,
     TS: TokenSink + Send,
 {
     let metadata = parse_spawned_child_metadata(metadata_json)?;
@@ -95,21 +95,23 @@ where
         metadata.reasoning_override.as_deref(),
     )?;
     let tier = metadata.tier.clone();
-    let subscriptions = context
-        .store
-        .list_subscriptions_for_session(&context.spawn_result.child_session_id)?
-        .into_iter()
-        .map(crate::subscription::SubscriptionRecord::from_row)
-        .collect::<Result<Vec<_>>>()?;
     let skills = metadata.skills.clone();
     let mut turn_builder = {
         let child_config = child_config.clone();
         let tier = tier.clone();
+        let subscriptions = crate::session_runtime::factory::load_subscriptions_for_session(
+            context.store,
+            &context.spawn_result.child_session_id,
+        )?;
         move || match tier.as_str() {
-            "t3" => crate::turn::build_spawned_t3_turn(&child_config, skills.clone()),
-            _ => {
-                crate::turn::build_turn_for_config_with_subscriptions(&child_config, &subscriptions)
-            }
+            "t3" => crate::session_runtime::factory::build_turn_builder_for_t3(
+                child_config.clone(),
+                skills.clone(),
+            )(),
+            _ => crate::session_runtime::factory::build_turn_builder_for_subscriptions(
+                child_config.clone(),
+                subscriptions.clone(),
+            )(),
         }
     };
 

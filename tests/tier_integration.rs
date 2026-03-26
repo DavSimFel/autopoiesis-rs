@@ -319,11 +319,11 @@ async fn process_one_queued_message<F, Fut, P, TS, AH>(
     approval_handler: &mut AH,
 ) -> Result<Option<autopoiesis::agent::QueueOutcome>>
 where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<P>>,
-    P: autopoiesis::llm::LlmProvider,
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<P>> + Send,
+    P: autopoiesis::llm::LlmProvider + Send,
     TS: autopoiesis::agent::TokenSink + Send,
-    AH: autopoiesis::agent::ApprovalHandler,
+    AH: autopoiesis::agent::ApprovalHandler + Send,
 {
     let Some(queued_message) = store.dequeue_next_message(child_session_id)? else {
         return Ok(None);
