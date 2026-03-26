@@ -269,7 +269,7 @@ impl Session {
             .join("\n")
     }
 
-    fn estimate_message_tokens(message: &ChatMessage) -> u64 {
+    pub(crate) fn estimate_message_tokens(message: &ChatMessage) -> u64 {
         let text = Self::message_text_for_estimation(message);
         if text.is_empty() {
             0
@@ -300,11 +300,11 @@ impl Session {
             "append session message"
         );
 
+        Self::append_entry_to_file(&self.today_path(), &entry)?;
         self.messages.push(message);
         self.message_tokens.push(token_delta);
         self.total_tokens += token_delta;
         self.session_total_tokens += token_delta;
-        Self::append_entry_to_file(&self.today_path(), &entry)?;
 
         if should_trim && self.total_tokens > self.max_context_tokens {
             self.trim_context();
@@ -491,16 +491,19 @@ impl Session {
     }
 
     fn latest_turn_tokens(&self) -> u64 {
-        self.messages
-            .iter()
-            .zip(self.message_tokens.iter())
-            .rev()
-            .find_map(|(message, token_delta)| {
-                (message.role == ChatRole::Assistant
-                    && message.principal == crate::principal::Principal::Agent)
-                    .then_some(*token_delta)
-            })
-            .unwrap_or(0)
+        let mut total = 0;
+
+        for (message, token_delta) in self.messages.iter().zip(self.message_tokens.iter()).rev() {
+            match message.role {
+                ChatRole::User => break,
+                ChatRole::Assistant if message.principal == crate::principal::Principal::Agent => {
+                    total += *token_delta;
+                }
+                _ => {}
+            }
+        }
+
+        total
     }
 
     fn today_token_total(&self) -> Result<u64> {
@@ -1215,7 +1218,51 @@ mod tests {
             .unwrap();
 
         let snapshot = session.budget_snapshot().unwrap();
-        assert_eq!(snapshot.turn_tokens, 0);
+        assert_eq!(snapshot.turn_tokens, 20);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn budget_snapshot_counts_all_assistant_batches_in_latest_turn() {
+        let dir = temp_sessions_dir("budget_snapshot_multi_batch");
+        let mut session = Session::new(&dir).unwrap();
+
+        session.add_user_message("first turn").unwrap();
+        session
+            .append(
+                assistant_message("batch one"),
+                Some(TurnMeta {
+                    input_tokens: Some(5),
+                    output_tokens: Some(5),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        session
+            .append(
+                ChatMessage::tool_result_with_principal(
+                    "call-1",
+                    "execute",
+                    "ok",
+                    Some(Principal::System),
+                ),
+                None,
+            )
+            .unwrap();
+        session
+            .append(
+                assistant_message("batch two"),
+                Some(TurnMeta {
+                    input_tokens: Some(7),
+                    output_tokens: Some(7),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+
+        let snapshot = session.budget_snapshot().unwrap();
+        assert_eq!(snapshot.turn_tokens, 24);
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1521,24 +1568,14 @@ mod tests {
                 .expect_err("append should fail when the target path is a directory");
             let error_text = error.to_string();
             assert!(!error_text.is_empty());
-            assert_eq!(session.history().len(), 1);
-            assert_eq!(
-                session.history()[0]
-                    .content
-                    .iter()
-                    .find_map(|block| match block {
-                        MessageContent::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    }),
-                Some("persist me")
-            );
+            assert!(session.history().is_empty());
 
             std::fs::remove_dir_all(&today_path).unwrap();
             let live_snapshot = session.budget_snapshot().unwrap();
             let mut reloaded = Session::new(&dir).unwrap();
             reloaded.load_today().unwrap();
             assert!(reloaded.history().is_empty());
-            assert_ne!(live_snapshot, reloaded.budget_snapshot().unwrap());
+            assert_eq!(live_snapshot, reloaded.budget_snapshot().unwrap());
 
             std::fs::remove_dir_all(&dir).unwrap();
         }

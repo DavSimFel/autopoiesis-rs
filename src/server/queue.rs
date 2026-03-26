@@ -67,7 +67,9 @@ where
         lock: Arc::downgrade(&session_lock),
     };
     let _session_guard = session_lock.lock().await;
-    let mut processed_any = false;
+    let mut completed_agent_turn = false;
+    let mut first_denial: Option<agent::TurnVerdict> = None;
+    let mut last_assistant_response = None;
 
     let mut history = session::Session::new(state.sessions_dir.join(&session_id))
         .with_context(|| format!("failed to open session {session_id}"))?;
@@ -81,8 +83,6 @@ where
         let Some(message) = message else {
             break;
         };
-        processed_any = true;
-
         let outcome = agent::process_message(
             &message,
             &mut history,
@@ -100,6 +100,11 @@ where
                     store.mark_processed(message.id)?;
                 }
 
+                if !matches!(verdict, agent::TurnVerdict::Denied { .. }) {
+                    last_assistant_response = crate::spawn::latest_assistant_response(&history);
+                    completed_agent_turn = true;
+                }
+
                 match verdict {
                     agent::TurnVerdict::Executed(_) => {}
                     agent::TurnVerdict::Approved { .. } => {
@@ -110,7 +115,9 @@ where
                     }
                     agent::TurnVerdict::Denied { reason, gate_id } => {
                         warn!(message_id = message.id, %gate_id, "turn denied");
-                        return Ok(Some(agent::TurnVerdict::Denied { reason, gate_id }));
+                        if first_denial.is_none() {
+                            first_denial = Some(agent::TurnVerdict::Denied { reason, gate_id });
+                        }
                     }
                 }
             }
@@ -131,17 +138,48 @@ where
         }
     }
 
-    if crate::spawn::should_enqueue_child_completion(processed_any) {
+    if crate::spawn::should_enqueue_child_completion(completed_agent_turn) {
         let mut store = state.store.lock().await;
-        let _ = crate::spawn::enqueue_child_completion(&mut store, &session_id, &history)?;
+        let _ = crate::spawn::enqueue_child_completion(
+            &mut store,
+            &session_id,
+            &history,
+            last_assistant_response.as_deref(),
+        )?;
     }
 
-    Ok(None)
+    if completed_agent_turn {
+        Ok(None)
+    } else {
+        Ok(first_denial)
+    }
 }
 
 pub(super) fn spawn_http_queue_worker(state: ServerState, session_id: String) {
     tokio::spawn(async move {
-        let turn = turn::build_turn_for_config(&state.config);
+        let turn = match turn::build_turn_for_config(&state.config) {
+            Ok(turn) => turn,
+            Err(error) => {
+                let mut store = state.store.lock().await;
+                loop {
+                    match store.dequeue_next_message(&session_id) {
+                        Ok(Some(message)) => {
+                            if let Err(mark_error) = store.mark_failed(message.id) {
+                                warn!(%session_id, %mark_error, "failed to mark queued message failed");
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(queue_error) => {
+                            warn!(%session_id, %queue_error, "failed to inspect queued messages");
+                            break;
+                        }
+                    }
+                }
+                warn!(%session_id, %error, "failed to build queue turn");
+                return;
+            }
+        };
         let mut provider_factory = {
             let client = state.http_client.clone();
             let config = state.config.clone();

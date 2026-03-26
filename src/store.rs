@@ -1576,14 +1576,16 @@ fn ensure_plan_runs_table(conn: &Connection) -> Result<()> {
     ensure_plan_step_attempt_column(conn, "checks_json", "TEXT NOT NULL DEFAULT '[]'")?;
     ensure_plan_step_attempt_column(conn, "started_at", "TEXT NOT NULL DEFAULT ''")?;
     ensure_plan_step_attempt_column(conn, "finished_at", "TEXT")?;
+    cleanup_legacy_plan_rows(conn)?;
     conn.execute_batch(
         r#"
         CREATE INDEX IF NOT EXISTS idx_plan_runs_owner_session_created_at
             ON plan_runs(owner_session_id, created_at, id);
         CREATE INDEX IF NOT EXISTS idx_plan_runs_status_claimed_at
             ON plan_runs(status, claimed_at, id);
-        CREATE INDEX IF NOT EXISTS idx_plan_step_attempts_run_step_attempt
-            ON plan_step_attempts(plan_run_id, step_index, attempt, id);
+        DROP INDEX IF EXISTS idx_plan_step_attempts_run_step_attempt;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_step_attempts_run_step_attempt
+            ON plan_step_attempts(plan_run_id, revision, step_index, attempt);
         CREATE TRIGGER IF NOT EXISTS trg_plan_runs_owner_session_fk
             BEFORE INSERT ON plan_runs
             WHEN NOT EXISTS (
@@ -1648,7 +1650,6 @@ fn ensure_plan_runs_table(conn: &Connection) -> Result<()> {
         "#,
     )
     .context("failed to initialize plan engine indexes")?;
-    cleanup_legacy_plan_rows(conn)?;
     Ok(())
 }
 
@@ -1730,6 +1731,29 @@ fn cleanup_legacy_plan_rows(conn: &Connection) -> Result<()> {
             OR status NOT IN ('running', 'passed', 'failed', 'crashed')
             OR (status = 'running' AND finished_at IS NOT NULL)
             OR (status IN ('passed', 'failed', 'crashed') AND (finished_at IS NULL OR finished_at = ''));
+        DELETE FROM plan_step_attempts
+         WHERE rowid NOT IN (
+             SELECT rowid
+             FROM (
+                 SELECT
+                     rowid,
+                     ROW_NUMBER() OVER (
+                         PARTITION BY plan_run_id, revision, step_index, attempt
+                         ORDER BY
+                             CASE
+                                 WHEN status IN ('passed', 'failed', 'crashed') THEN 1
+                                 ELSE 0
+                             END DESC,
+                             CASE
+                                 WHEN finished_at IS NOT NULL AND finished_at != '' THEN 1
+                                 ELSE 0
+                             END DESC,
+                             rowid DESC
+                     ) AS row_number
+                 FROM plan_step_attempts
+             )
+             WHERE row_number = 1
+         );
         "#,
     )
     .context("failed to clean legacy plan rows")?;
@@ -2146,6 +2170,147 @@ mod tests {
             attempts[1].finished_at.as_deref(),
             Some(attempts[1].started_at.as_str())
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn store_new_deduplicates_duplicate_step_attempts_and_enforces_unique_index() {
+        let path = temp_db_path("plan_step_attempt_dedup");
+        let timestamp = utc_timestamp();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    metadata TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE TABLE plan_runs (
+                    id TEXT PRIMARY KEY,
+                    owner_session_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    current_step_index INTEGER NOT NULL DEFAULT 0,
+                    definition_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE plan_step_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plan_run_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    step_index INTEGER NOT NULL,
+                    step_id TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    child_session_id TEXT,
+                    summary_json TEXT NOT NULL,
+                    checks_json TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
+                CREATE INDEX idx_plan_step_attempts_run_step_attempt
+                    ON plan_step_attempts(plan_run_id, revision, step_index, attempt);
+                "#,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, created_at, metadata) VALUES (?1, ?2, ?3)",
+                params!["owner", timestamp, "{}"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plan_runs (
+                    id,
+                    owner_session_id,
+                    status,
+                    revision,
+                    current_step_index,
+                    definition_json,
+                    created_at,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    "plan-1", "owner", "running", 1, 0, "{}", timestamp, timestamp
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plan_step_attempts (
+                    plan_run_id,
+                    revision,
+                    step_index,
+                    step_id,
+                    attempt,
+                    status,
+                    child_session_id,
+                    summary_json,
+                    checks_json,
+                    started_at,
+                    finished_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, NULL)",
+                params![
+                    "plan-1", 1, 0, "step-a", 0, "running", "{}", "[]", timestamp
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO plan_step_attempts (
+                    plan_run_id,
+                    revision,
+                    step_index,
+                    step_id,
+                    attempt,
+                    status,
+                    child_session_id,
+                    summary_json,
+                    checks_json,
+                    started_at,
+                    finished_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10)",
+                params![
+                    "plan-1", 1, 0, "step-b", 0, "passed", "{}", "[]", timestamp, timestamp
+                ],
+            )
+            .unwrap();
+        }
+
+        let store = Store::new(&path).unwrap();
+        let attempts = store.get_step_attempts("plan-1", 0).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].step_id, "step-b");
+        assert_eq!(attempts[0].status, "passed");
+        assert_eq!(attempts[0].finished_at.as_deref(), Some(timestamp.as_str()));
+
+        let duplicate_insert = store.conn.execute(
+            "INSERT INTO plan_step_attempts (
+                plan_run_id,
+                revision,
+                step_index,
+                step_id,
+                attempt,
+                status,
+                child_session_id,
+                summary_json,
+                checks_json,
+                started_at,
+                finished_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, NULL)",
+            params![
+                "plan-1",
+                1,
+                0,
+                "step-c",
+                0,
+                "running",
+                "{}",
+                "[]",
+                utc_timestamp()
+            ],
+        );
+        assert!(duplicate_insert.is_err());
 
         let _ = std::fs::remove_file(&path);
     }

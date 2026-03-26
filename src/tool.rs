@@ -66,6 +66,27 @@ fn signal_process_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
+fn pre_exec_child_setup_with<F>(setpgid: F) -> io::Result<()>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    set_resource_limits()?;
+    setpgid()
+}
+
+#[cfg(unix)]
+fn pre_exec_child_setup() -> io::Result<()> {
+    pre_exec_child_setup_with(|| {
+        // New process group so killpg reaches all descendants.
+        if unsafe { libc::setpgid(0, 0) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    })
+}
+
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
 
 pub trait Tool: Send + Sync {
@@ -370,11 +391,7 @@ impl Shell {
         unsafe {
             // SAFETY: pre_exec sets resource limits and creates a new process group
             // so that timeout kill can terminate all descendant processes.
-            command.pre_exec(|| {
-                // New process group so killpg reaches all descendants
-                libc::setpgid(0, 0);
-                set_resource_limits()
-            });
+            command.pre_exec(pre_exec_child_setup);
         }
         command
             .stdin(Stdio::null())
@@ -546,6 +563,15 @@ mod tests {
             start.elapsed() < Duration::from_millis(TERMINATION_GRACE_MS + 500),
             "clamped timeout should be enforced close to the configured ceiling"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_exec_child_setup_returns_setpgid_error() {
+        let error =
+            pre_exec_child_setup_with(|| Err(std::io::Error::from_raw_os_error(libc::EPERM)))
+                .expect_err("setpgid failure should bubble up");
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
     }
 
     #[cfg(unix)]

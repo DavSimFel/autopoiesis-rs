@@ -105,7 +105,16 @@ async fn websocket_session(
         }
     }
 
-    let turn = turn::build_turn_for_config(&state.config);
+    let turn = match turn::build_turn_for_config(&state.config) {
+        Ok(turn) => turn,
+        Err(error) => {
+            let _ = tx.send(WsFrame::Error {
+                data: format!("failed to build websocket turn: {error}"),
+            });
+            let _ = tx.send(WsFrame::Done);
+            return;
+        }
+    };
     let mut approval_handler = WsApprovalHandler::new(tx.clone(), approval_rx);
 
     while let Some(content) = prompt_rx.recv().await {

@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, from_str};
 
 use crate::delegation::{self, DelegationAdvice};
-use crate::gate::{GuardContext, Verdict};
+use crate::gate::{BudgetSnapshot, GuardContext, Verdict};
 use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall, TurnMeta};
 use crate::principal::Principal;
 use crate::session::Session;
@@ -89,6 +89,15 @@ fn append_inbound_deny(session: &mut Session, gate_id: &str) -> Result<()> {
     append_audit_note(session, format!("Message hard-denied by {gate_id}"))
 }
 
+fn flush_buffered_tokens<TS: TokenSink + ?Sized>(
+    token_sink: &mut TS,
+    buffered_tokens: &mut Vec<String>,
+) {
+    for token in buffered_tokens.drain(..) {
+        token_sink.on_token(token);
+    }
+}
+
 pub(super) fn make_denial_verdict(
     denial_count: &mut usize,
     gate_id: String,
@@ -119,6 +128,87 @@ fn inbound_verdict_name(verdict: &Verdict) -> &'static str {
         Verdict::Deny { .. } => "deny",
         Verdict::Approve { .. } => "approve",
     }
+}
+
+fn token_total(meta: Option<&TurnMeta>, assistant_message: &ChatMessage) -> u64 {
+    let estimated_tokens = Session::estimate_message_tokens(assistant_message);
+    match meta {
+        Some(meta) => match (meta.input_tokens, meta.output_tokens) {
+            (Some(input), Some(output)) => input.saturating_add(output),
+            (Some(input), None) => input.max(estimated_tokens),
+            (None, Some(output)) => output.max(estimated_tokens),
+            (None, None) => estimated_tokens,
+        },
+        None => estimated_tokens,
+    }
+}
+
+fn charged_turn_meta(meta: Option<TurnMeta>, assistant_message: &ChatMessage) -> TurnMeta {
+    let estimated_tokens = Session::estimate_message_tokens(assistant_message);
+    match meta {
+        Some(mut meta) => {
+            match (meta.input_tokens, meta.output_tokens) {
+                (Some(_), Some(_)) => {}
+                (Some(input), None) => {
+                    meta.output_tokens = Some(estimated_tokens.saturating_sub(input))
+                }
+                (None, Some(output)) => {
+                    meta.input_tokens = Some(estimated_tokens.saturating_sub(output))
+                }
+                (None, None) => meta.output_tokens = Some(estimated_tokens),
+            }
+            meta
+        }
+        None => TurnMeta {
+            model: None,
+            input_tokens: None,
+            output_tokens: Some(estimated_tokens),
+            reasoning_tokens: None,
+            reasoning_trace: None,
+        },
+    }
+}
+
+fn post_turn_budget_denial(
+    turn: &Turn,
+    session: &Session,
+    assistant_message: &ChatMessage,
+    turn_meta: Option<&TurnMeta>,
+) -> Result<Option<(String, String)>> {
+    if !turn.needs_budget_context() {
+        return Ok(None);
+    }
+
+    let turn_tokens = token_total(turn_meta, assistant_message);
+    let mut budget: BudgetSnapshot = session
+        .budget_snapshot()
+        .context("failed to read live budget snapshot")?;
+    budget.turn_tokens += turn_tokens;
+    budget.session_tokens += turn_tokens;
+    budget.day_tokens += turn_tokens;
+    let context = GuardContext {
+        budget,
+        ..Default::default()
+    };
+
+    if let Some(crate::gate::Verdict::Deny { reason, gate_id }) = turn.check_budget(context) {
+        return Ok(Some((gate_id, reason)));
+    }
+
+    Ok(None)
+}
+
+fn persisted_inbound_user_message(
+    messages: &[ChatMessage],
+    persisted_user_message_index: Option<usize>,
+) -> Option<ChatMessage> {
+    persisted_user_message_index.and_then(|index| {
+        messages
+            .iter()
+            .skip(index)
+            .find(|message| message.role == crate::llm::ChatRole::User)
+            .cloned()
+    })
 }
 
 fn maybe_queue_delegation_hint(
@@ -159,19 +249,22 @@ where
 {
     let user_prompt = format!("[{}] {}", utc_timestamp(), user_prompt);
     let tools = turn.tool_definitions();
-    let user_message = ChatMessage::user_with_principal(user_prompt, Some(user_principal));
+    let user_message = ChatMessage::user_with_principal(user_prompt.clone(), Some(user_principal));
     let mut persisted_user_message = false;
+    let mut persisted_user_message_index = None;
 
     let mut executed: Vec<ToolCall> = Vec::new();
     let mut had_user_approval = false;
     let mut denial_count = 0usize;
     let mut turn_tool_call_count = 0usize;
+    let mut buffered_tokens: Vec<String> = Vec::new();
     info!("starting agent turn");
 
     let denied_turn = 'agent_turn: loop {
         session.ensure_context_within_limit();
         let mut messages = session.history().to_vec();
         if !persisted_user_message {
+            persisted_user_message_index = Some(messages.len());
             messages.push(user_message.clone());
         }
         debug!(message_count = messages.len(), "assembled turn context");
@@ -195,14 +288,11 @@ where
         match verdict {
             Verdict::Allow | Verdict::Modify => {
                 if !persisted_user_message {
-                    let user_message = messages
-                        .iter()
-                        .rev()
-                        .find(|message| message.role == crate::llm::ChatRole::User)
-                        .cloned()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("missing user message after inbound checks")
-                        })?;
+                    let user_message =
+                        persisted_inbound_user_message(&messages, persisted_user_message_index)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("missing user message after inbound checks")
+                            })?;
                     session.append(user_message, None)?;
                     persisted_user_message = true;
                     info!("persisted inbound user message");
@@ -210,14 +300,11 @@ where
             }
             Verdict::Deny { reason, gate_id } => {
                 if !persisted_user_message {
-                    let mut user_message = messages
-                        .iter()
-                        .rev()
-                        .find(|message| message.role == crate::llm::ChatRole::User)
-                        .cloned()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("missing user message after inbound checks")
-                        })?;
+                    let mut user_message =
+                        persisted_inbound_user_message(&messages, persisted_user_message_index)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("missing user message after inbound checks")
+                            })?;
                     crate::gate::guard_message_output(turn, &mut user_message);
                     session.append(user_message, None)?;
                 }
@@ -244,14 +331,11 @@ where
                 let approved = approval_handler.request_approval(&severity, &reason, command);
                 if !approved {
                     if !persisted_user_message {
-                        let mut user_message = messages
-                            .iter()
-                            .rev()
-                            .find(|message| message.role == crate::llm::ChatRole::User)
-                            .cloned()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("missing user message after inbound checks")
-                            })?;
+                        let mut user_message =
+                            persisted_inbound_user_message(&messages, persisted_user_message_index)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("missing user message after inbound checks")
+                                })?;
                         crate::gate::guard_message_output(turn, &mut user_message);
                         session.append(user_message, None)?;
                     }
@@ -264,14 +348,11 @@ where
                     ));
                 }
                 if !persisted_user_message {
-                    let user_message = messages
-                        .iter()
-                        .rev()
-                        .find(|message| message.role == crate::llm::ChatRole::User)
-                        .cloned()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("missing user message after inbound checks")
-                        })?;
+                    let user_message =
+                        persisted_inbound_user_message(&messages, persisted_user_message_index)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("missing user message after inbound checks")
+                            })?;
                     session.append(user_message, None)?;
                     persisted_user_message = true;
                 }
@@ -300,18 +381,48 @@ where
         debug!("provider created");
         let mut streaming_output = crate::gate::StreamingTextBuffer::new();
         let mut redact_text = |segment: String| crate::gate::guard_text_output(turn, segment);
-        let mut emit_token = |token: String| token_sink.on_token(token);
+        let should_buffer_tokens = turn.needs_budget_context();
+        let mut emit_token = |token: String| {
+            if should_buffer_tokens {
+                buffered_tokens.push(token);
+            } else {
+                token_sink.on_token(token);
+            }
+        };
         let mut turn_reply = {
             let mut on_token = |token: String| {
                 streaming_output.push(&mut redact_text, &mut emit_token, token);
             };
-            provider
+            match provider
                 .stream_completion(&messages, &tools, &mut on_token)
-                .await?
+                .await
+            {
+                Ok(turn_reply) => turn_reply,
+                Err(err) => {
+                    streaming_output.finish(&mut redact_text, &mut emit_token);
+                    if should_buffer_tokens {
+                        flush_buffered_tokens(token_sink, &mut buffered_tokens);
+                    }
+                    return Err(err);
+                }
+            }
         };
         streaming_output.finish(&mut redact_text, &mut emit_token);
         crate::gate::guard_message_output(turn, &mut turn_reply.assistant_message);
         let turn_meta = turn_reply.meta;
+        let charged_meta = charged_turn_meta(turn_meta.clone(), &turn_reply.assistant_message);
+        if let Some((gate_id, reason)) = post_turn_budget_denial(
+            turn,
+            session,
+            &turn_reply.assistant_message,
+            turn_meta.as_ref(),
+        )? {
+            let mut denied_message = turn_reply.assistant_message.clone();
+            denied_message.content.clear();
+            session.append(denied_message, Some(charged_meta.clone()))?;
+            token_sink.on_complete();
+            return Ok(make_denial_verdict(&mut denial_count, gate_id, reason));
+        }
         debug!(stop_reason = ?turn_reply.stop_reason, tool_call_count = turn_reply.tool_calls.len(), "streamed completion received");
 
         match turn_reply.stop_reason {
@@ -327,7 +438,7 @@ where
                                 session,
                                 turn,
                                 turn_reply.assistant_message,
-                                turn_meta,
+                                Some(charged_meta.clone()),
                             )?;
                             append_hard_deny(session, &gate_id)?;
                             warn!(%gate_id, "tool call hard-denied");
@@ -351,7 +462,7 @@ where
                                     session,
                                     turn,
                                     turn_reply.assistant_message,
-                                    turn_meta,
+                                    Some(charged_meta.clone()),
                                 )?;
                                 append_approval_denied(session, &gate_id)?;
                                 warn!(%gate_id, "tool call approval denied");
@@ -374,7 +485,7 @@ where
                             session,
                             turn,
                             turn_reply.assistant_message,
-                            turn_meta,
+                            Some(charged_meta.clone()),
                         )?;
                         append_hard_deny(session, &gate_id)?;
                         warn!(%gate_id, "tool batch hard-denied");
@@ -398,7 +509,7 @@ where
                                 session,
                                 turn,
                                 turn_reply.assistant_message,
-                                turn_meta,
+                                Some(charged_meta.clone()),
                             )?;
                             append_approval_denied(session, &gate_id)?;
                             warn!(%gate_id, "tool batch approval denied");
@@ -413,7 +524,7 @@ where
                 }
 
                 crate::gate::guard_message_output(turn, &mut turn_reply.assistant_message);
-                session.append(turn_reply.assistant_message, turn_meta.clone())?;
+                session.append(turn_reply.assistant_message, Some(charged_meta.clone()))?;
 
                 for call in &tool_calls {
                     debug!(call_id = %call.id, tool_name = %call.name, "executing tool");
@@ -452,12 +563,15 @@ where
             }
 
             StopReason::Stop => {
-                session.append(turn_reply.assistant_message, turn_meta.clone())?;
+                session.append(turn_reply.assistant_message, Some(charged_meta))?;
                 if let Err(err) = session.clear_delegation_hint() {
                     warn!(error = %err, "failed to clear delegation hint");
                 }
                 if let Err(err) = maybe_queue_delegation_hint(session, turn, turn_tool_call_count) {
                     warn!(error = %err, "failed to persist delegation hint");
+                }
+                if should_buffer_tokens {
+                    flush_buffered_tokens(token_sink, &mut buffered_tokens);
                 }
                 token_sink.on_complete();
                 if had_user_approval {

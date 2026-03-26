@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-#[cfg(test)]
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -62,33 +61,33 @@ impl Identity {
     }
 }
 
+pub(crate) fn inject_identity_prompt(messages: &mut Vec<ChatMessage>, rendered: String) {
+    let replacement = MessageContent::text(rendered.clone());
+
+    if let Some(first) = messages.first_mut()
+        && first.role == ChatRole::System
+        && first.principal == crate::principal::Principal::Agent
+    {
+        if !matches!(&first.content[..], [MessageContent::Text { text }] if text == &rendered) {
+            first.content.clear();
+            first.content.push(replacement);
+        }
+        return;
+    }
+
+    messages.insert(
+        0,
+        ChatMessage::system_with_principal(rendered, Some(crate::principal::Principal::Agent)),
+    );
+}
+
 impl ContextSource for Identity {
     fn name(&self) -> &str {
         "identity"
     }
 
     fn assemble(&self, messages: &mut Vec<ChatMessage>) {
-        let rendered = self.load_prompt();
-        let replacement = MessageContent::text(rendered.clone());
-
-        if messages.is_empty() {
-            messages.push(ChatMessage::system(rendered));
-            return;
-        }
-
-        let first = &mut messages[0];
-        if first.role != ChatRole::System {
-            messages.insert(0, ChatMessage::system(rendered));
-            return;
-        }
-
-        let needs_edit =
-            !matches!(&first.content[..], [MessageContent::Text { text }] if text == &rendered);
-
-        if needs_edit {
-            first.content.clear();
-            first.content.push(replacement);
-        }
+        inject_identity_prompt(messages, self.load_prompt());
     }
 }
 
@@ -217,7 +216,6 @@ impl History {
         }
     }
 
-    #[cfg(test)]
     fn tool_call_ids(message: &ChatMessage) -> HashSet<&str> {
         message
             .content
@@ -229,7 +227,6 @@ impl History {
             .collect()
     }
 
-    #[cfg(test)]
     fn tool_result_call_id(message: &ChatMessage) -> Option<&str> {
         message.content.iter().find_map(|block| match block {
             MessageContent::ToolResult { result } => Some(result.tool_call_id.as_str()),
@@ -237,7 +234,6 @@ impl History {
         })
     }
 
-    #[cfg(test)]
     fn history_group_range(history: &[ChatMessage], index: usize) -> Option<(usize, usize)> {
         match history.get(index)?.role {
             ChatRole::System => None,
@@ -327,41 +323,11 @@ impl ContextSource for History {
     }
 
     fn assemble(&self, messages: &mut Vec<ChatMessage>) {
-        if self.history.is_empty() {
-            return;
-        }
-
-        let mut current_tokens = messages
-            .iter()
-            .map(Self::estimate_message_tokens)
-            .sum::<usize>();
-        let mut selected = Vec::new();
-
-        for message in self.history.iter().rev() {
-            if message.role == ChatRole::System {
-                continue;
-            }
-
-            let message_tokens = Self::estimate_message_tokens(message);
-            if current_tokens + message_tokens > self.max_tokens {
-                break;
-            }
-
-            selected.push(message.clone());
-            current_tokens += message_tokens;
-        }
-
-        if selected.is_empty() {
-            return;
-        }
-
-        selected.reverse();
-        messages.extend(selected);
+        self.assemble_pair_aware(messages);
     }
 }
 
 impl History {
-    #[cfg(test)]
     fn assemble_pair_aware(&self, messages: &mut Vec<ChatMessage>) {
         if self.history.is_empty() {
             return;
@@ -451,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_replaces_system_message() {
+    fn identity_preserves_existing_system_message() {
         let dir = temp_identity_dir("replaces");
         make_identity_files(
             &dir,
@@ -472,11 +438,18 @@ mod tests {
         let mut messages = vec![ChatMessage::system("old"), ChatMessage::user("ask")];
         source.assemble(&mut messages);
 
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].principal, crate::principal::Principal::Agent);
         let content = match &messages[0].content[0] {
             MessageContent::Text { text } => text.clone(),
             _ => panic!("expected text"),
         };
         assert_eq!(content, "constitution\n\nidentity\n\ncontext");
+        let preserved = match &messages[1].content[0] {
+            MessageContent::Text { text } => text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(preserved, "old");
     }
 
     #[test]
@@ -491,11 +464,17 @@ mod tests {
         let mut messages = vec![ChatMessage::system("old prompt")];
         source.assemble(&mut messages);
 
+        assert_eq!(messages.len(), 2);
         let content = match &messages[0].content[0] {
             MessageContent::Text { text } => text.clone(),
             _ => panic!("expected text"),
         };
         assert_eq!(content, "fallback prompt");
+        let preserved = match &messages[1].content[0] {
+            MessageContent::Text { text } => text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(preserved, "old prompt");
     }
 
     #[test]
@@ -535,11 +514,17 @@ mod tests {
         let mut messages = vec![ChatMessage::system("old")];
         source.assemble(&mut messages);
 
+        assert_eq!(messages.len(), 2);
         let content = match &messages[0].content[0] {
             MessageContent::Text { text } => text.clone(),
             _ => panic!("expected text"),
         };
         assert_eq!(content, "model: gpt-4\n\ncwd: /tmp/proj\n\ntool: execute");
+        let preserved = match &messages[1].content[0] {
+            MessageContent::Text { text } => text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(preserved, "old");
     }
 
     #[test]

@@ -79,6 +79,19 @@ impl Turn {
         self.has_guard(crate::gate::budget::BUDGET_GUARD_ID)
     }
 
+    pub fn check_budget(&self, context: GuardContext) -> Option<Verdict> {
+        let guard = self
+            .guards
+            .iter()
+            .find(|guard| guard.name() == crate::gate::budget::BUDGET_GUARD_ID)?;
+        let mut messages = vec![ChatMessage::user("budget probe")];
+        let mut event = GuardEvent::Inbound(&mut messages);
+        match guard.check(&mut event, &context) {
+            Verdict::Allow => None,
+            verdict => Some(verdict),
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip(self, messages, context), fields(message_count = messages.len()))]
     pub fn check_inbound(
         &self,
@@ -274,13 +287,13 @@ fn build_turn_with_tool(
     include_delegation: bool,
     include_skills: bool,
     skill_loader: Option<Vec<crate::skills::SkillDefinition>>,
-) -> Turn {
+) -> Result<Turn> {
     let tool_definition = tool.definition();
     let vars = identity_vars_for_turn(config, std::slice::from_ref(&tool_definition));
-
-    let mut turn = Turn::new().context(
-        Identity::new(config.identity_files.clone(), vars, &config.system_prompt).strict(),
-    );
+    let identity_prompt =
+        crate::identity::load_system_prompt_from_files(&config.identity_files, &vars)?;
+    let mut turn = Turn::new()
+        .context(Identity::new(config.identity_files.clone(), vars, &identity_prompt).strict());
     if include_skills {
         turn = turn.context(SkillContext::new(config.skills.browse()));
     }
@@ -315,11 +328,11 @@ fn build_turn_with_tool(
         });
     }
 
-    turn
+    Ok(turn)
 }
 
 /// Build the default T1 turn, kept for backward compatibility.
-pub fn build_default_turn(config: &crate::config::Config) -> Turn {
+pub fn build_default_turn(config: &crate::config::Config) -> Result<Turn> {
     build_turn_with_tool(
         config,
         crate::tool::Shell::with_limits(
@@ -334,7 +347,7 @@ pub fn build_default_turn(config: &crate::config::Config) -> Turn {
 }
 
 /// Build the active tier turn using the config's resolved agent tier.
-pub fn build_turn_for_config(config: &crate::config::Config) -> Turn {
+pub fn build_turn_for_config(config: &crate::config::Config) -> Result<Turn> {
     match resolve_tier(config) {
         TurnTier::T1 => build_default_turn(config),
         TurnTier::T2 => build_t2_turn(config),
@@ -343,7 +356,7 @@ pub fn build_turn_for_config(config: &crate::config::Config) -> Turn {
 }
 
 /// Build a T2 turn with structured reads only.
-pub fn build_t2_turn(config: &crate::config::Config) -> Turn {
+pub fn build_t2_turn(config: &crate::config::Config) -> Result<Turn> {
     build_turn_with_tool(
         config,
         ReadFile::from_config_with_protected_paths(
@@ -361,7 +374,7 @@ pub fn build_t2_turn(config: &crate::config::Config) -> Turn {
 }
 
 /// Build a T3 turn with shell access but no delegation hint support.
-pub fn build_t3_turn(config: &crate::config::Config) -> Turn {
+pub fn build_t3_turn(config: &crate::config::Config) -> Result<Turn> {
     build_turn_with_tool(
         config,
         crate::tool::Shell::with_limits(
@@ -375,7 +388,10 @@ pub fn build_t3_turn(config: &crate::config::Config) -> Turn {
     )
 }
 
-pub fn build_spawned_t3_turn(config: &crate::config::Config, skills: Vec<SkillDefinition>) -> Turn {
+pub fn build_spawned_t3_turn(
+    config: &crate::config::Config,
+    skills: Vec<SkillDefinition>,
+) -> Result<Turn> {
     build_turn_with_tool(
         config,
         crate::tool::Shell::with_limits(
@@ -693,7 +709,7 @@ mod tests {
         config.skills_dir = skills_dir.clone();
         config.skills = crate::skills::SkillCatalog::load_from_dir(&skills_dir).unwrap();
 
-        let turn = build_default_turn(&config);
+        let turn = build_default_turn(&config).unwrap();
         let mut messages = Vec::new();
         turn.assemble_context(&mut messages);
 
@@ -724,7 +740,7 @@ mod tests {
         let mut config = test_config_for_tier(Some("t2"), None);
         config.skills = crate::skills::SkillCatalog::load_from_dir("skills").unwrap();
 
-        let turn = build_t2_turn(&config);
+        let turn = build_t2_turn(&config).unwrap();
         let mut messages = Vec::new();
         turn.assemble_context(&mut messages);
 
@@ -752,7 +768,7 @@ mod tests {
         let mut config = test_config_for_tier(Some("t3"), None);
         config.skills = crate::skills::SkillCatalog::load_from_dir("skills").unwrap();
 
-        let turn = build_t3_turn(&config);
+        let turn = build_t3_turn(&config).unwrap();
         let mut messages = Vec::new();
         turn.assemble_context(&mut messages);
 
@@ -818,7 +834,7 @@ mod tests {
 
         let mut config = test_config(None);
         config.skills = crate::skills::SkillCatalog::load_from_dir("skills").unwrap();
-        let turn = build_default_turn(&config);
+        let turn = build_default_turn(&config).unwrap();
 
         let observed_messages = Arc::new(Mutex::new(None));
         let mut make_provider = {
@@ -878,7 +894,8 @@ mod tests {
             max_tokens_per_turn: Some(100),
             max_tokens_per_session: None,
             max_tokens_per_day: None,
-        })));
+        })))
+        .unwrap();
 
         let mut messages = make_messages("hello");
         let result = turn.check_inbound(&mut messages, Some(make_budget_context(101, 0, 0)));
@@ -898,7 +915,8 @@ mod tests {
             max_tokens_per_turn: Some(100),
             max_tokens_per_session: None,
             max_tokens_per_day: None,
-        })));
+        })))
+        .unwrap();
 
         let mut messages = vec![ChatMessage::user(
             "sk-1234567890abcdef1234567890abcdef1234567890abcdef",
@@ -1021,7 +1039,8 @@ mod tests {
             max_tokens_per_turn: Some(100),
             max_tokens_per_session: None,
             max_tokens_per_day: None,
-        })));
+        })))
+        .unwrap();
 
         let guard_names: Vec<_> = turn.guards.iter().map(|guard| guard.name()).collect();
 
@@ -1038,7 +1057,7 @@ mod tests {
 
     #[test]
     fn build_default_turn_without_budget_config_does_not_block() {
-        let turn = build_default_turn(&test_config(None));
+        let turn = build_default_turn(&test_config(None)).unwrap();
 
         let mut messages = make_messages("hello");
         let result = turn.check_inbound(&mut messages, Some(make_budget_context(101, 0, 0)));
@@ -1048,7 +1067,7 @@ mod tests {
 
     #[test]
     fn build_default_turn_remains_shell_backed() {
-        let turn = build_default_turn(&test_config(None));
+        let turn = build_default_turn(&test_config(None)).unwrap();
         let tool_names: Vec<_> = turn
             .tool_definitions()
             .into_iter()
@@ -1061,7 +1080,7 @@ mod tests {
 
     #[test]
     fn build_t2_turn_contains_only_read_file() {
-        let turn = build_t2_turn(&test_config_for_tier(Some("t2"), None));
+        let turn = build_t2_turn(&test_config_for_tier(Some("t2"), None)).unwrap();
         let tool_names: Vec<_> = turn
             .tool_definitions()
             .into_iter()
@@ -1088,7 +1107,7 @@ mod tests {
         let child_config = config
             .with_spawned_child_runtime("t1", "gpt-5.4", None)
             .expect("expected spawned child config");
-        let turn = build_turn_for_config(&child_config);
+        let turn = build_turn_for_config(&child_config).unwrap();
         let tool_names: Vec<_> = turn
             .tool_definitions()
             .into_iter()
@@ -1110,7 +1129,7 @@ mod tests {
         let config = test_config_for_tier(None, None)
             .with_spawned_child_runtime("t2", "o3", Some("high"))
             .expect("expected spawned child config");
-        let turn = build_turn_for_config(&config);
+        let turn = build_turn_for_config(&config).unwrap();
         let tool_names: Vec<_> = turn
             .tool_definitions()
             .into_iter()
@@ -1128,7 +1147,7 @@ mod tests {
         let config = test_config_for_tier(None, None)
             .with_spawned_child_runtime("t2", "o3", None)
             .expect("expected spawned child config");
-        let turn = build_turn_for_config(&config);
+        let turn = build_turn_for_config(&config).unwrap();
 
         let err = turn
             .execute_tool("execute", "{}")
@@ -1142,7 +1161,7 @@ mod tests {
         let config = test_config_for_tier(None, None)
             .with_spawned_child_runtime("t3", "gpt-child", None)
             .expect("expected spawned child config");
-        let turn = build_turn_for_config(&config);
+        let turn = build_turn_for_config(&config).unwrap();
         let tool_names: Vec<_> = turn
             .tool_definitions()
             .into_iter()
@@ -1165,7 +1184,8 @@ mod tests {
                 required_caps: vec!["reasoning".to_string()],
                 token_estimate: 10,
             }],
-        );
+        )
+        .unwrap();
 
         let mut messages = Vec::new();
         turn.assemble_context(&mut messages);
@@ -1198,7 +1218,8 @@ mod tests {
                 required_caps: vec!["reasoning".to_string()],
                 token_estimate: 10,
             }],
-        );
+        )
+        .unwrap();
 
         let mut messages = Vec::new();
         turn.assemble_context(&mut messages);
@@ -1226,7 +1247,8 @@ mod tests {
                 required_caps: vec!["reasoning".to_string()],
                 token_estimate: 10,
             }],
-        );
+        )
+        .unwrap();
         let tool_names: Vec<_> = turn
             .tool_definitions()
             .into_iter()
@@ -1241,7 +1263,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_t2_turn_missing_shell_tool_fails_closed() {
-        let turn = build_t2_turn(&test_config_for_tier(Some("t2"), None));
+        let turn = build_t2_turn(&test_config_for_tier(Some("t2"), None)).unwrap();
 
         let err = turn
             .execute_tool("execute", "{}")
@@ -1267,7 +1289,7 @@ mod tests {
             .expect("test config should include silas");
         agent.t1.delegation_token_threshold = Some(12_000);
         agent.t1.delegation_tool_depth = Some(3);
-        let turn = build_t3_turn(&config);
+        let turn = build_t3_turn(&config).unwrap();
 
         let tool_names: Vec<_> = turn
             .tool_definitions()
@@ -1291,7 +1313,7 @@ mod tests {
 
     #[test]
     fn build_turn_for_config_uses_t2_for_active_t2_agent() {
-        let turn = build_turn_for_config(&test_config_for_tier(Some("t2"), None));
+        let turn = build_turn_for_config(&test_config_for_tier(Some("t2"), None)).unwrap();
         let tool_names: Vec<_> = turn
             .tool_definitions()
             .into_iter()
@@ -1303,7 +1325,7 @@ mod tests {
 
     #[test]
     fn build_turn_for_config_uses_t3_for_active_t3_agent() {
-        let turn = build_turn_for_config(&test_config_for_tier(Some("t3"), None));
+        let turn = build_turn_for_config(&test_config_for_tier(Some("t3"), None)).unwrap();
         let tool_names: Vec<_> = turn
             .tool_definitions()
             .into_iter()
@@ -1316,7 +1338,7 @@ mod tests {
 
     #[test]
     fn build_turn_for_config_defaults_to_t1_when_tier_unset() {
-        let turn = build_turn_for_config(&test_config_for_tier(None, None));
+        let turn = build_turn_for_config(&test_config_for_tier(None, None)).unwrap();
         let tool_names: Vec<_> = turn
             .tool_definitions()
             .into_iter()
@@ -1328,7 +1350,7 @@ mod tests {
 
     #[test]
     fn build_turn_for_config_treats_unknown_tier_like_t1() {
-        let turn = build_turn_for_config(&test_config_for_tier(Some("weird"), None));
+        let turn = build_turn_for_config(&test_config_for_tier(Some("weird"), None)).unwrap();
         let tool_names: Vec<_> = turn
             .tool_definitions()
             .into_iter()
@@ -1414,7 +1436,7 @@ mod tests {
     #[test]
     fn build_default_turn_carries_delegation_thresholds_into_turn_config() {
         let config = crate::config::Config::load("agents.toml").expect("config should load");
-        let turn = build_default_turn(&config);
+        let turn = build_default_turn(&config).unwrap();
         let delegation = turn
             .delegation_config()
             .expect("delegation config should be present");

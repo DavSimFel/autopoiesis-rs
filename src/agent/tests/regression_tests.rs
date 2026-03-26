@@ -85,7 +85,7 @@ async fn inbound_approval_prompt_forwards_user_message_text() {
 }
 
 #[tokio::test]
-async fn budget_ceiling_is_enforced_on_the_next_turn() {
+async fn budget_ceiling_is_enforced_on_the_same_turn() {
     let dir = temp_sessions_dir("budget_next_turn");
     let config_path = dir.join("agents.toml");
     std::fs::write(
@@ -106,7 +106,7 @@ max_tokens_per_day = 10
     .unwrap();
 
     let config = crate::config::Config::load(&config_path).unwrap();
-    let turn = crate::turn::build_turn_for_config(&config);
+    let turn = crate::turn::build_turn_for_config(&config).unwrap();
     let mut session = crate::session::Session::new(&dir).unwrap();
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let provider_turn = StreamedTurn {
@@ -169,31 +169,16 @@ max_tokens_per_day = 10
     )
     .await
     .unwrap();
-    assert!(matches!(first, TurnVerdict::Executed(_)));
-
-    let live_snapshot = session.budget_snapshot().unwrap();
-    assert!(live_snapshot.turn_tokens > 10);
-
-    let second = run_agent_loop(
-        &mut make_provider,
-        &mut session,
-        "second turn".to_string(),
-        Principal::Operator,
-        &turn,
-        &mut token_sink,
-        &mut approval_handler,
-    )
-    .await
-    .unwrap();
-
     assert!(matches!(
-        second,
+        first,
         TurnVerdict::Denied {
             gate_id,
             ..
         } if gate_id == "budget"
     ));
     assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(session.history().len(), 2);
+    assert!(session.budget_snapshot().unwrap().turn_tokens > 10);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -407,7 +407,7 @@ token_estimate = 250
     let mut t3_session = autopoiesis::session::Session::new(fixtures.root.join("sessions/t3"))?;
     store.create_session("t1-root", None)?;
 
-    let t1_turn = autopoiesis::turn::build_turn_for_config(&config);
+    let t1_turn = autopoiesis::turn::build_turn_for_config(&config)?;
     assert_eq!(
         t1_turn
             .tool_definitions()
@@ -481,7 +481,7 @@ token_estimate = 250
     let t2_config = config
         .with_spawned_child_runtime("t2", "t2-model", Some("high"))
         .context("build T2 runtime config")?;
-    let t2_turn = autopoiesis::turn::build_turn_for_config(&t2_config);
+    let t2_turn = autopoiesis::turn::build_turn_for_config(&t2_config)?;
     assert_eq!(
         t2_turn
             .tool_definitions()
@@ -597,7 +597,7 @@ token_estimate = 250
     let t3_config = config
         .with_spawned_child_runtime("t3", "gpt-child", None)
         .context("build T3 runtime config")?;
-    let t3_turn = autopoiesis::turn::build_spawned_t3_turn(&t3_config, planning_skill.clone());
+    let t3_turn = autopoiesis::turn::build_spawned_t3_turn(&t3_config, planning_skill.clone())?;
     assert_eq!(
         t3_turn
             .tool_definitions()
@@ -648,7 +648,8 @@ token_estimate = 250
     assert!(autopoiesis::spawn::enqueue_child_completion(
         &mut store,
         &spawn_t3.child_session_id,
-        &t3_session
+        &t3_session,
+        None
     )?);
 
     let t3_tools = t3_provider_tools
@@ -697,7 +698,8 @@ token_estimate = 250
     assert!(autopoiesis::spawn::enqueue_child_completion(
         &mut store,
         &spawn_t2.child_session_id,
-        &t2_session
+        &t2_session,
+        None
     )?);
 
     let t2_tools = t2_provider_tools
@@ -734,7 +736,7 @@ token_estimate = 250
             .contains("T2 conclusion: workspace sentinel alpha + T3-SENTINEL")
     }));
 
-    let t1_turn_after_completion = autopoiesis::turn::build_turn_for_config(&config);
+    let t1_turn_after_completion = autopoiesis::turn::build_turn_for_config(&config)?;
     let mut t1_finalize_make_provider = {
         let provider = t1_provider.clone();
         move || {
@@ -824,7 +826,7 @@ token_estimate = 250
     let t3_config = config
         .with_spawned_child_runtime("t3", "gpt-child", None)
         .context("build T3 runtime config")?;
-    let t3_turn = autopoiesis::turn::build_spawned_t3_turn(&t3_config, vec![planning_skill]);
+    let t3_turn = autopoiesis::turn::build_spawned_t3_turn(&t3_config, vec![planning_skill])?;
 
     let approval_turn = StreamedTurn {
         assistant_message: ChatMessage {
@@ -958,7 +960,7 @@ token_estimate = 250
     let t3_config = config
         .with_spawned_child_runtime("t3", "gpt-child", None)
         .context("build T3 runtime config")?;
-    let t3_turn = autopoiesis::turn::build_spawned_t3_turn(&t3_config, vec![planning_skill]);
+    let t3_turn = autopoiesis::turn::build_spawned_t3_turn(&t3_config, vec![planning_skill])?;
 
     let provider = ScriptedProvider::new(vec![
         scripted_tool_call_turn(
@@ -1075,7 +1077,7 @@ token_estimate = 250
     let t3_config = config
         .with_spawned_child_runtime("t3", "gpt-child", None)
         .context("build T3 runtime config")?;
-    let t3_turn = autopoiesis::turn::build_spawned_t3_turn(&t3_config, vec![planning_skill]);
+    let t3_turn = autopoiesis::turn::build_spawned_t3_turn(&t3_config, vec![planning_skill])?;
 
     let provider = ScriptedProvider::new(vec![
         scripted_tool_call_turn(
@@ -1180,7 +1182,7 @@ token_estimate = 250
     let t3_config = config
         .with_spawned_child_runtime("t3", "gpt-child", None)
         .context("build T3 runtime config")?;
-    let t3_turn = autopoiesis::turn::build_spawned_t3_turn(&t3_config, vec![planning_skill]);
+    let t3_turn = autopoiesis::turn::build_spawned_t3_turn(&t3_config, vec![planning_skill])?;
 
     let approval_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let approval_calls_for_handler = approval_calls.clone();

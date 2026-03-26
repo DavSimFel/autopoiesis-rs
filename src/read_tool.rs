@@ -1,6 +1,8 @@
 //! Structured file read tool with provenance tagging and path policy checks.
 
 use std::convert::TryFrom;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
@@ -11,6 +13,14 @@ use crate::config::ReadToolConfig;
 use crate::gate::secret_patterns::path_is_protected;
 use crate::llm::FunctionTool;
 use crate::tool::{Tool, ToolFuture};
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 
 const PROVENANCE_PRINCIPAL: &str = "operator";
 
@@ -157,7 +167,9 @@ impl ReadFile {
     }
 
     fn read_text_file(path: &Path, max_read_bytes: usize) -> Result<String> {
-        let metadata = std::fs::metadata(path)
+        let file = Self::open_text_file(path)?;
+        let metadata = file
+            .metadata()
             .with_context(|| format!("failed to stat {}", path.display()))?;
 
         if metadata.is_dir() {
@@ -172,8 +184,10 @@ impl ReadFile {
             ));
         }
 
-        let bytes =
-            std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        let mut bytes = Vec::with_capacity(max_read_bytes.saturating_add(1));
+        let mut file = file.take(max_read_bytes as u64 + 1);
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("failed to read {}", path.display()))?;
         if bytes.len() > max_read_bytes {
             return Err(anyhow!(
                 "too large: {} exceeds {} bytes",
@@ -183,6 +197,147 @@ impl ReadFile {
         }
 
         String::from_utf8(bytes).with_context(|| format!("failed to decode {}", path.display()))
+    }
+
+    #[cfg(unix)]
+    fn open_text_file(path: &Path) -> Result<File> {
+        fn open_path(path: &Path, flags: libc::c_int) -> Result<OwnedFd> {
+            let path_bytes = path.as_os_str().as_bytes();
+            let c_path = CString::new(path_bytes)
+                .with_context(|| format!("failed to encode {}", path.display()))?;
+            let fd = unsafe { libc::open(c_path.as_ptr(), flags, 0) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("failed to open {}", path.display()));
+            }
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+
+        fn open_component(
+            dirfd: i32,
+            name: &std::ffi::OsStr,
+            flags: libc::c_int,
+        ) -> Result<OwnedFd> {
+            let c_name = CString::new(name.as_bytes())
+                .with_context(|| format!("failed to encode {}", Path::new(name).display()))?;
+            let fd = unsafe { libc::openat(dirfd, c_name.as_ptr(), flags, 0) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("failed to open {}", Path::new(name).display()));
+            }
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+
+        let mut current_dir = if path.is_absolute() {
+            open_path(
+                Path::new("/"),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )?
+        } else {
+            open_path(
+                Path::new("."),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )?
+        };
+
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
+            match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::Prefix(_) => {
+                    return Err(anyhow!("path prefixes are not allowed"));
+                }
+                Component::ParentDir => {
+                    return Err(anyhow!("parent directory components are not allowed"));
+                }
+                Component::Normal(name) => {
+                    let is_last = components.peek().is_none();
+                    let flags = if is_last {
+                        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW
+                    } else {
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW
+                    };
+                    let next_fd = open_component(current_dir.as_raw_fd(), name, flags)?;
+                    if is_last {
+                        return Ok(File::from(next_fd));
+                    }
+                    current_dir = next_fd;
+                }
+            }
+        }
+
+        Err(anyhow!("path is empty"))
+    }
+
+    #[cfg(not(unix))]
+    fn open_text_file(path: &Path) -> Result<File> {
+        let mut current_path = PathBuf::new();
+        let mut components = path.components().peekable();
+
+        while let Some(component) = components.next() {
+            match component {
+                Component::RootDir | Component::CurDir => {
+                    current_path.push(component.as_os_str());
+                }
+                Component::Prefix(_) => {
+                    #[cfg(windows)]
+                    {
+                        current_path.push(component.as_os_str());
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        return Err(anyhow!("path prefixes are not allowed"));
+                    }
+                }
+                Component::ParentDir => {
+                    return Err(anyhow!("parent directory components are not allowed"));
+                }
+                Component::Normal(name) => {
+                    current_path.push(name);
+                    if components.peek().is_some() {
+                        let metadata =
+                            std::fs::symlink_metadata(&current_path).with_context(|| {
+                                format!("failed to inspect {}", current_path.display())
+                            })?;
+                        if metadata.file_type().is_symlink() {
+                            return Err(anyhow!("symlinks are not allowed"));
+                        }
+                        if !metadata.is_dir() {
+                            return Err(anyhow!(
+                                "path component is not a directory: {}",
+                                current_path.display()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&current_path)
+                .with_context(|| format!("failed to open {}", path.display()))?;
+            return Ok(file);
+        }
+
+        #[cfg(all(not(windows), not(unix)))]
+        {
+            return Err(anyhow!(
+                "reading files is not supported securely on this platform"
+            ));
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&current_path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        Ok(file)
     }
 
     fn slice_lines(contents: &str, offset: Option<u64>, limit: Option<u64>) -> Result<String> {

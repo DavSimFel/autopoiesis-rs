@@ -249,12 +249,8 @@ fn step_at(plan_action: &PlanAction, index: usize) -> Result<&PlanStepSpec> {
         .ok_or_else(|| anyhow!("plan run current step index is out of range"))
 }
 
-fn next_attempt_index(store: &Store, plan_run: &PlanRun, step_index: i64) -> Result<i64> {
-    let attempts = store.get_step_attempts(&plan_run.id, step_index)?;
-    Ok(attempts
-        .into_iter()
-        .filter(|attempt| attempt.revision == plan_run.revision)
-        .count() as i64)
+fn next_attempt_index(store: &Store, plan_run: &PlanRun) -> Result<i64> {
+    store.next_step_attempt_index_for_run(plan_run)
 }
 
 fn observed_output_from_result(
@@ -555,13 +551,13 @@ where
     }
 
     let step = step_at(&plan_action, current_step_index)?;
-    let attempt = next_attempt_index(store, plan_run, step_index)?;
+    let attempt = next_attempt_index(store, plan_run)?;
     let parent_session_dir = session_dir.join(&plan_run.owner_session_id);
     let mut session = Session::new(&parent_session_dir).context("failed to open plan session")?;
     session
         .load_today()
         .context("failed to load plan session history")?;
-    let shell_turn = build_t3_turn(config);
+    let shell_turn = build_t3_turn(config)?;
 
     match step {
         PlanStepSpec::Shell {
@@ -742,7 +738,7 @@ where
             }
 
             let completed = current_step_index + 1 >= plan_action.steps.len();
-            store
+            let advanced = store
                 .update_plan_run_status_preserving_failed(
                     &plan_run.id,
                     if completed { "completed" } else { "pending" },
@@ -754,6 +750,11 @@ where
                     },
                 )
                 .context("failed to advance shell step")?;
+            if !advanced {
+                finalize_attempt(store, attempt_id, "failed", &summary_json, &checks_json)
+                    .context("failed to finalize raced shell attempt")?;
+                return Ok(StepOutcome::Failed);
+            }
             finalize_attempt(store, attempt_id, "passed", &summary_json, &checks_json)
                 .context("failed to finalize passed shell attempt")?;
             Ok(if completed {
@@ -958,7 +959,7 @@ where
             }
 
             let completed = current_step_index + 1 >= plan_action.steps.len();
-            store
+            let advanced = store
                 .update_plan_run_status_preserving_failed(
                     &plan_run.id,
                     if completed { "completed" } else { "pending" },
@@ -973,6 +974,11 @@ where
             store
                 .update_step_attempt_child_session(attempt_id, Some(&drain_result.child_session_id))
                 .context("failed to record spawned child session")?;
+            if !advanced {
+                finalize_attempt(store, attempt_id, "failed", &summary_json, &checks_json)
+                    .context("failed to finalize raced spawn attempt")?;
+                return Ok(StepOutcome::Failed);
+            }
             finalize_attempt(store, attempt_id, "passed", &summary_json, &checks_json)
                 .context("failed to finalize passed spawn attempt")?;
             Ok(if completed {

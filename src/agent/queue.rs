@@ -107,11 +107,10 @@ where
     P: LlmProvider,
 {
     info!(%session_id, "draining queue");
-    let mut processed_any = false;
+    let mut completed_agent_turn = false;
+    let mut first_denial: Option<TurnVerdict> = None;
     let mut last_assistant_response = None;
-    let baseline_assistant_response = crate::spawn::latest_assistant_response(session);
     while let Some(message) = store.dequeue_next_message(session_id)? {
-        processed_any = true;
         let outcome = process_queued_message(
             &message,
             session,
@@ -124,11 +123,9 @@ where
         match outcome {
             Ok(QueueOutcome::Agent(verdict)) => {
                 store.mark_processed(message.id)?;
-                let current_assistant_response = crate::spawn::latest_assistant_response(session);
-                if current_assistant_response.as_deref() != baseline_assistant_response.as_deref() {
-                    last_assistant_response = current_assistant_response;
-                } else {
-                    last_assistant_response = None;
+                if !matches!(verdict, TurnVerdict::Denied { .. }) {
+                    last_assistant_response = crate::spawn::latest_assistant_response(session);
+                    completed_agent_turn = true;
                 }
                 match verdict {
                     TurnVerdict::Executed(_) => {}
@@ -140,11 +137,9 @@ where
                     }
                     TurnVerdict::Denied { reason, gate_id } => {
                         warn!(message_id = message.id, %gate_id, "turn denied");
-                        return Ok((
-                            Some(TurnVerdict::Denied { reason, gate_id }),
-                            processed_any,
-                            last_assistant_response,
-                        ));
+                        if first_denial.is_none() {
+                            first_denial = Some(TurnVerdict::Denied { reason, gate_id });
+                        }
                     }
                 }
             }
@@ -163,11 +158,22 @@ where
         }
     }
 
-    if crate::spawn::should_enqueue_child_completion(processed_any) {
-        let _ = crate::spawn::enqueue_child_completion(store, session_id, session)?;
+    if crate::spawn::should_enqueue_child_completion(completed_agent_turn) {
+        let _ = crate::spawn::enqueue_child_completion(
+            store,
+            session_id,
+            session,
+            last_assistant_response.as_deref(),
+        )?;
     }
 
-    Ok((None, processed_any, last_assistant_response))
+    let verdict = if completed_agent_turn {
+        None
+    } else {
+        first_denial
+    };
+
+    Ok((verdict, completed_agent_turn, last_assistant_response))
 }
 
 #[cfg(test)]

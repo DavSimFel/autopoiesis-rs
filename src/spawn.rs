@@ -238,12 +238,13 @@ pub fn enqueue_child_completion(
     store: &mut Store,
     child_session_id: &str,
     session: &Session,
+    last_assistant_response: Option<&str>,
 ) -> Result<bool> {
     let Some(parent_session_id) = store.get_parent_session(child_session_id)? else {
         return Ok(false);
     };
 
-    let completion = build_completion_message(child_session_id, session);
+    let completion = build_completion_message(child_session_id, session, last_assistant_response);
     store
         .enqueue_message(
             &parent_session_id,
@@ -260,8 +261,14 @@ pub(crate) fn should_enqueue_child_completion(processed_any: bool) -> bool {
     processed_any
 }
 
-fn build_completion_message(child_session_id: &str, session: &Session) -> String {
-    let response = latest_assistant_response(session)
+fn build_completion_message(
+    child_session_id: &str,
+    session: &Session,
+    last_assistant_response: Option<&str>,
+) -> String {
+    let response = last_assistant_response
+        .map(ToString::to_string)
+        .or_else(|| latest_assistant_response(session))
         .unwrap_or_else(|| "No assistant response was produced.".to_string());
 
     format!("Child session {child_session_id} completed.\n\n{response}")
@@ -787,7 +794,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(enqueue_child_completion(&mut store, "child", &session).unwrap());
+        assert!(enqueue_child_completion(&mut store, "child", &session, None).unwrap());
 
         let conn = rusqlite::Connection::open(&queue_path).unwrap();
         let (role, content, source): (String, String, String) = conn
@@ -820,7 +827,7 @@ mod tests {
             .unwrap();
 
         let session = Session::new(&sessions_dir).unwrap();
-        assert!(enqueue_child_completion(&mut store, "child", &session).unwrap());
+        assert!(enqueue_child_completion(&mut store, "child", &session, None).unwrap());
 
         let conn = rusqlite::Connection::open(&queue_path).unwrap();
         let content: String = conn
@@ -856,7 +863,7 @@ mod tests {
             .append(assistant_message("only response", Principal::Agent), None)
             .unwrap();
 
-        assert!(!enqueue_child_completion(&mut store, "child", &session).unwrap());
+        assert!(!enqueue_child_completion(&mut store, "child", &session, None).unwrap());
 
         let conn = rusqlite::Connection::open(&queue_path).unwrap();
         let count: i64 = conn

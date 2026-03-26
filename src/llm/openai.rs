@@ -462,6 +462,20 @@ fn apply_sse_event(
     }
 }
 
+fn require_terminal_sse_event(terminal_seen: bool) -> Result<()> {
+    if terminal_seen {
+        Ok(())
+    } else {
+        anyhow::bail!("stream ended before terminal SSE event was received");
+    }
+}
+
+fn note_terminal_sse_event(event: &SseEvent, terminal_seen: &mut bool) {
+    if matches!(event, SseEvent::Done | SseEvent::Completed { .. }) {
+        *terminal_seen = true;
+    }
+}
+
 impl LlmProvider for OpenAIProvider {
     /// Stream a completion and parse SSE events from the OpenAI Responses API.
     ///
@@ -518,6 +532,7 @@ impl LlmProvider for OpenAIProvider {
         let mut state = SseStreamState::new();
         let mut stream_buffer = String::new();
         let mut done = false;
+        let mut terminal_seen = false;
 
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
@@ -531,7 +546,10 @@ impl LlmProvider for OpenAIProvider {
                 stream_buffer.drain(..line_end + 1);
                 trace!(line_len = raw_line.len(), "parsing sse line from stream");
                 if let Some(event) = parse_sse_line(&raw_line)
-                    && apply_sse_event(event, &mut state, on_token)
+                    && {
+                        note_terminal_sse_event(&event, &mut terminal_seen);
+                        apply_sse_event(event, &mut state, on_token)
+                    }
                 {
                     done = true;
                     break;
@@ -550,8 +568,11 @@ impl LlmProvider for OpenAIProvider {
                 buffer_len = stream_buffer.len(),
                 "parsing trailing sse buffer"
             );
+            note_terminal_sse_event(&event, &mut terminal_seen);
             let _ = apply_sse_event(event, &mut state, on_token);
         }
+
+        require_terminal_sse_event(terminal_seen)?;
 
         let tool_calls: Vec<ToolCall> = state
             .tool_calls
@@ -924,6 +945,38 @@ mod tests {
     }
 
     #[test]
+    fn stream_completion_requires_terminal_sse_event() {
+        assert!(require_terminal_sse_event(true).is_ok());
+        assert!(require_terminal_sse_event(false).is_err());
+    }
+
+    #[test]
+    fn note_terminal_sse_event_marks_terminal_events() {
+        let mut terminal_seen = false;
+        note_terminal_sse_event(&SseEvent::Done, &mut terminal_seen);
+        assert!(terminal_seen);
+
+        terminal_seen = false;
+        note_terminal_sse_event(&SseEvent::Completed { meta: None }, &mut terminal_seen);
+        assert!(terminal_seen);
+    }
+
+    #[test]
+    fn collect_stream_from_sse_chunks_without_terminal_event_is_rejected() {
+        let (tokens, tool_calls, meta, stop_reason, done) = collect_stream_from_sse_chunks(&[
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\"}\n",
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n",
+        ]);
+
+        assert_eq!(tokens.concat(), "hello");
+        assert!(tool_calls.is_empty());
+        assert!(meta.is_none());
+        assert_eq!(stop_reason, StopReason::Stop);
+        assert!(!done);
+        assert!(require_terminal_sse_event(done).is_err());
+    }
+
+    #[test]
     fn parse_sse_line_trailing_function_call_output_item_without_newline_is_parsed() {
         let (_, tool_calls, meta, stop_reason, done) = collect_stream_from_sse_chunks(&[
             b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"execute\",\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}",
@@ -952,6 +1005,40 @@ mod tests {
         assert_eq!(meta.input_tokens, Some(100));
         assert_eq!(meta.output_tokens, Some(50));
         assert_eq!(meta.reasoning_tokens, Some(25));
+    }
+
+    #[tokio::test]
+    async fn stream_completion_requires_terminal_sse_event_through_http() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(|| async {
+                (
+                    [
+                        ("content-type", "text/event-stream"),
+                        ("cache-control", "no-cache"),
+                    ],
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\"}\n\n\
+                     data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n",
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider =
+            OpenAIProvider::new("test-key", format!("http://{}", addr), "gpt-4o-mini", None);
+        let messages = vec![ChatMessage::user("hello")];
+        let mut on_token = |_| {};
+        let err = provider
+            .stream_completion(&messages, &[], &mut on_token)
+            .await
+            .expect_err("missing terminal SSE event must fail");
+
+        assert!(err.to_string().contains("terminal"));
+        server.abort();
     }
 
     #[test]

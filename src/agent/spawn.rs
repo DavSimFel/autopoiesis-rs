@@ -97,7 +97,7 @@ where
     let turn = match metadata.tier.as_str() {
         "t3" => crate::turn::build_spawned_t3_turn(&child_config, metadata.skills.clone()),
         _ => crate::turn::build_turn_for_config(&child_config),
-    };
+    }?;
 
     let child_session_dir = context
         .session_dir
@@ -109,7 +109,7 @@ where
         .context("failed to load child session history")?;
 
     let mut make_provider_for_turn = || make_provider(&child_config);
-    let (drain_result, processed_any, current_assistant_response) = drain_queue_with_stats(
+    let (drain_result, completed_agent_turn, current_assistant_response) = drain_queue_with_stats(
         context.store,
         &context.spawn_result.child_session_id,
         &mut child_session,
@@ -134,7 +134,7 @@ where
     }
 
     let last_assistant_response = current_assistant_response;
-    if processed_any {
+    if completed_agent_turn {
         apply_t2_plan_handoff(
             context.store,
             &metadata.parent_session_id,

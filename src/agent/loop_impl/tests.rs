@@ -1,5 +1,18 @@
 use crate::agent::loop_impl::make_denial_verdict;
 use crate::agent::tests::common::*;
+use crate::llm::TurnMeta;
+
+struct TailUserContext;
+
+impl crate::context::ContextSource for TailUserContext {
+    fn name(&self) -> &str {
+        "tail-user"
+    }
+
+    fn assemble(&self, messages: &mut Vec<ChatMessage>) {
+        messages.push(ChatMessage::user("tail context user message"));
+    }
+}
 #[tokio::test]
 async fn trims_context_before_stream_completion_when_over_estimated_limit() {
     let dir = temp_sessions_dir("pre_call_trim");
@@ -685,11 +698,13 @@ async fn context_insertion_does_not_replace_persisted_user_message() {
 
     let (provider, _observed_message_counts) = InspectingProvider::new();
     let mut session = crate::session::Session::new(&dir).unwrap();
-    let turn = Turn::new().context(crate::context::Identity::new(
-        crate::identity::t1_identity_files(&identity_dir, "silas"),
-        std::collections::HashMap::new(),
-        "fallback",
-    ));
+    let turn = Turn::new()
+        .context(crate::context::Identity::new(
+            crate::identity::t1_identity_files(&identity_dir, "silas"),
+            std::collections::HashMap::new(),
+            "fallback",
+        ))
+        .context(TailUserContext);
     let mut make_provider = {
         let provider = provider.clone();
         move || {
@@ -712,18 +727,179 @@ async fn context_insertion_does_not_replace_persisted_user_message() {
     .await
     .unwrap();
 
-    let first = session
+    let persisted_user = session
         .history()
-        .first()
+        .iter()
+        .find(|message| matches!(message.role, crate::llm::ChatRole::User))
         .expect("user message should be persisted");
-    assert!(matches!(first.role, crate::llm::ChatRole::User));
-    let content = match &first.content[0] {
+    let content = match &persisted_user.content[0] {
         MessageContent::Text { text } => text,
         _ => panic!("expected text content"),
     };
     assert!(content.contains("store this user prompt"));
+    assert_ne!(content, "tail context user message");
 
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn context_insertion_modify_path_persists_indexed_user_message() {
+    let dir = temp_sessions_dir("modify_user_with_context");
+    let identity_dir = dir.join("identity");
+    std::fs::create_dir_all(identity_dir.join("agents/silas")).unwrap();
+    std::fs::write(identity_dir.join("constitution.md"), "constitution").unwrap();
+    std::fs::write(identity_dir.join("agents/silas/agent.md"), "You are Silas.").unwrap();
+    std::fs::write(identity_dir.join("context.md"), "context").unwrap();
+
+    struct ModifyGuard;
+
+    impl Guard for ModifyGuard {
+        fn name(&self) -> &str {
+            "modify-guard"
+        }
+
+        fn check(&self, event: &mut GuardEvent, _context: &crate::gate::GuardContext) -> Verdict {
+            match event {
+                GuardEvent::Inbound(messages) => {
+                    if let Some(user_message) = messages.iter_mut().rev().find(|message| {
+                        message.role == crate::llm::ChatRole::User
+                            && message.content.iter().any(|block| {
+                                matches!(block, MessageContent::Text { text } if text.contains("modify this user prompt"))
+                            })
+                    }) {
+                        for block in &mut user_message.content {
+                            if let MessageContent::Text { text } = block {
+                                *text = "modified user prompt".to_string();
+                            }
+                        }
+                    }
+                    Verdict::Modify
+                }
+                _ => Verdict::Allow,
+            }
+        }
+    }
+
+    let (provider, _observed_message_counts) = InspectingProvider::new();
+    let mut session = crate::session::Session::new(&dir).unwrap();
+    let turn = Turn::new()
+        .context(crate::context::Identity::new(
+            crate::identity::t1_identity_files(&identity_dir, "silas"),
+            std::collections::HashMap::new(),
+            "fallback",
+        ))
+        .context(TailUserContext)
+        .guard(ModifyGuard);
+    let mut make_provider = {
+        let provider = provider.clone();
+        move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        }
+    };
+    let mut token_sink = |_token: String| {};
+    let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+
+    run_agent_loop(
+        &mut make_provider,
+        &mut session,
+        "modify this user prompt".to_string(),
+        Principal::Operator,
+        &turn,
+        &mut token_sink,
+        &mut approval_handler,
+    )
+    .await
+    .unwrap();
+
+    let persisted_user = session
+        .history()
+        .iter()
+        .find(|message| matches!(message.role, crate::llm::ChatRole::User))
+        .expect("user message should be persisted");
+    let content = match &persisted_user.content[0] {
+        MessageContent::Text { text } => text,
+        _ => panic!("expected text content"),
+    };
+    assert_eq!(content, "modified user prompt");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn token_total_does_not_overcharge_partial_metadata() {
+    let mut assistant_message = ChatMessage::with_role_with_principal(
+        crate::llm::ChatRole::Assistant,
+        Some(Principal::Agent),
+    );
+    assistant_message
+        .content
+        .push(MessageContent::text("response"));
+    let estimated_tokens = crate::session::Session::estimate_message_tokens(&assistant_message);
+
+    let input_only = TurnMeta {
+        model: None,
+        input_tokens: Some(11),
+        output_tokens: None,
+        reasoning_tokens: None,
+        reasoning_trace: None,
+    };
+    assert_eq!(
+        super::token_total(Some(&input_only), &assistant_message),
+        estimated_tokens.max(11)
+    );
+
+    let output_only = TurnMeta {
+        model: None,
+        input_tokens: None,
+        output_tokens: Some(17),
+        reasoning_tokens: None,
+        reasoning_trace: None,
+    };
+    assert_eq!(
+        super::token_total(Some(&output_only), &assistant_message),
+        estimated_tokens.max(17)
+    );
+}
+
+#[test]
+fn charged_turn_meta_preserves_partial_usage_totals() {
+    let mut assistant_message = ChatMessage::with_role_with_principal(
+        crate::llm::ChatRole::Assistant,
+        Some(Principal::Agent),
+    );
+    assistant_message
+        .content
+        .push(MessageContent::text("response"));
+    let estimated_tokens = crate::session::Session::estimate_message_tokens(&assistant_message);
+
+    let input_only = TurnMeta {
+        model: None,
+        input_tokens: Some(11),
+        output_tokens: None,
+        reasoning_tokens: None,
+        reasoning_trace: None,
+    };
+    let charged = super::charged_turn_meta(Some(input_only), &assistant_message);
+    assert_eq!(charged.input_tokens, Some(11));
+    assert_eq!(
+        charged.output_tokens,
+        Some(estimated_tokens.saturating_sub(11))
+    );
+
+    let output_only = TurnMeta {
+        model: None,
+        input_tokens: None,
+        output_tokens: Some(17),
+        reasoning_tokens: None,
+        reasoning_trace: None,
+    };
+    let charged = super::charged_turn_meta(Some(output_only), &assistant_message);
+    assert_eq!(
+        charged.input_tokens,
+        Some(estimated_tokens.saturating_sub(17))
+    );
+    assert_eq!(charged.output_tokens, Some(17));
 }
 
 #[test]
