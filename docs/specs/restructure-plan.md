@@ -316,15 +316,15 @@ src/
 | `src/terminal_ui.rs` | Terminal token output, approval prompting, and denial rendering. | Rename/move current `src/cli.rs`. |
 | `src/logging.rs` | Tracing formatter and user-output tracing targets. | `PlainMessageFormatter`, `STDOUT_USER_OUTPUT_TARGET`, and `STDERR_USER_OUTPUT_TARGET` from `src/util.rs`. |
 | `src/time.rs` | UTC timestamp formatting helpers shared by store/session/plan. | `utc_timestamp()` from `src/util.rs` and `format_system_time()` from `src/store.rs`. |
-| `src/config/mod.rs` | Public config facade and reexports. | Public API surface from current `src/config.rs`. |
-| `src/config/runtime.rs` | Defines runtime `Config` and lightweight accessors. | `Config`, `active_agent_definition()`, and `active_t1_config()` from `src/config.rs`. |
-| `src/config/load.rs` | Loads file config into runtime config and applies env overrides. | `load()`, `load_typed()`, `from_file*()`, default runtime assembly, skills-dir resolution, and env override logic from `src/config.rs:158-356`. |
-| `src/config/spawn_runtime.rs` | Retargets runtime config for spawned child sessions. | `with_spawned_child_runtime*()` from `src/config.rs:359-490`. |
-| `src/config/agents.rs` | Defines agent/tier config and active-agent selection rules. | `AgentsConfig`, `AgentDefinition`, `AgentTierConfig`, `select_active_agent()`, and `validate_agent_identity()` from `src/config.rs:1256-1384`. |
-| `src/config/models.rs` | Defines model catalog and route config types. | `ModelsConfig`, `ModelDefinition`, `ModelRoute` from `src/config.rs:1303-1335`. |
-| `src/config/domains.rs` | Defines domain packs and validates domain prompt extensions. | `DomainsConfig`, `DomainConfig`, and `validate_domain_context_extend()` from `src/config.rs:1337-1404`. |
-| `src/config/policy.rs` | Defines shell/read/subscription/queue/budget policy types and validation. | `BudgetConfig`, `QueueConfig`, `ReadToolConfig`, `SubscriptionsConfig`, `ShellPolicy`, defaults, and validators from `src/config.rs`. |
-| `src/config/file_schema.rs` | Defines the raw TOML file schema. | `RuntimeFileConfig` and `AuthFileSection` from `src/config.rs:1233-1254` and `src/config.rs:1350-1353`. |
+| `src/config/mod.rs` | Public config facade and reexports. | Public API surface currently split across `src/config/{runtime,load,spawn_runtime,agents,models,domains,policy,file_schema}.rs`. |
+| `src/config/runtime.rs` | Defines runtime `Config` and lightweight accessors. | `Config`, `active_agent_definition()`, and `active_t1_config()`. |
+| `src/config/load.rs` | Loads file config into runtime config and applies env overrides. | `load()`, `load_typed()`, `from_file*()`, default runtime assembly, skills-dir resolution, and env override logic. |
+| `src/config/spawn_runtime.rs` | Retargets runtime config for spawned child sessions. | `with_spawned_child_runtime*()`. |
+| `src/config/agents.rs` | Defines agent/tier config and active-agent selection rules. | `AgentsConfig`, `AgentDefinition`, `AgentTierConfig`, `select_active_agent()`, and `validate_agent_identity()`. |
+| `src/config/models.rs` | Defines model catalog and route config types. | `ModelsConfig`, `ModelDefinition`, `ModelRoute`. |
+| `src/config/domains.rs` | Defines domain packs and validates domain prompt extensions. | `DomainsConfig`, `DomainConfig`, and `validate_domain_context_extend()`. |
+| `src/config/policy.rs` | Defines shell/read/subscription policy types and validation. | `BudgetConfig`, `QueueConfig`, `ReadToolConfig`, `SubscriptionsConfig`, `ShellPolicy`, defaults, and validators. |
+| `src/config/file_schema.rs` | Defines the raw TOML file schema. | `RuntimeFileConfig` and `AuthFileSection`. |
 | `src/store/mod.rs` | Keeps `Store` as the facade and owns shared transaction/reexport wiring. | `Store`, `with_transaction()`, and public reexports from current `src/store.rs`. |
 | `src/store/migrations.rs` | Initializes and migrates SQLite schema. | `Store::new()` schema bootstrap plus `ensure_*`, `cleanup_legacy_plan_rows()`, and related helpers from `src/store.rs:103-170` and `src/store.rs:1590-1862`. |
 | `src/store/sessions.rs` | Owns session and child-session persistence. | `create_session()`, `create_child_session*()`, `list_sessions()`, `get_parent_session()`, `get_session_metadata()`, and `list_child_sessions()` from `src/store.rs:173-295`. |

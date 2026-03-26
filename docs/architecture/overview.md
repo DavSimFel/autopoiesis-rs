@@ -35,7 +35,7 @@
 - `src/plan/notify.rs` - notifications back to T2.
 - `src/plan/patch.rs` - plan patching and revision handling.
 - `src/plan/recovery.rs` - crash recovery for stalled plan runs.
-- `src/config.rs` - `agents.toml` loading, shell policy, model catalog, domains.
+- `src/config/mod.rs` - config facade; `src/config/{runtime,load,spawn_runtime,agents,models,domains,policy,file_schema}.rs` own runtime state, validation, and schema parsing.
 - `src/context.rs` - context sources and prompt assembly helpers.
 - `src/session.rs` - JSONL history and per-session metadata.
 - `src/store.rs` - SQLite sessions, queue, subscriptions, and plan tables.

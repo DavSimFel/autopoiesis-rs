@@ -1,286 +1,293 @@
-# Session 3 Plan: Validation Boundaries - Config Split
+# Session 3 Plan: Validation Boundaries / Config Split
 
 ## 1. Files Read
 
-### Repo guidance, standards, and validation flow
 - `AGENTS.md`
 - `CODE_STANDARD.md`
-- `README.md`
-- `docs/risks.md`
-- `docs/architecture/overview.md`
-- `docs/specs/restructure-plan.md` (config split section)
-- `xtask/lint.sh`
-
-### Config
 - `Cargo.toml`
 - `agents.toml`
-
-### `src/` root
-- `src/auth.rs`
-- `src/cli.rs`
-- `src/config.rs`
-- `src/context.rs`
-- `src/delegation.rs`
-- `src/identity.rs`
-- `src/lib.rs`
-- `src/main.rs`
-- `src/model_selection.rs`
-- `src/plan.rs`
-- `src/principal.rs`
-- `src/read_tool.rs`
-- `src/skills.rs`
-- `src/spawn.rs`
-- `src/store.rs`
-- `src/subscription.rs`
-- `src/template.rs`
-- `src/time.rs`
-- `src/tool.rs`
-- `src/turn.rs`
-- `src/util.rs`
-
-### `src/agent/`
-- `src/agent/loop_impl.rs`
-- `src/agent/loop_impl/tests.rs`
-- `src/agent/mod.rs`
-- `src/agent/queue.rs`
-- `src/agent/queue/tests.rs`
-- `src/agent/shell_execute.rs`
-- `src/agent/spawn.rs`
-- `src/agent/spawn/tests.rs`
-- `src/agent/tests.rs`
-- `src/agent/tests/common.rs`
-- `src/agent/tests/regression_tests.rs`
-
-### `src/gate/`
-- `src/gate/budget.rs`
-- `src/gate/exfil_detector.rs`
-- `src/gate/mod.rs`
-- `src/gate/output_cap.rs`
-- `src/gate/secret_patterns.rs`
-- `src/gate/secret_redactor.rs`
-- `src/gate/shell_safety.rs`
-- `src/gate/streaming_redact.rs`
-
-### `src/llm/`
-- `src/llm/history_groups.rs`
-- `src/llm/mod.rs`
-- `src/llm/openai.rs`
-
-### `src/plan/`
-- `src/plan/executor.rs`
-- `src/plan/notify.rs`
-- `src/plan/patch.rs`
-- `src/plan/recovery.rs`
-- `src/plan/runner.rs`
-
-### `src/server/`
-- `src/server/auth.rs`
-- `src/server/http.rs`
-- `src/server/mod.rs`
-- `src/server/queue.rs`
-- `src/server/ws.rs`
-
-### `src/session/`
-- `src/session/budget.rs`
-- `src/session/delegation_hint.rs`
-- `src/session/jsonl.rs`
-- `src/session/mod.rs`
-- `src/session/tests.rs`
-- `src/session/trimming.rs`
-
-### Audit note
-- All `src/` files were inspected before writing this plan.
-- `src/config.rs` and `src/subscription.rs` were then re-read line-by-line because they are the target validation boundaries for this session.
+- `docs/risks.md`
+- `docs/architecture/overview.md`
+- `xtask/lint.sh`
+- every file under `src/`, with focused review of:
+  - `src/config.rs`
+  - `src/subscription.rs`
+  - every in-tree `crate::config::*` consumer found during the full read
 
 ## 2. Exact Changes Per File
 
 ### `src/config.rs`
-- Delete the monolith after its contents move into `src/config/`.
-- Delete list:
-- remove `src/config.rs`
-- remove the inline `#[cfg(test)]` blocks from production config code once tests live in `src/config/tests.rs`
+
+- Keep this file as the module root only during extraction.
+- Replace inline definitions with `mod ...` declarations, reexports, and thin facade glue as code moves into `src/config/*.rs`.
+- Remove moved definitions in the same patch that introduces their new owning submodule. Do not leave duplicate definitions behind.
+- While `src/config.rs` is still the active root, create `src/config/tests.rs`, move the existing facade-level / cross-module tests out of `src/config.rs` into that file, and add `#[cfg(test)] mod tests;` in the same patch.
+- Final state: once only module declarations, reexports, `#[cfg(test)] mod tests;`, and facade glue remain, move that glue verbatim to `src/config/mod.rs` and delete `src/config.rs` in the same patch.
+- Never leave both `src/config.rs` and `src/config/mod.rs` present as active roots at the same time.
 
 ### `src/config/mod.rs`
-- Create the facade module and keep it thin.
-- Reexport the current public surface so existing `crate::config::*` call sites keep compiling:
-- `Config`
-- `ConfigError`
-- `BudgetConfig`
-- `QueueConfig`
-- `ReadToolConfig`
-- `SubscriptionsConfig`
-- `ShellPolicy`
-- `ShellDefaultAction`
-- `ShellDefaultSeverity`
-- `AgentsConfig`
-- `AgentDefinition`
-- `AgentTierConfig`
-- `ModelsConfig`
-- `ModelDefinition`
-- `ModelRoute`
-- `DomainsConfig`
-- `DomainConfig`
-- any new typed enums added for bounded config values
-- the existing `pub(crate)` constants currently consumed as `crate::config::DEFAULT_*`
-- `mod.rs` should only declare submodules, reexport symbols, and host `#[cfg(test)] mod tests;`.
+
+- Final module root for the split config module.
+- Declare:
+  - `mod runtime;`
+  - `mod load;`
+  - `mod spawn_runtime;`
+  - `mod agents;`
+  - `mod models;`
+  - `mod domains;`
+  - `mod policy;`
+  - `mod file_schema;`
+  - `#[cfg(test)] mod tests;`
+- Keep this file as a thin facade only. No moved business logic should remain here after the split.
+- Preserve this explicit facade inventory exactly, at the same public or crate-visible paths it has today:
+  - `Config`
+  - `ConfigError`
+  - `BudgetConfig`
+  - `QueueConfig`
+  - `ReadToolConfig`
+  - `SubscriptionsConfig`
+  - `AgentsConfig`
+  - `AgentDefinition`
+  - `AgentTierConfig`
+  - `ModelsConfig`
+  - `ModelDefinition`
+  - `ModelRoute`
+  - `DomainsConfig`
+  - `DomainConfig`
+  - `ShellDefaultAction`
+  - `ShellDefaultSeverity`
+  - `ShellPolicy`
+  - `load`
+  - `load_typed`
+  - `from_file`
+  - `from_file_typed`
+  - `with_spawned_child_runtime`
+  - `with_spawned_child_runtime_typed`
+  - `DEFAULT_SHELL_MAX_OUTPUT_BYTES`
+  - `DEFAULT_SHELL_MAX_TIMEOUT_MS`
+  - `DEFAULT_STALE_PROCESSING_TIMEOUT_SECS`
+- Preserve current visibilities exactly:
+  - public items stay public through `pub use`
+  - crate-visible items stay crate-visible through `pub(crate) use`
+  - specifically keep the three `DEFAULT_*` constants at `pub(crate)`, not `pub`
+- Add top-level comments:
+  - `Invariant:` summary of precedence ownership across `load.rs` and `spawn_runtime.rs`
+  - `Policy:` summary of path-safety ownership across `agents.rs`, `domains.rs`, and `load.rs`
 
 ### `src/config/runtime.rs`
-- Move `Config`, `ConfigError`, and lightweight accessors here.
-- Keep `active_agent_definition()` and `active_t1_config()` here because they are read-only runtime accessors, not parsing logic.
-- Keep the default shell/queue constants here if other modules/tests continue importing them from `crate::config::*`.
+
+- Move runtime-facing data structures and simple accessors here:
+  - `Config`
+  - queue/read/subscription/runtime structs
+  - crate-visible `DEFAULT_*` constants
+  - other runtime-only helpers that do not own load/validation policy
+- Keep inherent impls here when they are just accessors or resolved-runtime behavior.
+- Prefer `pub(super)` or private helpers over widening visibility for convenience.
 
 ### `src/config/load.rs`
-- Move `Config::load()`, `Config::load_typed()`, `Config::from_file()`, and `Config::from_file_typed()` here.
-- Keep the default runtime assembly, skills-dir resolution, skill catalog load, and env override application here.
-- Extract small helpers so load-time precedence is explicit instead of being spread across one long function.
-- Add `Policy:` comments on runtime precedence:
-- tier-specific value wins over agent-level value
-- agent-level value wins over hard-coded runtime defaults
-- `AUTOPOIESIS_OPERATOR_KEY` wins over file config because env is the last override
+
+- Move file loading, env application, merge/default resolution, and final validation orchestration here.
+- Make this the owning module for `ConfigError`, since load/merge/validation failures originate here and the type belongs with the load/validation boundary.
+- Keep precedence logic co-located here instead of scattering it across schema modules.
+- Add `Invariant:` comments on:
+  - env-over-file precedence where it exists today
+  - file-over-default precedence
+  - validation occurring after the fully merged config is assembled
+- Add `Policy:` comment on `skills_dir` path handling:
+  - relative values resolve against the config file directory
+  - absolute values remain absolute
+  - path handling must not silently normalize traversal into a different trusted root
 
 ### `src/config/spawn_runtime.rs`
-- Move `with_spawned_child_runtime()` and `with_spawned_child_runtime_typed()` here.
-- Keep spawned-child retargeting separate from file parsing.
-- Reuse the same typed tier representation as the load path instead of reparsing raw strings.
-- Add a `Policy:` comment that child-runtime retargeting only rewrites tier-sensitive runtime fields and intentionally preserves already validated shared state like shell/read/subscription/queue policy and the loaded skill catalog.
+
+- Move spawned-child runtime overlay/build logic and `validate_spawn_tier()` here.
+- Keep child-runtime precedence logic here.
+- Add `Invariant:` comments documenting the current order:
+  - explicit override
+  - child tier
+  - agent defaults
+  - parent runtime fallback
+- Keep helper-private tests here when they depend on private builders or validators.
 
 ### `src/config/agents.rs`
-- Move `AgentsConfig`, `AgentDefinition`, `AgentTierConfig`, `select_active_agent()`, and `validate_agent_identity()` here.
-- Introduce a typed enum for agent tier because `t1 | t2 | t3` is a closed set and is still stringly typed in `src/config.rs`.
-- Replace config-side `Option<String>` tier storage and `validate_spawn_tier(&str)`-style checks with typed parse/validation at the serde boundary where possible.
-- Keep `model`, `base_url`, `system_prompt`, and `session_name` as strings because they are open-ended values.
-- Keep `reasoning` / `reasoning_effort` stringly unless a shared repo-wide enum already exists; the current provider path forwards these values verbatim, so forcing a local enum without a settled vocabulary would be speculative.
-- Add `Invariant:` comments:
-- active-agent selection currently supports exactly one non-`default` entry
-- agent identity must be a single lexical path segment because it is appended under `identity-templates/agents/`
+
+- Move agent/tier schema and selection helpers here.
+- Keep `validate_agent_identity()` here.
+- Add `Policy:` comment that agent identity is a logical path segment and must reject empty, dot, dot-dot, or separator-containing values.
 
 ### `src/config/models.rs`
-- Move `ModelsConfig`, `ModelDefinition`, and `ModelRoute` here.
-- Introduce a typed enum for `provider`; current repo usage is a closed config choice and is still represented as a raw string.
-- Audit `cost_tier` before typing it:
-- repo examples are inconsistent today: `cheap` appears in `README.md`/`agents.toml`, while test fixtures also use `low`, `medium`, and `high`
-- if the vocabulary is normalized in this session, type it as an enum and fail closed on unknown values
-- if the vocabulary is not normalized, leave it as an intentional string and document why it is not yet a safe enum candidate
-- Keep `caps`, `requires`, and `prefer` as strings because they are catalog keys / capability labels, not a fixed closed set.
+
+- Move provider/model schema and related helpers here.
+- Keep this module focused on model metadata, not loading or policy.
 
 ### `src/config/domains.rs`
-- Move `DomainsConfig`, `DomainConfig`, and `validate_domain_context_extend()` here.
-- Keep domain prompt extension validation isolated from agent selection and runtime assembly.
-- Add an `Invariant:` comment that `context_extend` is a lexical safety check: it must remain under `identity-templates/` and contain only `Normal` path components.
+
+- Move domain schema and `validate_domain_context_extend()` here.
+- Add `Policy:` comment that `context_extend` must stay under `identity-templates/` and only use normal path components after that root.
 
 ### `src/config/policy.rs`
-- Move `BudgetConfig`, `QueueConfig`, `ReadToolConfig`, `SubscriptionsConfig`, `ShellPolicy`, shell enums, defaults, and validation helpers here.
-- Keep shell policy parsing fail-closed through serde + `TryFrom<String>`.
-- Keep read/subscription validation here so policy validation remains separate from file schema and runtime assembly.
-- Add a short `Policy:` comment near validation helpers explaining that zero/empty policy values are rejected here so later runtime code does not need to silently repair config.
+
+- Move shell/read/subscription validation and policy enums/structs here.
+- Keep fail-closed validation boundaries here instead of mixing them into file I/O.
+- Add `Policy:` comments on:
+  - deny/approve/allow expectations inherited from repo rules
+  - validation rejecting unsafe or ambiguous config instead of normalizing it
+- Keep private validation-helper tests here when they need direct access.
 
 ### `src/config/file_schema.rs`
-- Move `RuntimeFileConfig` and `AuthFileSection` here.
-- Keep this module raw and schema-shaped: TOML decode only, no runtime mutation or precedence logic.
+
+- Move serde/TOML input-only structs and parsing-schema helpers here.
+- Keep this module free of runtime merge policy and free of spawned-child overlay logic.
 
 ### `src/config/tests.rs`
-- Move the current config tests here and regroup them by boundary:
-- shell/read/subscription/queue policy defaults and validation
-- load wrapper vs typed wrapper behavior
-- active-agent and path-safety validation
-- spawned-child runtime retargeting
-- typed enum parsing and structured error variants
-- Reuse shared helpers like `temp_toml_path()` and `assert_default_*()` instead of duplicating them across production modules.
+
+- Create this file while `src/config.rs` is still the active root.
+- Move the existing facade-level / cross-module tests here before the `src/config.rs` -> `src/config/mod.rs` cutover.
+- Keep only facade-level and cross-module tests here.
+- This file must compile using the `crate::config` facade surface and intentionally exposed items only.
+- Do not move helper-private assertions here if doing so would require widening production visibility.
+- If a current top-level test mixes facade behavior and private-helper behavior, split it:
+  - keep the facade assertion here
+  - move the helper-private assertion into the owning submodule
 
 ### `src/subscription.rs`
-- Re-verify it against the repository standard and keep it as the canonical validation shape.
-- Expected outcome: no behavior change.
-- If any edit is needed at all, keep it comment-only and limited to clarifying that `SubscriptionFilter::from_flags()` / `from_storage()` are fail-closed validation boundaries.
-- Do not restructure this file during Session 3 unless the audit finds an actual validation drift.
 
-### Required doc sync if implementation lands in the same merge
-- `AGENTS.md`
-- `README.md`
-- `docs/architecture/overview.md`
-- These files currently reference `src/config.rs`; deleting that path without updating the docs would violate the repo rule that docs stay synced with `src/` changes.
+- Verification-only by default. No planned behavior change.
+- Audit against this pass/fail checklist derived from `CODE_STANDARD.md` and repo rules:
+  - no `.unwrap()` in non-test code
+  - error handling still uses the repo’s expected style with context where needed
+  - logging still follows repo severity guidance
+  - policy/state mutation/I/O boundaries remain readable and not newly mixed together
+  - public types and async entrypoints still have the expected docs/comments
+  - non-obvious invariants or policy boundaries still have comments where needed
+- If every checklist item passes, leave `src/subscription.rs` untouched and explicitly record that the audit passed with no code change.
+- Only edit `src/subscription.rs` if this audit finds a real standard mismatch.
+
+### Downstream Consumer Sweep
+
+- Verify that the facade split does not require consumer-path churn. Expected no code changes outside `src/config/**` unless an import truly breaks.
+- Explicit verification targets include:
+  - `src/lib.rs`
+  - `src/main.rs`
+  - `src/cli.rs`
+  - `src/model_selection.rs`
+  - `src/turn.rs`
+  - `src/context.rs`
+  - `src/skills.rs`
+  - `src/server/auth.rs`
+  - `src/server/http.rs`
+  - `src/server/mod.rs`
+  - `src/server/queue.rs`
+  - `src/server/ws.rs`
+  - any tests importing `crate::config::*`
+- Target state is no consumer-path churn. If a consumer needs a direct submodule import, treat that as a facade regression.
+
+### Docs / Metadata
+
+- Review docs for both:
+  - literal `src/config.rs` references
+  - higher-level prose that describes config loading/validation as a single-file responsibility
+- This doc sweep is not limited to grep hits for `src/config.rs`; it also includes architecture/risk/overview prose that would become stale if config ownership, validation boundaries, or public API descriptions still imply a single-file module.
+- Update any stale architecture/risk/overview references in the same change set.
+- Keep the completion step in the implementation plan:
+  - `openclaw system event --text 'Session 3 done: config split' --mode now`
 
 ## 3. What Tests To Write
 
-### `src/config/tests.rs`
-- Add a module-split parity test: `Config::load*()` and `Config::with_spawned_child_runtime*()` still behave exactly as before after the file split.
-- Add focused precedence tests:
-- selected tier overrides agent-level values
-- agent-level values override hard-coded defaults
-- `AUTOPOIESIS_OPERATOR_KEY` overrides the file value
-- Add typed enum parse tests for every bounded value converted in this session.
-- Assertions:
-- valid TOML values deserialize successfully
-- invalid values fail closed with a structured `ConfigError` or serde parse failure
-- Add tier-validation tests using the new config-side tier enum.
-- Assertions:
-- `t1`, `t2`, and `t3` are accepted
-- unknown tier values are rejected before child-runtime assembly proceeds
-- Add provider-validation tests if `provider` becomes typed.
-- Assertions:
-- `openai` is accepted
-- unknown providers are rejected
-- For `cost_tier`, choose one path and test it explicitly:
-- if normalized and typed, test the accepted vocabulary and hard failure on unknown values
-- if left as a string, add a regression that heterogeneous values round-trip unchanged and document that this field is intentionally untyped until vocabulary is settled
-- Keep the existing path-safety regressions and make them more boundary-explicit:
-- `identity='../tmp/prompt'` is rejected
-- `context_extend='../prompt.md'` is rejected
-- selected domains must exist and must provide `context_extend`
-- Add a reexport smoke test that constructs representative types through `crate::config::*` paths so the facade proves the public module surface stayed intact.
+### Preserve Existing Coverage
 
-### `src/subscription.rs`
-- No new functional tests are required if the audit leaves the file unchanged.
-- If a clarifying comment move accidentally changes code shape, rerun the existing subscription tests and keep:
-- filter parse/render round-trips
-- path normalization / readability checks
-- store round-trip and timestamp refresh behavior
+- Move or split existing tests; do not silently drop assertions.
+- Keep helper-private tests in the module that owns the helper.
 
-### End-to-end verification
-- Run `cargo test`.
-- Run `xtask/lint.sh`, which currently executes:
-- `./xtask/lint_checks.sh`
-- `cargo build --release`
-- `cargo fmt --check`
-- `cargo clippy -- -D warnings`
-- `cargo test`
-- `cargo test --features integration --test integration` when auth is present
+### Facade / API Coverage
+
+- In `src/config/tests.rs`, add or preserve tests that exercise the explicit `crate::config` facade inventory from `src/config/mod.rs`.
+- Verify the split keeps the same facade names reachable through the same public paths.
+- Keep wrapper-equivalence tests for any top-level config helpers that remain part of the facade.
+
+### Visibility Coverage
+
+- Add in-crate tests that `crate::config::DEFAULT_*` constants remain reachable where `pub(crate)` access is expected.
+- Do not claim this proves they are not `pub`; treat “not widened beyond `pub(crate)`” as a code-review invariant checked against the explicit reexport inventory in `src/config/mod.rs`.
+
+### Precedence Coverage
+
+- Preserve or add tests for load precedence:
+  - env-over-file behavior where it exists today
+  - file-over-default behavior
+- Preserve or add tests for spawned-child precedence:
+  - reasoning override wins over child tier / agent / parent
+  - child `provider_model` replaces the parent model
+  - child tier `base_url`, `system_prompt`, and `session_name` keep the current fallback order
+  - identity retargeting behavior for child tiers stays unchanged
+
+### Path-Safety Coverage
+
+- In `src/config/agents.rs`, keep or add helper-private tests that `validate_agent_identity()` rejects:
+  - empty string
+  - `.`
+  - `..`
+  - separator-containing values
+- In `src/config/domains.rs`, keep or add helper-private tests that `validate_domain_context_extend()` rejects:
+  - absolute paths
+  - traversal paths
+  - roots outside `identity-templates/`
+  - any non-`Normal` component after the allowed root
+- In `src/config/load.rs`, keep or add tests that:
+  - relative `skills_dir` resolves against the config file directory
+  - absolute `skills_dir` stays absolute
+
+### Validation Helper Coverage
+
+- Keep or add private-helper tests in:
+  - `src/config/policy.rs` for read/subscription validation helpers
+  - `src/config/spawn_runtime.rs` for `validate_spawn_tier()`
+  - any other submodule-local validator that should remain private
+
+### `subscription.rs`
+
+- No new `subscription.rs` tests unless the audit reveals an actual mismatch that requires a regression test.
 
 ## 4. Order Of Operations
 
-1. Mechanically move `src/config.rs` to `src/config/mod.rs` first, with no semantic change, and delete `src/config.rs` in the same step so the old shape is actually removed.
-2. Extract pure type modules next: `runtime.rs`, `policy.rs`, `agents.rs`, `models.rs`, `domains.rs`, and `file_schema.rs`. Keep `mod.rs` reexporting the existing surface after each extraction.
-3. Extract `load.rs` and keep `Config::load*()` behavior byte-for-byte equivalent before touching any enum conversions.
-4. Extract `spawn_runtime.rs` and keep spawned-child behavior equivalent before touching any enum conversions.
-5. Move the existing config test coverage into `src/config/tests.rs` so production files stop carrying giant inline test blocks.
-6. Convert remaining clearly bounded config values to enums one at a time, starting with tier, then provider.
-7. Handle `cost_tier` only after auditing and normalizing the repo vocabulary. Do not silently invent an enum that breaks existing fixtures.
-8. Add the requested `Policy:` and `Invariant:` comments on precedence and path-safety boundaries after the logic split is stable.
-9. Audit `src/subscription.rs` last. If it still matches the standard, leave the implementation alone.
-10. Update `AGENTS.md`, `README.md`, and `docs/architecture/overview.md` if the implementation merge actually deletes `src/config.rs`.
-11. Finish with `cargo test` and `xtask/lint.sh`.
+1. Create `src/config/` submodules and move the most self-contained code first:
+   - `file_schema`
+   - `models`
+   - `domains`
+   - `agents`
+   - `policy`
+   - `runtime`
+   Keep `src/config.rs` as the root during this phase.
+2. As each responsibility moves, remove the old inline definition in the same patch and keep the facade wired through `src/config.rs`. Do not leave duplicate definitions in both places.
+3. While `src/config.rs` is still the active root, create `src/config/tests.rs`, move every existing facade-level / cross-module test into it, and add `#[cfg(test)] mod tests;` in that same patch so no top-level facade assertion is lost or duplicated during the later cutover.
+4. Move helper-private tests with their owning modules as those moves happen. Do not widen production visibility just to preserve old test locations.
+5. Move `load` and `spawn_runtime` last, because they depend on the extracted schema/runtime/policy pieces and carry the key precedence comments.
+6. Once `src/config.rs` contains only module declarations, reexports, `#[cfg(test)] mod tests;`, and facade glue, move that file verbatim to `src/config/mod.rs` and delete `src/config.rs` in the same patch.
+7. Run the downstream consumer sweep and the explicit `src/subscription.rs` standards audit.
+8. Run the broader docs sync pass:
+   - literal filename/path references
+   - conceptual ownership and architecture prose
+9. Run the full required verification suite:
+   - `cargo build --release`
+   - `cargo test`
+   - `cargo fmt --check`
+   - `cargo clippy -- -D warnings`
+   - `xtask/lint.sh`
+   - `cargo test --features integration` if credentials are configured
+10. Only after the full verification suite passes, run:
+   - `openclaw system event --text 'Session 3 done: config split' --mode now`
 
 ## 5. Risk Assessment
 
-- Highest risk: accidentally breaking the public `crate::config::*` surface while moving code into `src/config/`.
-- Mitigation: keep `mod.rs` as an exhaustive reexport facade and add a small reexport smoke test.
-
-- High risk: changing precedence semantics while extracting `load.rs` and `spawn_runtime.rs`.
-- Mitigation: keep the split mechanical first, then add focused precedence tests before any cleanup beyond file moves.
-
-- High risk: typing the wrong fields.
-- Mitigation: only convert values that are actually closed sets in config today; tier is clearly bounded, provider is likely bounded, but `reasoning_effort` and possibly `cost_tier` need explicit vocabulary decisions before typing.
-
-- Medium risk: `cost_tier` vocabulary is inconsistent across the repo right now.
-- Mitigation: normalize the accepted values first or leave the field intentionally stringly with a documented reason; do not half-convert it.
-
-- Medium risk: path-safety checks could become weaker if `validate_agent_identity()` or `validate_domain_context_extend()` are rewritten during extraction.
-- Mitigation: move those functions mechanically, add `Invariant:` comments, and preserve the existing traversal regressions.
-
-- Medium risk: the file split lands cleanly but docs still point to `src/config.rs`.
-- Mitigation: treat doc sync as part of the implementation merge, not as optional cleanup.
-
-- Medium risk: Session 3 only types config-side tier/provider values while `SpawnRequest` / plan JSON still use raw strings elsewhere.
-- Mitigation: keep the scope explicit: this session fixes the config validation boundary, not every tier string in the runtime. Call out any remaining non-config raw strings as a follow-up, not as hidden debt.
-
-- Low risk: `src/subscription.rs` gets churned even though it already matches the desired validator shape.
-- Mitigation: keep the subscription audit read-only unless a real mismatch appears.
+- Highest risk: precedence drift while moving load/spawn code.
+  - Mitigation: keep precedence logic co-located, document it with `Invariant:` comments, and preserve/add explicit precedence tests.
+- High risk: root-module cutover from `src/config.rs` to `src/config/mod.rs`.
+  - Mitigation: keep `src/config.rs` as the root until it is only facade glue, move facade tests out before the cutover, then do a same-patch move/delete with no dual-root state.
+- High risk: facade visibility drift.
+  - Mitigation: use the explicit symbol inventory in `src/config/mod.rs`, preserve `pub(crate)` constant visibility, and verify against that inventory during implementation and review.
+- Medium risk: helper-private tests forcing visibility widening.
+  - Mitigation: move those tests into the owning submodule instead of changing production visibility.
+- Medium risk: docs drift even when no literal filename reference changes.
+  - Mitigation: review architecture/risk prose for responsibility-boundary drift, not just string matches.
+- Low risk: unnecessary churn in `src/subscription.rs`.
+  - Mitigation: use the explicit audit checklist and leave the file untouched unless a concrete standard mismatch is found.
