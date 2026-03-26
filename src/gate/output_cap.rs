@@ -16,6 +16,7 @@ const TRUNCATED_CAPTURE_NOTE: &str = "[shell output capture truncated at max_out
 
 pub(crate) const DEFAULT_OUTPUT_CAP_BYTES: usize = DEFAULT_INLINE_CAP_BYTES;
 
+// Invariant: result filenames must never trust the raw tool call id.
 pub(crate) fn safe_call_id_for_filename(call_id: &str) -> String {
     let mut safe = String::from(CALL_PREFIX);
     for byte in call_id.as_bytes() {
@@ -40,6 +41,7 @@ pub(crate) fn cap_tool_output(
     output: String,
     threshold: usize,
 ) -> Result<String> {
+    // Policy: tool output is always persisted to the bounded results artifact first; oversized inline output becomes a pointer.
     let output_truncated = crate::tool::shell_output_was_truncated(&output);
     let results_dir = sessions_dir.join(RESULTS_DIR_NAME);
     fs::create_dir_all(&results_dir).with_context(|| {

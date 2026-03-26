@@ -76,6 +76,7 @@ pub trait Guard: Send + Sync {
 
 /// Guard outbound text emitted by the current turn.
 pub(crate) fn guard_text_output(turn: &Turn, text: String) -> String {
+    // Policy: denied outbound text collapses to empty output instead of partially persisting unsafe content.
     let mut text = text;
     match turn.check_text_delta(&mut text) {
         Verdict::Deny { .. } => String::new(),
@@ -83,8 +84,9 @@ pub(crate) fn guard_text_output(turn: &Turn, text: String) -> String {
     }
 }
 
-/// Guard assistant message content before persistence.
+/// Guard message content before persistence.
 pub(crate) fn guard_message_output(turn: &Turn, message: &mut ChatMessage) {
+    // Policy: message text and tool-call arguments are guarded before persistence.
     for block in &mut message.content {
         if let MessageContent::Text { text } = block {
             *text = guard_text_output(turn, std::mem::take(text));
@@ -129,12 +131,13 @@ fn redact_tool_call_arguments(turn: &Turn, arguments: String) -> String {
             }
 
             redact_value(turn, &mut value);
-            serde_json::to_string(&value).unwrap_or(arguments)
+            serde_json::to_string(&value)
+                .unwrap_or_else(|_| "{\"redacted\":\"[REDACTED]\"}".to_string())
         }
-        Err(_) => serde_json::to_string(&serde_json::json!({
+        Err(_) => serde_json::json!({
             "redacted": guard_text_output(turn, arguments)
-        }))
-        .unwrap_or_else(|_| "{\"redacted\":\"\"}".to_string()),
+        })
+        .to_string(),
     }
 }
 

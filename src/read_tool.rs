@@ -78,10 +78,12 @@ impl ReadFile {
     }
 
     fn parse_args(arguments: &str) -> Result<ReadFileArgs> {
+        // Policy: malformed read-tool arguments are hard failures, not permissive fallbacks.
         serde_json::from_str(arguments).context("failed to decode tool call arguments")
     }
 
     fn provenance_header(path: &str) -> String {
+        // Invariant: successful reads always carry explicit provenance so downstream consumers know the source path and principal.
         format!(
             "<meta source=read_file path={} principal={PROVENANCE_PRINCIPAL} />",
             Self::encode_provenance_path(path)
@@ -128,6 +130,7 @@ impl ReadFile {
     }
 
     fn resolve_allowed_roots(allowed_paths: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+        // Policy: allowed roots are normalized and canonicalized up front so traversal and alias tricks do not bypass the root check.
         let normalized_roots = allowed_paths
             .iter()
             .map(|path| Self::normalize_to_absolute(path))
@@ -150,6 +153,7 @@ impl ReadFile {
     }
 
     fn path_is_explicitly_denied(path: &Path, protected_paths: &[PathBuf]) -> bool {
+        // Policy: protected paths are denied before any file read attempt, including explicit auth and secret locations.
         path_is_protected(path)
             || protected_paths
                 .iter()
@@ -201,6 +205,7 @@ impl ReadFile {
 
     #[cfg(unix)]
     fn open_text_file(path: &Path) -> Result<File> {
+        // Policy: Unix reads walk the path component by component so symlinks and parent traversal cannot escape the allowed root.
         fn open_path(path: &Path, flags: libc::c_int) -> Result<OwnedFd> {
             let path_bytes = path.as_os_str().as_bytes();
             let c_path = CString::new(path_bytes)
@@ -271,6 +276,7 @@ impl ReadFile {
 
     #[cfg(not(unix))]
     fn open_text_file(path: &Path) -> Result<File> {
+        // Policy: non-Unix reads reject traversal and symlink escapes before opening the final file.
         let mut current_path = PathBuf::new();
         let mut components = path.components().peekable();
 

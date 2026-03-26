@@ -1,59 +1,335 @@
-# Session 4a Plan
+# Session 4b Plan: Gate Cleanup
+
+This turn is planning only. No code was changed, no tests were run, and the `openclaw system event --text 'Session 4b done: gate cleanup' --mode now` command is deferred until the implementation session actually finishes.
 
 ## 1. Files Read
 
-- Repo guidance and verification entrypoints: `AGENTS.md`, `CODE_STANDARD.md`, `Cargo.toml`, `agents.toml`, `xtask/lint.sh`, `README.md`, `docs/risks.md`, `docs/architecture/overview.md`, and the relevant `src/gate/secret_patterns.rs` split sections in `docs/specs/restructure-plan.md`.
-- `src/agent`: `src/agent/loop_impl.rs`, `src/agent/loop_impl/tests.rs`, `src/agent/mod.rs`, `src/agent/queue.rs`, `src/agent/queue/tests.rs`, `src/agent/shell_execute.rs`, `src/agent/spawn.rs`, `src/agent/spawn/tests.rs`, `src/agent/tests.rs`, `src/agent/tests/common.rs`, `src/agent/tests/regression_tests.rs`.
-- `src/config`: `src/config/agents.rs`, `src/config/domains.rs`, `src/config/file_schema.rs`, `src/config/load.rs`, `src/config/mod.rs`, `src/config/models.rs`, `src/config/policy.rs`, `src/config/runtime.rs`, `src/config/spawn_runtime.rs`, `src/config/tests.rs`.
-- `src/gate`: `src/gate/budget.rs`, `src/gate/exfil_detector.rs`, `src/gate/mod.rs`, `src/gate/output_cap.rs`, `src/gate/secret_patterns.rs`, `src/gate/secret_redactor.rs`, `src/gate/shell_safety.rs`, `src/gate/streaming_redact.rs`.
-- `src/llm`: `src/llm/history_groups.rs`, `src/llm/mod.rs`, `src/llm/openai.rs`.
-- `src/plan`: `src/plan/executor.rs`, `src/plan/notify.rs`, `src/plan/patch.rs`, `src/plan/recovery.rs`, `src/plan/runner.rs`.
-- `src/server`: `src/server/auth.rs`, `src/server/http.rs`, `src/server/mod.rs`, `src/server/queue.rs`, `src/server/ws.rs`.
-- `src/session`: `src/session/budget.rs`, `src/session/delegation_hint.rs`, `src/session/jsonl.rs`, `src/session/mod.rs`, `src/session/tests.rs`, `src/session/trimming.rs`.
-- Top-level `src/` files: `src/auth.rs`, `src/cli.rs`, `src/context.rs`, `src/delegation.rs`, `src/identity.rs`, `src/lib.rs`, `src/main.rs`, `src/model_selection.rs`, `src/plan.rs`, `src/principal.rs`, `src/read_tool.rs`, `src/skills.rs`, `src/spawn.rs`, `src/store.rs`, `src/subscription.rs`, `src/template.rs`, `src/time.rs`, `src/tool.rs`, `src/turn.rs`, `src/util.rs`.
+### Standards, docs, and config
+
+- `CODE_STANDARD.md`
+- `docs/risks.md`
+- `docs/architecture/overview.md`
+- `Cargo.toml`
+- `agents.toml`
+
+### All `src/` files
+
+- `src/agent/loop_impl.rs`
+- `src/agent/loop_impl/tests.rs`
+- `src/agent/mod.rs`
+- `src/agent/queue.rs`
+- `src/agent/queue/tests.rs`
+- `src/agent/shell_execute.rs`
+- `src/agent/spawn.rs`
+- `src/agent/spawn/tests.rs`
+- `src/agent/tests.rs`
+- `src/agent/tests/common.rs`
+- `src/agent/tests/regression_tests.rs`
+- `src/auth.rs`
+- `src/cli.rs`
+- `src/config/agents.rs`
+- `src/config/domains.rs`
+- `src/config/file_schema.rs`
+- `src/config/load.rs`
+- `src/config/mod.rs`
+- `src/config/models.rs`
+- `src/config/policy.rs`
+- `src/config/runtime.rs`
+- `src/config/spawn_runtime.rs`
+- `src/config/tests.rs`
+- `src/context.rs`
+- `src/delegation.rs`
+- `src/gate/budget.rs`
+- `src/gate/command_path_analysis.rs`
+- `src/gate/exfil_detector.rs`
+- `src/gate/mod.rs`
+- `src/gate/output_cap.rs`
+- `src/gate/protected_paths.rs`
+- `src/gate/secret_catalog.rs`
+- `src/gate/secret_redactor.rs`
+- `src/gate/shell_safety.rs`
+- `src/gate/streaming_redact.rs`
+- `src/identity.rs`
+- `src/lib.rs`
+- `src/llm/history_groups.rs`
+- `src/llm/mod.rs`
+- `src/llm/openai.rs`
+- `src/main.rs`
+- `src/model_selection.rs`
+- `src/plan.rs`
+- `src/plan/executor.rs`
+- `src/plan/notify.rs`
+- `src/plan/patch.rs`
+- `src/plan/recovery.rs`
+- `src/plan/runner.rs`
+- `src/principal.rs`
+- `src/read_tool.rs`
+- `src/server/auth.rs`
+- `src/server/http.rs`
+- `src/server/mod.rs`
+- `src/server/queue.rs`
+- `src/server/ws.rs`
+- `src/session/budget.rs`
+- `src/session/delegation_hint.rs`
+- `src/session/jsonl.rs`
+- `src/session/mod.rs`
+- `src/session/tests.rs`
+- `src/session/trimming.rs`
+- `src/skills.rs`
+- `src/spawn.rs`
+- `src/store.rs`
+- `src/subscription.rs`
+- `src/template.rs`
+- `src/time.rs`
+- `src/tool.rs`
+- `src/turn.rs`
+- `src/util.rs`
 
 ## 2. Exact Changes Per File
 
-- `src/gate/secret_catalog.rs`: create a focused metadata module that owns only the secret catalog constants and types now sitting at the top of `secret_patterns.rs`: `OPENAI_SECRET_*`, `GITHUB_PAT_*`, `AWS_ACCESS_KEY_*`, `SecretBodyKind`, `SecretSuffixLen`, `SecretPattern`, and `SECRET_PATTERNS`. If `SECRET_PATTERN_COUNT` becomes redundant after the move, delete it rather than carrying a dead compatibility constant.
-- `src/gate/protected_paths.rs`: create a focused protected-path module that owns the protected-path catalog data and normalized path classification helpers: `PROTECTED_PATH_FRAGMENTS`, `PROTECTED_HOME_PATHS`, `PROTECTED_ENV_FILENAMES`, `PROTECTED_GIT_PATHS`, `protected_path_fragments()`, `path_is_protected()`, `home_prefix()`, `strip_prefix_with_boundary()`, `expand_home_prefix()`, `normalize_lexical_path()`, `is_protected_env_filename()`, `is_protected_path_value()`, and `is_protected_git_pathspec_value()`. Move the existing path-classification tests here. Add a module-level threat-model comment explaining that these lists are a deny-first credential protection layer for high-value secrets and that false positives are preferable to missing a real credential path.
-- `src/gate/command_path_analysis.rs`: create a focused command-analysis module that owns the shell-command heuristics now mixed into `secret_patterns.rs`: the identity-template and target-path write detection helpers, env-wrapper normalization, grep and git pathspec/config heuristics, target-path rewrite helpers, `command_writes_identity_template_path()`, `command_writes_target_path()`, `simple_command_reads_protected_path()`, and `simple_command_reads_target_path()`. Keep internal helpers such as `command_references_protected_path()`, `git_path_spec_argument()`, `resolve_path_like()`, and `path_matches_target()` private to this file. Import shared normalized-path helpers from `super::protected_paths` instead of reintroducing a second path-normalization implementation. Move `env_wrapper_regression_tests`, the main command-heuristic test block, and `identity_template_guard_tests` from `secret_patterns.rs` into this file. Add a module-level threat-model comment explaining that this logic is heuristic shell analysis, not sandboxing, and that it exists to hard-deny obvious protected-path reads/writes before policy allowlists or approvals can widen access.
-- `src/gate/mod.rs`: replace `pub(crate) mod secret_patterns;` with the three focused modules, keep `output_cap` and `streaming_redact` private, and make `mod.rs` the only public facade for callers outside `src/gate/`. Reexport only the moved items that non-gate modules still need after the split, and do that with `pub(crate) use` rather than broader `pub use`: `SECRET_PATTERNS` for `turn.rs` tests and `path_is_protected()` for `read_tool.rs`. Keep `command_path_analysis` helpers off the public facade unless a non-gate caller actually requires them after the refactor. Sibling gate modules should use `super::secret_catalog`, `super::protected_paths`, and `super::command_path_analysis` directly instead of depending on the parent facade.
-- `src/gate/secret_redactor.rs`: change the catalog import from `crate::gate::secret_patterns::SECRET_PATTERNS` to `super::secret_catalog::SECRET_PATTERNS`. No behavior change.
-- `src/gate/streaming_redact.rs`: change the catalog imports from `crate::gate::secret_patterns::{...}` to `super::secret_catalog::{...}`. No behavior change.
-- `src/gate/shell_safety.rs`: change the moved helper imports from `crate::gate::secret_patterns::{...}` to `super::command_path_analysis::{...}`. Preserve the current test-only helper visibility at the bottom of the file so the identity-template shell-safety tests continue to compile.
-- `src/gate/exfil_detector.rs`: change the moved helper imports from `crate::gate::secret_patterns::{...}` to `super::command_path_analysis::{...}`. Do not change the current “read + send in one batch requires approval” semantics.
-- `src/read_tool.rs`: change the protected-path import from `crate::gate::secret_patterns::path_is_protected` to the gate facade reexport. Keep `ReadFile::path_is_explicitly_denied()` behavior identical.
-- `src/turn.rs`: change the test-only `SECRET_PATTERNS` import to the gate facade reexport.
-- `src/gate/secret_patterns.rs`: if a compatibility phase is needed to keep the tree green, reduce this file to a pure `pub(crate) use ...` shim that forwards to the new modules. Do not leave duplicated logic or duplicated constants in place. Final state: file removed.
-- `README.md`: replace the `gate/secret_patterns.rs` tree entry with `gate/secret_catalog.rs`, `gate/protected_paths.rs`, and `gate/command_path_analysis.rs`.
-- `docs/architecture/overview.md`: replace the single `src/gate/secret_patterns.rs` description with three focused module descriptions that match the new file layout.
-- `docs/specs/restructure-plan.md`: update the current-state table and any still-current wording that says `src/gate/secret_patterns.rs` is the live module. Keep the historical rationale, but make the document describe the repo as it actually exists after the split.
+### `src/gate/secret_redactor.rs`
+
+- Keep the Session 1 fail-closed constructor shape: `SecretRedactor::new()` must continue to return `Result<Self, regex::Error>` and compile every pattern eagerly.
+- Add `Policy:` comments at the security boundaries:
+  - above `new()` to state that redaction configuration is validated eagerly and invalid regexes must fail construction instead of silently disabling a pattern
+  - above `redact_messages()` to state that inbound/tool-result content is rewritten before persistence
+  - above `check()` to state that inbound history and streaming text are redacted in place, and deny is never used as a substitute for redaction here
+- Add an `Invariant:` comment above `default_catalog()` explaining that `SECRET_PATTERNS` is repo-owned static configuration and invalid built-in patterns are a programmer bug that must abort immediately
+- No algorithm rewrite is planned unless review during edit uncovers an actual mismatch with the standard
+
+### `src/gate/shell_safety.rs`
+
+- Add `Policy:` comments documenting the decision ladder inside `evaluate_command()`:
+  - deny patterns run before all other shell policy checks
+  - parse failure is a security boundary and must not be treated as a safe command
+  - protected reads and prompt/skills writes are hard-denied before allowlist/default handling
+  - compound commands always require explicit approval even if an allow pattern would otherwise match
+  - standing approvals are disabled for tainted turns
+- Tighten malformed argument handling to match `CODE_STANDARD.md` fail-closed requirements:
+  - replace the current `command_from_args(...).ok()?` plus `unwrap_or_default()` path
+  - malformed JSON or a missing/non-string `command` field should produce an explicit `Verdict::Deny`, not default back to `allow`/`approve`
+- Keep typed config usage from Session 1 as-is: no stringly-typed severity/default parsing should be reintroduced
+- Preserve the current deny/approve/allow precedence and protected-path logic
+
+### `src/agent/shell_execute.rs`
+
+- Add `Invariant:` comments at the shell execution boundaries:
+  - `guarded_shell_execute_call()` and `guarded_shell_execute_prechecked()` only accept `execute` tool calls
+  - `guarded_shell_execute_prechecked()` assumes the caller has already applied shell approval/deny policy
+  - `execute_shell_call()` must preserve the order `execute -> derive exit code -> redact -> cap -> persist/return`
+  - denial paths must return no raw shell output and no result artifact path
+- Keep the Session 1 serde-based error serialization; do not reintroduce hand-built JSON strings
+- Add small cleanup only if needed for clarity; no interface changes are planned
+
+### `src/gate/budget.rs`
+
+- Add a `Policy:` comment above `check()` explaining that budget enforcement is an inbound preflight hard deny and intentionally does not redact or mutate content
+- Add a short comment near `violations()` that the reporting order is deterministic because tests and operator output depend on stable ordering
+
+### `src/gate/exfil_detector.rs`
+
+- Add `Policy:` comments describing scope and limits:
+  - this is a heuristic batch detector layered on top of primary shell policy, not a sandbox
+  - the detector escalates read+send sequences to approval instead of silently allowing them
+  - parse failures in shell tokenization are treated conservatively inside `has_sensitive_read()`
+- Tighten `command_from_args()` for malformed `execute` payloads:
+  - current malformed JSON path is silently skipped
+  - malformed JSON or a missing/non-string `command` field should produce a conservative batch-level `Verdict::Approve` with high severity instead of disappearing from exfil checks
+  - keep ShellSafety as the primary hard fail-closed boundary, but do not let malformed batch entries become invisible to the heuristic detector
+
+### `src/gate/output_cap.rs`
+
+- Add a `Policy:` comment above `cap_tool_output()` that all tool output is written to the bounded `results/` artifact first, and oversized inline responses are replaced with a pointer string so transcripts do not carry raw oversized output
+- Add an `Invariant:` comment above `safe_call_id_for_filename()` explaining that result filenames must never trust raw tool call IDs
+- Keep the pointer contract unchanged unless tests reveal a leak
+
+### `src/gate/streaming_redact.rs`
+
+- Add `Policy:` comments explaining:
+  - why `prefix_holdback()` exists
+  - why partial prefixes must remain buffered until the guard can decide whether a secret is present
+  - why active secret continuation keeps redacting across token boundaries
+- No behavior change is planned unless the comment pass exposes an unstated invariant that needs a focused assertion
+
+### `src/tool.rs`
+
+- Add `Policy:` / `Invariant:` comments at the shell execution boundaries:
+  - RLIMITs are bounded-resource controls, not isolation
+  - Unix pre-exec sets a new process group so termination reaches descendants
+  - stdout/stderr share a single capture budget
+  - after the capture cap is hit, draining continues briefly to let the child exit cleanly while still discarding excess bytes
+  - timeout errors distinguish between original timeout expiry and post-cap drain expiry
+- Keep command parsing and timeout clamping typed and fail-closed
+- No behavioral changes are planned unless the comment pass exposes a real mismatch
+
+### `src/read_tool.rs`
+
+- Add `Policy:` comments around:
+  - deny-first path validation before file reads
+  - normalization and allowed-root checks
+  - protected path rejection
+  - Unix component-by-component `openat` walk / non-Unix symlink defenses
+  - provenance header construction
+- Keep the current fail-closed posture: malformed args, parent traversals, symlinks, protected paths, and oversize files must continue to error out instead of degrading to best-effort reads
+
+### `src/gate/mod.rs`
+
+- Verify the facade exports remain the intended surface:
+  - public: `BudgetGuard`, `ExfilDetector`, `SecretRedactor`, `ShellSafety`
+  - internal: `output_cap`, `protected_paths`, `streaming_redact`
+  - test-only: `SECRET_PATTERNS`
+- Add `Policy:` comments above:
+  - `guard_text_output()` to state that denied outbound deltas collapse to empty text instead of partially persisting unsafe content
+  - `guard_message_output()` to state that assistant text and tool-call arguments are guarded before persistence
+  - `redact_tool_call_arguments()` to state that argument redaction must never leak the original string on a serializer failure
+- Remove the remaining serializer fail-open behavior:
+  - current `serde_json::to_string(&value).unwrap_or(arguments)` can leak original unredacted arguments if serialization fails
+  - replace that fallback with a conservative redacted object/string path that is constructed without ever falling back to the original arguments
+  - keep the malformed-JSON wrapper path conservative and explicit
+
+### `src/agent/loop_impl/tests.rs`
+
+- Add a guard-interaction regression for malformed `execute` arguments with both `ShellSafety` and `ExfilDetector` enabled
+- Assert that the final result is the `shell-policy` deny path and that the approval handler is never invoked
+- Keep the assertion at the agent-loop level so it proves the real deny-over-approve integration behavior, not just unit-level guard behavior
+
+### Caller-side gate import cleanup
+
+- Audit and update gate import sites that depend on the facade surface while this cleanup is in flight:
+  - `src/agent/shell_execute.rs`
+  - `src/read_tool.rs`
+  - `src/turn.rs`
+  - any affected tests that import internal gate helpers or test-only exports
+- If `src/gate/mod.rs` visibility or re-exports change, adjust these call sites in the same patch so the tree stays compiling at every step
+
+### Files reviewed with no planned functional edit
+
+- `src/gate/command_path_analysis.rs`
+- `src/gate/protected_paths.rs`
+
+These already carry the right heuristic/not-a-sandbox framing and did not show obvious Session 4b follow-up work beyond keeping their imports aligned if the facade changes.
 
 ## 3. What Tests To Write
 
-- Catalog invariants in `src/gate/secret_catalog.rs`: assert the secret catalog remains three entries, prefixes stay stable, and the regex strings required by `SecretRedactor::default_catalog()` still compile.
-- Protected-path invariants in `src/gate/protected_paths.rs`: keep the current assertions that `~/.autopoiesis/auth.json`, `~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, `~/.aws/credentials`, `.env`, `.env.local`, and `.env.production.local` are protected, while `config/auth.json` and `.env.example` remain allowed. Add explicit coverage for `$HOME`, `${HOME}`, and lexical `.` / `..` normalization because that logic will move files.
-- Command-analysis invariants in `src/gate/command_path_analysis.rs`: preserve the existing `env -S`, `env --split-string`, `git -c alias.show=!cat ...`, `git show HEAD:.env.production.local`, grep `-f`, symlink-alias write detection, and identity-template write regressions. Explicitly keep the negative git-config cases for `include.path=config/auth.json` and `core.attributesfile=.env.example`, the non-matching target-path cases for `myskills/...` and `vendor/skills/...`, the allowed read-only copy case `cp identity-templates/context.md /tmp/x`, and the false-positive guards where a command only mentions a protected path or `.env` pattern as data, such as `printf '%s' ~/.autopoiesis/auth.json`, `grep '.env' README.md`, and `git grep '.env' README.md`.
-- Consumer invariants in existing tests: `ShellSafety` must still hard-deny protected credential reads and protected prompt/skills writes before allowlists or standing approvals apply; `ExfilDetector` must still treat protected-path and target-path reads as sensitive; `ReadFile` must still deny protected paths through the shared `path_is_protected()` helper.
-- Facade invariants: add or keep a cheap grep-style assertion that `secret_patterns.rs` no longer exists and that non-gate modules do not import `crate::gate::secret_catalog`, `crate::gate::protected_paths`, or `crate::gate::command_path_analysis` directly. Do not forbid sibling imports inside `src/gate/`; the public-facade rule applies to outside consumers.
-- Full-suite verification: run `cargo build --release`, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and `xtask/lint.sh`. If `~/.autopoiesis/auth.json` exists, also run the integration test path already encoded in `xtask/lint.sh`.
+### `src/gate/shell_safety.rs`
+
+- Add a regression test that malformed `execute` arguments are hard-denied even when shell default action is `Allow`
+- Add a regression test that a missing `command` field is also hard-denied
+- Preserve existing tests for protected reads, protected writes, compound commands, allowlist hits, and taint-blocked standing approvals
+
+### `src/gate/mod.rs`
+
+- Add a test that malformed tool-call argument JSON containing a secret is persisted only through the conservative redacted wrapper and never echoes the original string
+- Add a test that structured tool-call argument JSON with embedded secrets is redacted and never falls back to the original argument string
+- Implement the code path so no synthetic serializer-failure harness is required; the contract test is the absence of any path back to the original arguments
+
+### `src/agent/shell_execute.rs`
+
+- Add a test that `guarded_shell_execute_call()` rejects non-`execute` tool calls
+- Add a test that `guarded_shell_execute_prechecked()` rejects non-`execute` tool calls
+- Add a regression test that tool execution errors still return valid JSON error output that is redacted/capped in the normal path
+
+### `src/gate/secret_redactor.rs`
+
+- Keep the invalid-regex constructor test
+- Add an explicit regression if needed for the built-in catalog invariant comment path only if code changes there
+
+### `src/gate/exfil_detector.rs`
+
+- Add a batch-level regression for malformed JSON producing the conservative high-severity approval outcome instead of silent skip
+- Add a regression for a missing/non-string `command` field producing the same conservative batch outcome
+- Keep existing read+send heuristics tests intact
+
+### `src/agent/loop_impl/tests.rs`
+
+- Add an integration regression with both `ShellSafety` and `ExfilDetector` active on malformed `execute` arguments
+- Assert that `shell-policy` deny wins over the batch-level exfil approval and the approval handler call count remains zero
+
+### `src/gate/streaming_redact.rs`
+
+- Add a regression for a secret prefix split across token boundaries to ensure holdback prevents prefix leakage
+- Add a regression for final flush behavior on an incomplete candidate so literal text and redaction boundaries remain correct
+
+### `src/tool.rs`
+
+- Keep existing timeout, truncation, and drain-after-cap tests
+- Add only targeted assertions if a behavior change is required; comments alone should not force broad test churn
+
+### `src/read_tool.rs`
+
+- Add a regression only if any path-policy code moves:
+  - protected path deny remains hard error
+  - provenance header remains present on successful reads
+  - parent traversal / symlink protections remain intact
+
+### Whole-tree verification
+
+- Run focused unit tests for the edited modules first
+- Then run `cargo build --release`
+- Then run `cargo test`
+- Then run `cargo fmt --check`
+- Then run `cargo clippy -- -D warnings`
+- Then run `xtask/lint.sh`
 
 ## 4. Order Of Operations
 
-1. Add `src/gate/secret_catalog.rs` first and move only the secret metadata types/constants. Update `src/gate/mod.rs` in the same step to add the minimal `pub(crate) use secret_catalog::SECRET_PATTERNS` reexport that the `turn.rs` test will need, then update `secret_redactor.rs`, `streaming_redact.rs`, and the `turn.rs` test import so those paths use the new source of truth. If `secret_patterns.rs` needs to stay briefly, make its catalog surface a pure forwarding shim rather than a second copy of the constants.
-2. Add `src/gate/protected_paths.rs` second and move only the protected-path catalogs, normalization helpers, and path tests. Update `src/gate/mod.rs` in the same step to add the minimal `pub(crate) use protected_paths::path_is_protected` reexport that `read_tool.rs` needs, then update `read_tool.rs` to the final `crate::gate::path_is_protected` import. If `secret_patterns.rs` still exists, forward its protected-path surface to `protected_paths.rs` so there is still only one implementation.
-3. Add `src/gate/command_path_analysis.rs` third and move the remaining command heuristics and their tests from `secret_patterns.rs`. Have this new module import `super::protected_paths` directly. Only after this file exists should `shell_safety.rs` and `exfil_detector.rs` switch away from `secret_patterns.rs`.
-4. Once `command_path_analysis.rs` is in place, update `shell_safety.rs` and `exfil_detector.rs` to import from sibling modules, narrow `src/gate/mod.rs` to the public facade needed outside `src/gate/`, and reduce `secret_patterns.rs` to a pure forwarding shim if any references still remain.
-5. Delete `src/gate/secret_patterns.rs` once every caller and test is building against the new modules. This is the delete step that proves the old mixed boundary is gone.
-6. Update the docs that still name `secret_patterns.rs`: `README.md`, `docs/architecture/overview.md`, and `docs/specs/restructure-plan.md`.
-7. Run targeted checks while moving code so failures stay local: the new `protected_paths.rs` tests, the new `command_path_analysis.rs` tests, `shell_safety` tests, `exfil_detector` tests, `read_tool` tests, `turn` tests, and any compile failures caused by stale imports. After the tree is stable, run the full verification stack: `cargo build --release`, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and `xtask/lint.sh`.
-8. After all checks pass and the tree is clean, run `openclaw system event --text 'Session 4a done: secret_patterns split' --mode now`.
+1. Start with the pure comment / low-risk guard files:
+   - `src/gate/secret_redactor.rs`
+   - `src/gate/budget.rs`
+   - `src/gate/output_cap.rs`
+   - `src/gate/streaming_redact.rs`
+
+2. Fix the actual fail-closed issues before facade cleanup:
+   - `src/gate/shell_safety.rs`
+   - `src/gate/exfil_detector.rs` if malformed-arg skipping is tightened
+
+3. Harden the persistence/redaction facade and fix caller imports in the same slice:
+   - `src/gate/mod.rs`
+   - `src/agent/shell_execute.rs`
+   - `src/read_tool.rs`
+   - `src/turn.rs`
+   - any directly affected gate-related tests
+
+4. Add shell execution boundary comments and any tiny invariant tests:
+   - `src/tool.rs`
+
+5. Run targeted tests for the touched files after each cluster to keep the work green and isolate regressions quickly
+
+6. Run full verification:
+   - `cargo build --release`
+   - `cargo test`
+   - `cargo fmt --check`
+   - `cargo clippy -- -D warnings`
+   - `xtask/lint.sh`
+
+7. Only after the implementation session passes verification, run:
+   - `openclaw system event --text 'Session 4b done: gate cleanup' --mode now`
 
 ## 5. Risk Assessment
 
-- The main risk is a silent security regression while moving helper functions between files. `secret_patterns.rs` currently mixes pure catalogs with heuristic path analysis, so a bad move can accidentally widen `ShellSafety`, `ExfilDetector`, or `ReadFile` behavior even if the crate still compiles.
-- The highest-risk helpers are the env-wrapper parsers, git config/pathspec handling, grep `-f` operand checks, target-path rewrite logic, and symlink-aware target matching. They should move with minimal textual edits first, then be cleaned up only after tests pass.
-- `protected_paths.rs` and `command_path_analysis.rs` will share normalization assumptions. If they diverge, the shell guard and the read tool can start disagreeing about what counts as protected. The mitigation is one owner for normalized path classification, with command heuristics importing that owner instead of copying path logic.
-- The facade requirement is easy to violate accidentally. If callers start importing the new submodules directly, the split helps file shape but fails the “gate/mod.rs is the only public gate facade” requirement. The mitigation is a final repo-wide grep for direct imports before deleting `secret_patterns.rs`.
-- Docs drift is a real merge blocker in this repo. Search already shows stale references in `README.md`, `docs/architecture/overview.md`, and `docs/specs/restructure-plan.md`, so those updates must ship in the same merge as the code move.
-- Verification is expensive because `xtask/lint.sh` runs the full build, fmt, clippy, and test stack. The mitigation is targeted test runs after each move, followed by one final full run when the delete step and docs updates are done.
+### Highest risk
+
+- `src/gate/shell_safety.rs`: changing malformed-argument handling from default-policy fallback to explicit fail-closed behavior can break existing tests and any flows that accidentally relied on malformed `execute` payloads being merely approved
+- `src/gate/mod.rs`: removing `unwrap_or(arguments)` changes the exact persisted shape of redacted tool-call arguments in rare serializer-failure paths; tests need to pin the new conservative contract
+
+### Medium risk
+
+- `src/gate/exfil_detector.rs`: if malformed tool-call args stop being silently skipped, batch approval behavior changes and may require test updates in turn/agent integration coverage
+- `src/agent/shell_execute.rs`: invariant-only edits are low risk, but if any helper extraction happens around the guarded execution pipeline it can subtly change denial/result-file behavior
+
+### Low risk
+
+- `src/gate/secret_redactor.rs`
+- `src/gate/budget.rs`
+- `src/gate/output_cap.rs`
+- `src/gate/streaming_redact.rs`
+- `src/tool.rs`
+- `src/read_tool.rs`
+
+These should mostly be comment additions plus narrow assertions, provided the implementation does not broaden scope.
+
+### Out-of-scope / no planned deletions
+
+- No module splits or dependency changes are planned
+- No public API expansion is planned
+- No delete list is expected for Session 4b unless a review during implementation finds a genuinely dead import/re-export in `src/gate/mod.rs`

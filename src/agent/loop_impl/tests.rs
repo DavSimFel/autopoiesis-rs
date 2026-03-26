@@ -1247,6 +1247,74 @@ async fn denied_tool_calls_reload_with_placeholder_and_audit_note() {
 }
 
 #[tokio::test]
+async fn malformed_execute_arguments_deny_wins_over_batch_approval() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = temp_sessions_dir("malformed_execute_arguments");
+    let provider = SequenceProvider::new(vec![crate::llm::StreamedTurn {
+        assistant_message: crate::llm::ChatMessage {
+            role: crate::llm::ChatRole::Assistant,
+            principal: Principal::Agent,
+            content: vec![crate::llm::MessageContent::ToolCall {
+                call: crate::llm::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "execute".to_string(),
+                    arguments: "not-json".to_string(),
+                },
+            }],
+        },
+        tool_calls: vec![crate::llm::ToolCall {
+            id: "call-1".to_string(),
+            name: "execute".to_string(),
+            arguments: "not-json".to_string(),
+        }],
+        meta: None,
+        stop_reason: StopReason::ToolCalls,
+    }]);
+    let mut session = crate::session::Session::new(&dir).unwrap();
+    let turn = Turn::new()
+        .tool(crate::tool::Shell::new())
+        .guard(ShellSafety::new())
+        .guard(crate::gate::ExfilDetector::new());
+    let approval_count = Arc::new(AtomicUsize::new(0));
+    let approval_count_seen = approval_count.clone();
+    let mut make_provider = {
+        let provider = provider.clone();
+        move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        }
+    };
+    let mut token_sink = |_token: String| {};
+    let mut approval_handler = move |_severity: &Severity, _reason: &str, _command: &str| {
+        approval_count_seen.fetch_add(1, Ordering::SeqCst);
+        true
+    };
+
+    let verdict = run_agent_loop(
+        &mut make_provider,
+        &mut session,
+        "malformed execute arguments".to_string(),
+        Principal::Operator,
+        &turn,
+        &mut token_sink,
+        &mut approval_handler,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        verdict,
+        TurnVerdict::Denied { reason, gate_id }
+            if gate_id == "shell-policy" && reason.contains("malformed JSON")
+    ));
+    assert_eq!(approval_count.load(Ordering::SeqCst), 0);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn denied_mixed_content_assistant_message_keeps_text_but_drops_tool_calls() {
     let dir = temp_sessions_dir("denied_mixed_content");
     let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(

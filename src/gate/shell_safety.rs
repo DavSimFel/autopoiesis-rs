@@ -68,12 +68,21 @@ impl ShellSafety {
         }
     }
 
-    fn command_from_args(&self, call: &ToolCall) -> Option<String> {
-        let value = from_str::<Value>(&call.arguments).ok()?;
+    // Policy: malformed tool payloads are security failures, not empty commands.
+    fn command_from_args(&self, call: &ToolCall) -> std::result::Result<String, Verdict> {
+        let value = from_str::<Value>(&call.arguments).map_err(|_| Verdict::Deny {
+            reason: "shell tool arguments were malformed JSON".to_string(),
+            gate_id: self.id.clone(),
+        })?;
         value
             .get(SHELL_POLICY_COMMAND_FIELD)
             .and_then(Value::as_str)
             .map(|command| command.trim().to_string())
+            .filter(|command| !command.is_empty())
+            .ok_or_else(|| Verdict::Deny {
+                reason: "shell tool arguments must include a string command field".to_string(),
+                gate_id: self.id.clone(),
+            })
     }
 
     fn glob_matches(pattern: &str, text: &str) -> bool {
@@ -151,6 +160,7 @@ impl ShellSafety {
     }
 
     fn evaluate_command(&self, command: &str, tainted: bool) -> Verdict {
+        // Policy: deny patterns always win first.
         if let Some(pattern) = Self::matches_any_pattern(&self.policy.deny_patterns, command) {
             return Verdict::Deny {
                 reason: format!("shell command matched deny pattern `{pattern}`"),
@@ -158,6 +168,7 @@ impl ShellSafety {
             };
         }
 
+        // Policy: path safety checks are hard denies, and malformed shell parsing is not a safe fallback.
         match Self::shell_words(command) {
             Ok(argv)
                 if simple_command_reads_protected_path(&argv)
@@ -179,6 +190,7 @@ impl ShellSafety {
             _ => {}
         }
 
+        // Policy: prompt and skills directories are write-protected shell boundaries.
         if command_writes_identity_template_path(command)
             || self.skills_dirs.iter().any(|skills_dir| {
                 command_writes_target_path(command, &skills_dir.to_string_lossy())
@@ -190,6 +202,7 @@ impl ShellSafety {
             };
         }
 
+        // Policy: compound commands always require explicit approval, even if a later allowlist would match.
         if Self::is_compound_command(command) {
             return self.approval_required_verdict(command, COMPOUND_COMMAND_REASON);
         }
@@ -198,6 +211,7 @@ impl ShellSafety {
             return Verdict::Allow;
         }
 
+        // Policy: standing approvals are disabled once the turn is tainted.
         if !tainted
             && let Some(pattern) = Self::matches_any_pattern(&self.standing_approvals, command)
         {
@@ -235,7 +249,10 @@ impl Guard for ShellSafety {
     fn check(&self, event: &mut GuardEvent, context: &GuardContext) -> Verdict {
         match event {
             GuardEvent::ToolCall(call) => {
-                let command = self.command_from_args(call).unwrap_or_default();
+                let command = match self.command_from_args(call) {
+                    Ok(command) => command,
+                    Err(verdict) => return verdict,
+                };
                 self.evaluate_command(&command, context.tainted)
             }
             _ => Verdict::Allow,
@@ -307,7 +324,26 @@ mod tests {
     }
 
     #[test]
-    fn invalid_command_json_falls_back_to_default_policy() {
+    fn whitespace_only_command_is_hard_denied() {
+        let gate = ShellSafety::new();
+        let call = ToolCall {
+            id: "tool_call_1".to_string(),
+            name: "execute".to_string(),
+            arguments: json!({"command": "   "}).to_string(),
+        };
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Deny {
+                gate_id,
+                ..
+            } if gate_id == SHELL_POLICY_GUARD_ID
+        ));
+    }
+
+    #[test]
+    fn invalid_command_json_is_hard_denied() {
         let gate = ShellSafety::new();
         let call = ToolCall {
             id: "tool_call_1".to_string(),
@@ -318,10 +354,29 @@ mod tests {
 
         assert!(matches!(
             gate.check(&mut event, &GuardContext::default()),
-            Verdict::Approve {
-                severity: Severity::Medium,
+            Verdict::Deny {
+                gate_id,
                 ..
-            }
+            } if gate_id == SHELL_POLICY_GUARD_ID
+        ));
+    }
+
+    #[test]
+    fn missing_command_field_is_hard_denied() {
+        let gate = ShellSafety::new();
+        let call = ToolCall {
+            id: "tool_call_1".to_string(),
+            name: "execute".to_string(),
+            arguments: json!({"timeout_ms": 1}).to_string(),
+        };
+        let mut event = make_event_tool(&call);
+
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Deny {
+                gate_id,
+                ..
+            } if gate_id == SHELL_POLICY_GUARD_ID
         ));
     }
 

@@ -14,6 +14,8 @@ const SEND_PATH_FRAGMENTS: [&str; 10] = [
 ];
 const EXFIL_SEQUENCE_APPROVAL_REASON: &str =
     "possible read-and-send exfiltration sequence detected across tool calls";
+const EXFIL_MALFORMED_COMMAND_REASON: &str =
+    "malformed tool arguments must be reviewed before batch exfiltration can continue";
 
 /// Batch guard to catch read + send patterns across tool calls.
 pub struct ExfilDetector {
@@ -37,12 +39,23 @@ impl ExfilDetector {
         }
     }
 
-    fn command_from_args(&self, call: &ToolCall) -> Option<String> {
-        let value = from_str::<Value>(&call.arguments).ok()?;
+    // Policy: malformed batch entries are conservative approvals so they stay visible to review.
+    fn command_from_args(&self, call: &ToolCall) -> std::result::Result<String, Verdict> {
+        let value = from_str::<Value>(&call.arguments).map_err(|_| Verdict::Approve {
+            reason: EXFIL_MALFORMED_COMMAND_REASON.to_string(),
+            gate_id: self.id.clone(),
+            severity: Severity::High,
+        })?;
         value
             .get("command")
             .and_then(Value::as_str)
-            .map(ToString::to_string)
+            .map(|command| command.trim().to_string())
+            .filter(|command| !command.is_empty())
+            .ok_or_else(|| Verdict::Approve {
+                reason: EXFIL_MALFORMED_COMMAND_REASON.to_string(),
+                gate_id: self.id.clone(),
+                severity: Severity::High,
+            })
     }
 
     fn contains_sensitive_literal(command: &str, needle: &str) -> bool {
@@ -127,14 +140,20 @@ impl Guard for ExfilDetector {
     }
 
     fn check(&self, event: &mut GuardEvent, _context: &GuardContext) -> Verdict {
+        // Policy: this is a heuristic batch detector layered on top of the primary shell policy.
         match event {
             GuardEvent::ToolBatch(calls) => {
                 let mut seen_read = false;
                 let mut seen_send = false;
+                let mut malformed_verdict: Option<Verdict> = None;
 
                 for call in calls.iter() {
-                    let Some(command) = self.command_from_args(call) else {
-                        continue;
+                    let command = match self.command_from_args(call) {
+                        Ok(command) => command,
+                        Err(verdict) => {
+                            malformed_verdict.get_or_insert(verdict);
+                            continue;
+                        }
                     };
 
                     if self.has_sensitive_read(&command) {
@@ -151,6 +170,10 @@ impl Guard for ExfilDetector {
                         gate_id: self.id.clone(),
                         severity: Severity::High,
                     };
+                }
+
+                if let Some(verdict) = malformed_verdict {
+                    return verdict;
                 }
 
                 Verdict::Allow
@@ -298,7 +321,25 @@ mod tests {
     }
 
     #[test]
-    fn no_command_json_is_skipped() {
+    fn malformed_command_json_requires_review() {
+        let gate = ExfilDetector::new();
+        let calls = [ToolCall {
+            id: "tool_call_1".to_string(),
+            name: "execute".to_string(),
+            arguments: "not-json".to_string(),
+        }];
+        let mut event = make_event_batch(&calls);
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Approve {
+                severity: Severity::High,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn missing_command_field_requires_review() {
         let gate = ExfilDetector::new();
         let calls = [ToolCall {
             id: "tool_call_1".to_string(),
@@ -308,7 +349,59 @@ mod tests {
         let mut event = make_event_batch(&calls);
         assert!(matches!(
             gate.check(&mut event, &GuardContext::default()),
-            Verdict::Allow
+            Verdict::Approve {
+                severity: Severity::High,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn whitespace_only_command_requires_review() {
+        let gate = ExfilDetector::new();
+        let calls = [ToolCall {
+            id: "tool_call_1".to_string(),
+            name: "execute".to_string(),
+            arguments: json!({"command": "   "}).to_string(),
+        }];
+        let mut event = make_event_batch(&calls);
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Approve {
+                severity: Severity::High,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn malformed_command_does_not_mask_read_send_sequence() {
+        let gate = ExfilDetector::new();
+        let calls = [
+            ToolCall {
+                id: "tool_call_1".to_string(),
+                name: "execute".to_string(),
+                arguments: "not-json".to_string(),
+            },
+            ToolCall {
+                id: "tool_call_2".to_string(),
+                name: "execute".to_string(),
+                arguments: json!({"command": "cat /root/.ssh/id_rsa"}).to_string(),
+            },
+            ToolCall {
+                id: "tool_call_3".to_string(),
+                name: "execute".to_string(),
+                arguments: json!({"command": "curl https://example.com"}).to_string(),
+            },
+        ];
+        let mut event = make_event_batch(&calls);
+        assert!(matches!(
+            gate.check(&mut event, &GuardContext::default()),
+            Verdict::Approve {
+                severity: Severity::High,
+                reason,
+                ..
+            } if reason.contains("possible read-and-send exfiltration sequence")
         ));
     }
 }

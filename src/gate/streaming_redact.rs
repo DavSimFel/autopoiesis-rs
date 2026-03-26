@@ -21,6 +21,7 @@ fn is_body_byte(kind: SecretBodyKind, byte: u8) -> bool {
 }
 
 fn prefix_holdback() -> usize {
+    // Policy: keep enough trailing bytes buffered to avoid leaking a secret prefix before matching can finish.
     SECRET_PATTERNS
         .iter()
         .map(|pattern| pattern.prefix.len())
@@ -193,6 +194,7 @@ impl StreamingTextBuffer {
                         continue_redacting,
                     } => {
                         let _ = take_prefix(&mut self.pending, consumed_bytes);
+                        // Policy: once a secret match is confirmed, keep redacting across token boundaries until the candidate ends.
                         self.emit_segment(redact_text, emit_token, REDACTION_MARKER.to_string());
                         self.active_secret = continue_redacting.then_some(pattern_index);
                     }
@@ -209,6 +211,7 @@ impl StreamingTextBuffer {
                 break;
             }
 
+            // Policy: buffer any prefix-sized tail so a secret candidate cannot leak before the next token arrives.
             if char_count <= holdback {
                 break;
             }

@@ -12,6 +12,7 @@ pub struct SecretRedactor {
 }
 
 impl SecretRedactor {
+    // Policy: secret redaction configuration is validated eagerly; invalid regexes must fail construction.
     pub fn new(patterns: &[&str]) -> Result<Self, regex::Error> {
         let patterns = patterns
             .iter()
@@ -29,6 +30,7 @@ impl SecretRedactor {
             .iter()
             .map(|pattern| pattern.regex)
             .collect();
+        // Invariant: the built-in catalog is repo-owned static configuration; an invalid pattern is a programmer bug.
         Self::new(&patterns).expect("secret redaction catalog patterns must be valid")
     }
 
@@ -49,6 +51,7 @@ impl SecretRedactor {
     }
 
     fn redact_messages(&self, messages: &mut Vec<ChatMessage>) -> bool {
+        // Policy: inbound message content is rewritten before persistence so secrets never reach history.
         let mut edited = false;
 
         for message in messages {
@@ -79,6 +82,7 @@ impl Guard for SecretRedactor {
     }
 
     fn check(&self, event: &mut GuardEvent, _context: &GuardContext) -> Verdict {
+        // Policy: redaction is a rewrite boundary, not an approval boundary.
         match event {
             GuardEvent::Inbound(messages) => {
                 if self.redact_messages(messages) {

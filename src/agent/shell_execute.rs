@@ -39,6 +39,7 @@ where
 }
 
 /// Run the guarded shell path for a prepared `execute` tool call.
+// Invariant: this entrypoint only processes `execute` tool calls that already passed guard evaluation.
 pub async fn guarded_shell_execute_call<AH>(
     turn: &Turn,
     call: &ToolCall,
@@ -88,6 +89,7 @@ where
 }
 
 /// Execute a shell call after guard policy has already been applied by the caller.
+// Invariant: callers of the prechecked path must have already enforced approval / denial policy.
 pub(crate) async fn guarded_shell_execute_prechecked(
     turn: &Turn,
     call: &ToolCall,
@@ -118,6 +120,7 @@ async fn execute_shell_call(
     session: &Session,
     was_approved: bool,
 ) -> Result<GuardedShellResult> {
+    // Invariant: execution, redaction, and output capping always happen in this order before persistence.
     debug!(call_id = %call.id, tool_name = %call.name, "executing guarded shell call");
     let raw_output = match turn.execute_tool(&call.name, &call.arguments).await {
         Ok(output) => output,

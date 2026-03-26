@@ -22,6 +22,7 @@ impl BudgetGuard {
     }
 
     fn violations(&self, budget: &BudgetSnapshot) -> Vec<String> {
+        // Invariant: violation order is stable so operator output and tests stay deterministic.
         let mut violations = Vec::new();
 
         if let Some(limit) = self.limits.max_tokens_per_turn
@@ -56,6 +57,7 @@ impl Guard for BudgetGuard {
     }
 
     fn check(&self, event: &mut GuardEvent, context: &GuardContext) -> Verdict {
+        // Policy: budget checks are inbound preflight hard denies; they do not mutate or redact content.
         match event {
             GuardEvent::Inbound(_) => {
                 let violations = self.violations(&context.budget);

@@ -268,6 +268,7 @@ impl Shell {
     }
 
     async fn kill_with_fallback(child: &mut TokioChild, pid: Option<u32>) -> Result<()> {
+        // Policy: timeout enforcement must terminate the whole process group so descendants do not outlive the shell call.
         if child.id().is_none() {
             return Ok(());
         }
@@ -302,6 +303,7 @@ impl Shell {
         effective_deadline: &mut Instant,
         cap_hit_observed: &mut bool,
     ) {
+        // Policy: stdout and stderr share one capture budget, and after the cap is hit the child still gets a short drain window to exit cleanly.
         if *cap_hit_observed {
             return;
         }
@@ -318,6 +320,7 @@ impl Shell {
         started_at: Instant,
         effective_deadline: Instant,
     ) -> anyhow::Error {
+        // Invariant: timeout errors distinguish the original deadline from the shorter post-cap drain deadline.
         let effective_timeout_ms =
             u64::try_from(effective_deadline.duration_since(started_at).as_millis())
                 .unwrap_or(u64::MAX);
@@ -339,6 +342,7 @@ impl Shell {
     where
         R: AsyncRead + Unpin,
     {
+        // Invariant: each stream drains against the same shared capture budget, never against its own private limit.
         let mut captured = Vec::new();
         let mut truncated = false;
         let mut chunk = [0u8; DRAIN_CHUNK_SIZE];
@@ -380,6 +384,7 @@ impl Shell {
         timeout_ms: u64,
         max_output_bytes: usize,
     ) -> Result<ShellOutput> {
+        // Invariant: the shell runtime is bounded by timeout and capture budgets, but it is not a sandbox.
         debug!(
             command_len = command_text.len(),
             timeout_ms, max_output_bytes, "starting shell execution"
