@@ -371,6 +371,17 @@ pub(super) fn get_step_attempts(
     Ok(attempts)
 }
 
+pub(super) fn total_step_attempts_for_run(conn: &Connection, plan_run_id: &str) -> Result<i64> {
+    let total_attempts: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM plan_step_attempts WHERE plan_run_id = ?1",
+            params![plan_run_id],
+            |row| row.get(0),
+        )
+        .context("failed to count plan step attempts")?;
+    Ok(total_attempts)
+}
+
 impl super::Store {
     pub fn next_step_attempt_index_for_run(&self, plan_run: &PlanRun) -> Result<i64> {
         next_step_attempt_index_for_run(&self.conn, plan_run)
@@ -378,6 +389,10 @@ impl super::Store {
 
     pub fn max_step_attempt_index_for_run(&self, plan_run_id: &str) -> Result<i64> {
         max_step_attempt_index_for_run(&self.conn, plan_run_id)
+    }
+
+    pub fn total_step_attempts_for_run(&self, plan_run_id: &str) -> Result<i64> {
+        total_step_attempts_for_run(&self.conn, plan_run_id)
     }
 
     pub fn crash_running_step_attempts_for_run(
@@ -447,5 +462,80 @@ impl super::Store {
         step_index: i64,
     ) -> Result<Vec<StepAttempt>> {
         get_step_attempts(&self.conn, plan_run_id, step_index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_store() -> (Store, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "autopoiesis_step_attempts_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::new(root.join("queue.sqlite")).unwrap();
+        (store, root)
+    }
+
+    #[test]
+    fn total_step_attempts_for_run_counts_all_attempts() {
+        let (mut store, root) = test_store();
+        store.create_session("owner", None).unwrap();
+        store
+            .create_plan_run(
+                "plan-1",
+                "owner",
+                r#"{"kind":"plan","plan_run_id":null,"replace_from_step":null,"note":null,"steps":[{"kind":"shell","id":"step-1","command":"echo hi","timeout_ms":null,"checks":[],"max_attempts":1}]}"#,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .record_step_attempt(StepAttemptRecord {
+                plan_run_id: "plan-1".to_string(),
+                revision: 1,
+                step_index: 0,
+                step_id: "step-1".to_string(),
+                attempt: 0,
+                status: "running".to_string(),
+                child_session_id: None,
+                summary_json: "{}".to_string(),
+                checks_json: "[]".to_string(),
+            })
+            .unwrap();
+        store
+            .record_step_attempt(StepAttemptRecord {
+                plan_run_id: "plan-1".to_string(),
+                revision: 1,
+                step_index: 0,
+                step_id: "step-1".to_string(),
+                attempt: 1,
+                status: "running".to_string(),
+                child_session_id: None,
+                summary_json: "{}".to_string(),
+                checks_json: "[]".to_string(),
+            })
+            .unwrap();
+        store
+            .record_step_attempt(StepAttemptRecord {
+                plan_run_id: "plan-1".to_string(),
+                revision: 2,
+                step_index: 0,
+                step_id: "step-1".to_string(),
+                attempt: 0,
+                status: "running".to_string(),
+                child_session_id: None,
+                summary_json: "{}".to_string(),
+                checks_json: "[]".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(store.total_step_attempts_for_run("plan-1").unwrap(), 3);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

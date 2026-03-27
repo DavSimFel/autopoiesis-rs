@@ -14,6 +14,111 @@ impl crate::context::ContextSource for TailUserContext {
         messages.push(ChatMessage::user("tail context user message"));
     }
 }
+
+#[tokio::test]
+async fn observed_turn_emits_turn_and_tool_lifecycle_events() {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl crate::observe::Observer for RecordingObserver {
+        fn emit(&self, event: &crate::observe::TraceEvent) {
+            self.events
+                .lock()
+                .expect("observer mutex poisoned")
+                .push(serde_json::to_value(event).expect("trace event should serialize"));
+        }
+    }
+
+    let dir = temp_sessions_dir("observed_turn");
+    let first_turn = StreamedTurn {
+        assistant_message: ChatMessage {
+            role: crate::llm::ChatRole::Assistant,
+            principal: Principal::Agent,
+            content: vec![MessageContent::text("run it")],
+        },
+        tool_calls: vec![ToolCall {
+            id: "call-1".to_string(),
+            name: "execute".to_string(),
+            arguments: serde_json::json!({ "command": "echo hello" }).to_string(),
+        }],
+        meta: None,
+        stop_reason: StopReason::ToolCalls,
+    };
+    let second_turn = StreamedTurn {
+        assistant_message: ChatMessage {
+            role: crate::llm::ChatRole::Assistant,
+            principal: Principal::Agent,
+            content: vec![MessageContent::text("done")],
+        },
+        tool_calls: vec![],
+        meta: None,
+        stop_reason: StopReason::Stop,
+    };
+    let provider = SequenceProvider::new(vec![first_turn, second_turn]);
+    let mut session = crate::session::Session::new(&dir).unwrap();
+    let turn = Turn::new()
+        .tool(Shell::new())
+        .guard(SecretRedactor::new(&[]).expect("empty secret redaction patterns are valid"));
+    let mut make_provider = {
+        let provider = provider.clone();
+        move || {
+            let provider = provider.clone();
+            async move { Ok::<_, anyhow::Error>(provider) }
+        }
+    };
+    let mut token_sink = |_token: String| {};
+    let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
+    let observer = Arc::new(RecordingObserver::default());
+    let observed_events = observer.events.clone();
+
+    let verdict = super::run_agent_loop_observed(
+        observer,
+        &mut make_provider,
+        &mut session,
+        "run the command".to_string(),
+        Principal::Operator,
+        &turn,
+        &mut token_sink,
+        &mut approval_handler,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(verdict, TurnVerdict::Executed(_)));
+    let events = observed_events
+        .lock()
+        .expect("observer mutex poisoned")
+        .clone();
+    let kinds: Vec<_> = events
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "TurnStarted",
+            "CompletionFinished",
+            "ToolCallStarted",
+            "ToolCallFinished",
+            "CompletionFinished",
+            "TurnFinished",
+        ]
+    );
+    let first_turn_id = events[0]["turn_id"].as_str().unwrap();
+    assert_eq!(events[2]["turn_id"].as_str().unwrap(), first_turn_id);
+    assert_eq!(events[3]["turn_id"].as_str().unwrap(), first_turn_id);
+    assert_eq!(events[4]["turn_id"].as_str().unwrap(), first_turn_id);
+    assert_eq!(events[5]["turn_id"].as_str().unwrap(), first_turn_id);
+    assert_eq!(events[3]["status"].as_str().unwrap(), "completed");
+    assert!(!events[3]["was_denied"].as_bool().unwrap());
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test]
 async fn trims_context_before_stream_completion_when_over_estimated_limit() {
     let dir = temp_sessions_dir("pre_call_trim");

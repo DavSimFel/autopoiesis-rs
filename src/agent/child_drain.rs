@@ -2,14 +2,16 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::llm::LlmProvider;
+use crate::observe::Observer;
 use crate::plan::extract_plan_action;
 use crate::session::Session;
 use crate::store::Store;
 
-use super::queue::drain_queue_with_stats_fresh_turns;
 use super::{ApprovalHandler, SpawnDrainResult, SpawnRequest, SpawnResult, TokenSink, TurnVerdict};
+use crate::session_runtime::drain::drain_queue_with_stats_fresh_turns_observed;
 
 pub(super) type SpawnedChildMetadata = crate::child_session::ChildSessionMetadata;
 
@@ -18,6 +20,36 @@ pub(super) fn parse_spawned_child_metadata(metadata: &str) -> Result<SpawnedChil
 }
 
 pub(super) async fn spawn_and_drain_with_provider<F, Fut, P, TS>(
+    store: &mut Store,
+    config: &crate::config::Config,
+    session_dir: &Path,
+    request: SpawnRequest,
+    make_provider: &mut F,
+    token_sink: &mut TS,
+    approval_handler: &mut (dyn ApprovalHandler + Send),
+) -> Result<SpawnDrainResult>
+where
+    F: FnMut(&crate::config::Config) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<P>> + Send,
+    P: LlmProvider + Send,
+    TS: TokenSink + Send,
+{
+    spawn_and_drain_with_provider_observed(
+        crate::observe::runtime_observer(session_dir),
+        store,
+        config,
+        session_dir,
+        request,
+        make_provider,
+        token_sink,
+        approval_handler,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn spawn_and_drain_with_provider_observed<F, Fut, P, TS>(
+    observer: Arc<dyn Observer>,
     store: &mut Store,
     config: &crate::config::Config,
     session_dir: &Path,
@@ -52,7 +84,8 @@ where
         session_dir,
         spawn_result,
     };
-    finish_spawned_child_drain(
+    finish_spawned_child_drain_observed(
+        observer,
         context,
         &metadata_json,
         make_provider,
@@ -69,7 +102,34 @@ pub(crate) struct SpawnDrainContext<'a> {
     pub(crate) spawn_result: SpawnResult,
 }
 
+#[cfg(test)]
 pub(crate) async fn finish_spawned_child_drain<F, Fut, P, TS>(
+    context: SpawnDrainContext<'_>,
+    metadata_json: &str,
+    make_provider: &mut F,
+    token_sink: &mut TS,
+    approval_handler: &mut (dyn ApprovalHandler + Send),
+) -> Result<SpawnDrainResult>
+where
+    F: FnMut(&crate::config::Config) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<P>> + Send,
+    P: LlmProvider + Send,
+    TS: TokenSink + Send,
+{
+    let observer = crate::observe::runtime_observer(context.session_dir);
+    finish_spawned_child_drain_observed(
+        observer,
+        context,
+        metadata_json,
+        make_provider,
+        token_sink,
+        approval_handler,
+    )
+    .await
+}
+
+pub(crate) async fn finish_spawned_child_drain_observed<F, Fut, P, TS>(
+    observer: Arc<dyn Observer>,
     context: SpawnDrainContext<'_>,
     metadata_json: &str,
     make_provider: &mut F,
@@ -125,9 +185,11 @@ where
         .context("failed to load child session history")?;
 
     let mut make_provider_for_turn = || make_provider(&child_config);
-    let (drain_result, completed_agent_turn, current_assistant_response) =
-        drain_queue_with_stats_fresh_turns(
-            context.store,
+    let mut backend = crate::session_runtime::drain::StoreDrainBackend::new(context.store);
+    let (drain_result, completed_agent_turn, current_assistant_response, last_successful_turn_id) =
+        drain_queue_with_stats_fresh_turns_observed(
+            &mut backend,
+            observer.clone(),
             &context.spawn_result.child_session_id,
             &mut child_session,
             &mut turn_builder,
@@ -153,9 +215,11 @@ where
     let last_assistant_response = current_assistant_response;
     if completed_agent_turn {
         apply_t2_plan_handoff(
+            observer,
             context.store,
             &metadata.parent_session_id,
             &tier,
+            last_successful_turn_id.as_deref(),
             last_assistant_response.as_deref(),
         )?;
     }
@@ -163,13 +227,16 @@ where
         child_session_id: context.spawn_result.child_session_id,
         resolved_model: context.spawn_result.resolved_model,
         last_assistant_response,
+        last_successful_turn_id,
     })
 }
 
 fn apply_t2_plan_handoff(
+    observer: Arc<dyn Observer>,
     store: &mut Store,
     owner_session_id: &str,
     tier: &str,
+    caused_by_turn_id: Option<&str>,
     last_assistant_response: Option<&str>,
 ) -> Result<()> {
     if tier != "t2" {
@@ -184,7 +251,13 @@ fn apply_t2_plan_handoff(
         return Ok(());
     };
 
-    crate::plan::patch::apply_plan_action(store, owner_session_id, &action)?;
+    crate::plan::patch::apply_plan_action_observed(
+        observer,
+        store,
+        owner_session_id,
+        caused_by_turn_id,
+        &action,
+    )?;
     Ok(())
 }
 

@@ -1,9 +1,11 @@
 use anyhow::{Result, ensure};
+use std::sync::Arc;
 use tracing::debug;
 
 use crate::agent::ApprovalHandler;
 use crate::gate::{DEFAULT_OUTPUT_CAP_BYTES, Verdict, cap_tool_output, guard_text_output};
 use crate::llm::ToolCall;
+use crate::observe::{Observer, TraceEvent};
 use crate::session::Session;
 use crate::turn::Turn;
 
@@ -94,13 +96,53 @@ pub(crate) async fn guarded_shell_execute_prechecked(
     turn: &Turn,
     call: &ToolCall,
     session: &Session,
+    was_approved: bool,
 ) -> Result<GuardedShellResult> {
     ensure!(
         call.name == "execute",
         "guarded shell execution requires execute tool calls"
     );
 
-    execute_shell_call(turn, call, session, false).await
+    execute_shell_call(turn, call, session, was_approved).await
+}
+
+pub(crate) async fn guarded_shell_execute_prechecked_observed(
+    observer: Arc<dyn Observer>,
+    session_id: &str,
+    turn_id: &str,
+    turn: &Turn,
+    call: &ToolCall,
+    session: &Session,
+    was_approved: bool,
+) -> Result<GuardedShellResult> {
+    match guarded_shell_execute_prechecked(turn, call, session, was_approved).await {
+        Ok(result) => {
+            observer.emit(&TraceEvent::ToolCallFinished {
+                session_id: session_id.to_string(),
+                turn_id: turn_id.to_string(),
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                status: "completed".to_string(),
+                exit_code: result.exit_code.map(i64::from),
+                was_approved: Some(result.was_approved),
+                was_denied: Some(false),
+            });
+            Ok(result)
+        }
+        Err(error) => {
+            observer.emit(&TraceEvent::ToolCallFinished {
+                session_id: session_id.to_string(),
+                turn_id: turn_id.to_string(),
+                call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                status: "error".to_string(),
+                exit_code: None,
+                was_approved: Some(was_approved),
+                was_denied: Some(false),
+            });
+            Err(error)
+        }
+    }
 }
 
 fn command_from_call(call: &ToolCall) -> String {

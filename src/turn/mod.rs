@@ -16,7 +16,7 @@ pub use builders::{
     build_turn_for_config_with_subscriptions,
 };
 pub use tiers::{TurnTier, resolve_tier};
-pub use verdicts::resolve_verdict;
+pub use verdicts::{GuardTraceOutcome, TracedVerdict, resolve_traced_verdict, resolve_verdict};
 
 #[cfg(test)]
 mod tests;
@@ -106,6 +106,14 @@ impl Turn {
         messages: &mut Vec<ChatMessage>,
         context: Option<GuardContext>,
     ) -> Verdict {
+        self.check_inbound_with_trace(messages, context).verdict
+    }
+
+    pub fn check_inbound_with_trace(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+        context: Option<GuardContext>,
+    ) -> TracedVerdict {
         let baseline = messages.clone();
         self.assemble_context(messages);
         let tainted = messages
@@ -114,7 +122,8 @@ impl Turn {
         self.tainted.store(tainted, Ordering::Relaxed);
         let mut context = context.unwrap_or_default();
         context.tainted = tainted;
-        let verdict = resolve_verdict(&self.guards, GuardEvent::Inbound(messages), false, context);
+        let traced =
+            resolve_traced_verdict(&self.guards, GuardEvent::Inbound(messages), false, context);
         let modified = baseline.len() != messages.len()
             || baseline.iter().zip(messages.iter()).any(|(before, after)| {
                 before.role != after.role
@@ -122,19 +131,27 @@ impl Turn {
                     || serde_json::to_string(&before.content).ok()
                         != serde_json::to_string(&after.content).ok()
             });
-        if modified {
-            match verdict {
+        let verdict = if modified {
+            match traced.verdict {
                 Verdict::Allow => Verdict::Modify,
-                _ => verdict,
+                _ => traced.verdict.clone(),
             }
         } else {
-            verdict
+            traced.verdict.clone()
+        };
+        TracedVerdict {
+            verdict,
+            guard_outcomes: traced.guard_outcomes,
         }
     }
 
     #[tracing::instrument(level = "debug", skip(self, call))]
     pub fn check_tool_call(&self, call: &ToolCall) -> Verdict {
-        resolve_verdict(
+        self.check_tool_call_with_trace(call).verdict
+    }
+
+    pub fn check_tool_call_with_trace(&self, call: &ToolCall) -> TracedVerdict {
+        resolve_traced_verdict(
             &self.guards,
             GuardEvent::ToolCall(call),
             false,
@@ -147,7 +164,11 @@ impl Turn {
 
     #[tracing::instrument(level = "debug", skip(self, calls), fields(call_count = calls.len()))]
     pub fn check_tool_batch(&self, calls: &[ToolCall]) -> Verdict {
-        resolve_verdict(
+        self.check_tool_batch_with_trace(calls).verdict
+    }
+
+    pub fn check_tool_batch_with_trace(&self, calls: &[ToolCall]) -> TracedVerdict {
+        resolve_traced_verdict(
             &self.guards,
             GuardEvent::ToolBatch(calls),
             false,
@@ -160,7 +181,11 @@ impl Turn {
 
     #[tracing::instrument(level = "debug", skip(self, text))]
     pub fn check_text_delta(&self, text: &mut String) -> Verdict {
-        resolve_verdict(
+        self.check_text_delta_with_trace(text).verdict
+    }
+
+    pub fn check_text_delta_with_trace(&self, text: &mut String) -> TracedVerdict {
+        resolve_traced_verdict(
             &self.guards,
             GuardEvent::TextDelta(text),
             false,

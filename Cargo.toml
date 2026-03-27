@@ -26,6 +26,10 @@ tower = "0.5"
 tower-http = "0.6"
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+opentelemetry = "0.27"
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 
 [features]
 integration = []

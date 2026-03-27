@@ -40,6 +40,7 @@ pub struct SpawnDrainResult {
     pub child_session_id: String,
     pub resolved_model: String,
     pub last_assistant_response: Option<String>,
+    pub last_successful_turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

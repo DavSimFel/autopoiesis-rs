@@ -33,6 +33,7 @@ struct TierTestFixtures {
 
 impl TierTestFixtures {
     fn new() -> Result<Self> {
+        autopoiesis::observe::disable_observers_for_tests();
         let mut root = std::env::temp_dir();
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)

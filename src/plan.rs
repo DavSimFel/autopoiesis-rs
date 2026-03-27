@@ -7,10 +7,10 @@ pub(crate) mod patch;
 pub mod recovery;
 pub mod runner;
 
-pub use recovery::recover_crashed_plans;
+pub use recovery::{recover_crashed_plans, recover_crashed_plans_observed};
 pub use runner::{
     CheckOutcome, CheckVerdict, ObservedOutput, PlanFailureDetails, StepOutcome, run_plan_step,
-    tick_plan_runner,
+    run_plan_step_observed, tick_plan_runner, tick_plan_runner_observed,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

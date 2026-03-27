@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
@@ -6,13 +7,13 @@ use serde_json::json;
 #[cfg(test)]
 use std::cell::Cell;
 
-use crate::agent::{ApprovalHandler, SpawnDrainContext, TokenSink, finish_spawned_child_drain};
+use crate::agent::{ApprovalHandler, SpawnDrainContext, TokenSink};
 use crate::child_session::SpawnRequest;
 use crate::config::Config;
 use crate::gate::output_cap::safe_call_id_for_filename;
 use crate::llm::ToolCall;
-use crate::plan::notify::notify_plan_failure;
-use crate::plan::recovery::crash_plan_run_to_waiting_t2;
+use crate::observe::{Observer, TraceEvent};
+use crate::plan::notify::notify_plan_failure_observed;
 use crate::plan::{PlanAction, PlanStepSpec, ShellCheckSpec, ShellExpectation};
 use crate::session::Session;
 use crate::store::{NullableUpdate, PlanRun, PlanRunUpdateFields, StepAttemptRecord, Store};
@@ -51,6 +52,7 @@ fn maybe_force_missing_spawn_metadata(metadata_json: Option<String>) -> Option<S
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepOutcome {
     Advanced,
+    Stale,
     WaitingT2 { failure: PlanFailureDetails },
     Completed,
     Failed,
@@ -385,7 +387,10 @@ struct SpawnMissingMetadataArgs<'a> {
     attempt_id: i64,
 }
 
-async fn handle_spawn_missing_metadata(args: SpawnMissingMetadataArgs<'_>) -> Result<StepOutcome> {
+async fn handle_spawn_missing_metadata(
+    observer: Arc<dyn Observer>,
+    args: SpawnMissingMetadataArgs<'_>,
+) -> Result<StepOutcome> {
     let failure = build_waiting_t2_failure_details(
         args.step_index,
         args.step_id,
@@ -424,6 +429,21 @@ async fn handle_spawn_missing_metadata(args: SpawnMissingMetadataArgs<'_>) -> Re
         &checks_json,
     )
     .context("failed to finalize crashed spawn attempt")?;
+    emit_plan_step_attempt_finished(
+        observer.as_ref(),
+        args.plan_run,
+        args.step_index,
+        args.step_id,
+        args.attempt,
+        "crashed",
+        Some(&args.spawn_result.child_session_id),
+    );
+    emit_plan_waiting_t2(
+        observer.as_ref(),
+        args.plan_run,
+        args.step_index,
+        Some("spawn_failed"),
+    );
     Ok(StepOutcome::WaitingT2 { failure })
 }
 
@@ -498,6 +518,80 @@ fn build_waiting_t2_failure_details(
     }
 }
 
+fn emit_plan_waiting_t2(
+    observer: &dyn Observer,
+    plan_run: &PlanRun,
+    step_index: i64,
+    reason: Option<&str>,
+) {
+    observer.emit(&TraceEvent::PlanWaitingT2 {
+        session_id: plan_run.owner_session_id.clone(),
+        plan_run_id: plan_run.id.clone(),
+        step_index,
+        reason: reason.map(ToString::to_string),
+    });
+}
+
+fn emit_plan_completed(observer: &dyn Observer, plan_run: &PlanRun, total_attempts: i64) {
+    observer.emit(&TraceEvent::PlanCompleted {
+        session_id: plan_run.owner_session_id.clone(),
+        plan_run_id: plan_run.id.clone(),
+        total_attempts,
+    });
+}
+
+fn emit_plan_failed(
+    observer: &dyn Observer,
+    plan_run: &PlanRun,
+    total_attempts: i64,
+    reason: Option<&str>,
+) {
+    observer.emit(&TraceEvent::PlanFailed {
+        session_id: plan_run.owner_session_id.clone(),
+        plan_run_id: plan_run.id.clone(),
+        total_attempts,
+        reason: reason.map(ToString::to_string),
+    });
+}
+
+fn emit_plan_step_attempt_started(
+    observer: &dyn Observer,
+    plan_run: &PlanRun,
+    step_index: i64,
+    step_id: &str,
+    attempt: i64,
+    child_session_id: Option<&str>,
+) {
+    observer.emit(&TraceEvent::PlanStepAttemptStarted {
+        session_id: plan_run.owner_session_id.clone(),
+        plan_run_id: plan_run.id.clone(),
+        step_index,
+        step_id: step_id.to_string(),
+        attempt,
+        child_session_id: child_session_id.map(ToString::to_string),
+    });
+}
+
+fn emit_plan_step_attempt_finished(
+    observer: &dyn Observer,
+    plan_run: &PlanRun,
+    step_index: i64,
+    step_id: &str,
+    attempt: i64,
+    status: &str,
+    child_session_id: Option<&str>,
+) {
+    observer.emit(&TraceEvent::PlanStepAttemptFinished {
+        session_id: plan_run.owner_session_id.clone(),
+        plan_run_id: plan_run.id.clone(),
+        step_index,
+        step_id: step_id.to_string(),
+        attempt,
+        status: status.to_string(),
+        child_session_id: child_session_id.map(ToString::to_string),
+    });
+}
+
 fn step_result_to_failure_reason(verdicts: &[CheckOutcome]) -> Option<&'static str> {
     if verdicts
         .iter()
@@ -515,6 +609,37 @@ fn step_result_to_failure_reason(verdicts: &[CheckOutcome]) -> Option<&'static s
 }
 
 pub async fn run_plan_step<F, Fut, P, TS>(
+    store: &mut Store,
+    config: &Config,
+    session_dir: &Path,
+    plan_run: &PlanRun,
+    make_provider: &mut F,
+    token_sink: &mut TS,
+    approval_handler: &mut (dyn ApprovalHandler + Send),
+) -> Result<StepOutcome>
+where
+    F: FnMut(&Config) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<P>> + Send,
+    P: crate::llm::LlmProvider + Send,
+    TS: TokenSink + Send,
+{
+    let observer = crate::observe::runtime_observer(session_dir);
+    run_plan_step_observed(
+        observer,
+        store,
+        config,
+        session_dir,
+        plan_run,
+        make_provider,
+        token_sink,
+        approval_handler,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_plan_step_observed<F, Fut, P, TS>(
+    observer: Arc<dyn Observer>,
     store: &mut Store,
     config: &Config,
     session_dir: &Path,
@@ -541,7 +666,7 @@ where
         return Err(anyhow!("plan run current step index is out of range"));
     }
     if current_step_index == plan_action.steps.len() {
-        let _ = store
+        let completed = store
             .update_plan_run_status_preserving_failed(
                 &plan_run.id,
                 "completed",
@@ -551,8 +676,14 @@ where
                     active_child_session_id: NullableUpdate::Null,
                     ..PlanRunUpdateFields::default()
                 },
+                &plan_run.updated_at,
             )
             .context("failed to mark completed plan run")?;
+        if !completed {
+            return Ok(StepOutcome::Stale);
+        }
+        let total_attempts = store.total_step_attempts_for_run(&plan_run.id)?;
+        emit_plan_completed(observer.as_ref(), plan_run, total_attempts);
         return Ok(StepOutcome::Completed);
     }
 
@@ -561,8 +692,12 @@ where
         .into_iter()
         .any(|attempt| attempt.revision == plan_run.revision && attempt.status == "running");
     if preexisting_running_attempts {
-        let failure = crash_plan_run_to_waiting_t2(store, plan_run)
-            .context("failed to hand off preexisting running plan step attempts")?;
+        let failure = crate::plan::recovery::crash_plan_run_to_waiting_t2_observed(
+            observer.clone(),
+            store,
+            plan_run,
+        )
+        .context("failed to hand off preexisting running plan step attempts")?;
         return Ok(StepOutcome::WaitingT2 { failure });
     }
 
@@ -609,6 +744,14 @@ where
                 summary_json: initial_summary_json.clone(),
                 checks_json: initial_checks_json.clone(),
             })?;
+            emit_plan_step_attempt_started(
+                observer.as_ref(),
+                plan_run,
+                step_index,
+                id,
+                attempt,
+                None,
+            );
             let call_id = build_step_call_id(
                 &plan_run.id,
                 plan_run.revision,
@@ -651,7 +794,7 @@ where
                     });
                     let summary_json = serialize_json(&summary, "step summary")?;
                     let checks_json = initial_checks_json.clone();
-                    store
+                    let advanced = store
                         .update_plan_run_status_preserving_failed(
                             &plan_run.id,
                             "failed",
@@ -661,10 +804,30 @@ where
                                 active_child_session_id: NullableUpdate::Null,
                                 ..PlanRunUpdateFields::default()
                             },
+                            &plan_run.updated_at,
                         )
                         .context("failed to mark crashed shell step failed")?;
                     finalize_attempt(store, attempt_id, "crashed", &summary_json, &checks_json)
                         .context("failed to finalize crashed shell attempt")?;
+                    emit_plan_step_attempt_finished(
+                        observer.as_ref(),
+                        plan_run,
+                        step_index,
+                        id,
+                        attempt,
+                        "crashed",
+                        None,
+                    );
+                    if !advanced {
+                        return Ok(StepOutcome::Stale);
+                    }
+                    let total_attempts = store.total_step_attempts_for_run(&plan_run.id)?;
+                    emit_plan_failed(
+                        observer.as_ref(),
+                        plan_run,
+                        total_attempts,
+                        Some(&error.to_string()),
+                    );
                     return Ok(StepOutcome::Failed);
                 }
             };
@@ -697,6 +860,21 @@ where
                 let summary_json = serialize_json(&summary, "step summary")?;
                 finalize_attempt(store, attempt_id, "failed", &summary_json, &checks_json)
                     .context("failed to finalize denied shell attempt")?;
+                emit_plan_step_attempt_finished(
+                    observer.as_ref(),
+                    plan_run,
+                    step_index,
+                    id,
+                    attempt,
+                    "failed",
+                    None,
+                );
+                emit_plan_waiting_t2(
+                    observer.as_ref(),
+                    plan_run,
+                    step_index,
+                    Some("shell_denied"),
+                );
                 return Ok(StepOutcome::WaitingT2 { failure });
             }
 
@@ -750,6 +928,16 @@ where
                 );
                 finalize_attempt(store, attempt_id, "failed", &summary_json, &checks_json)
                     .context("failed to finalize failed shell attempt")?;
+                emit_plan_step_attempt_finished(
+                    observer.as_ref(),
+                    plan_run,
+                    step_index,
+                    id,
+                    attempt,
+                    "failed",
+                    None,
+                );
+                emit_plan_waiting_t2(observer.as_ref(), plan_run, step_index, Some(reason));
                 return Ok(StepOutcome::WaitingT2 { failure });
             }
 
@@ -764,15 +952,38 @@ where
                         active_child_session_id: NullableUpdate::Null,
                         ..PlanRunUpdateFields::default()
                     },
+                    &plan_run.updated_at,
                 )
                 .context("failed to advance shell step")?;
             if !advanced {
                 finalize_attempt(store, attempt_id, "failed", &summary_json, &checks_json)
                     .context("failed to finalize raced shell attempt")?;
-                return Ok(StepOutcome::Failed);
+                emit_plan_step_attempt_finished(
+                    observer.as_ref(),
+                    plan_run,
+                    step_index,
+                    id,
+                    attempt,
+                    "failed",
+                    None,
+                );
+                return Ok(StepOutcome::Stale);
             }
             finalize_attempt(store, attempt_id, "passed", &summary_json, &checks_json)
                 .context("failed to finalize passed shell attempt")?;
+            emit_plan_step_attempt_finished(
+                observer.as_ref(),
+                plan_run,
+                step_index,
+                id,
+                attempt,
+                "passed",
+                None,
+            );
+            if completed {
+                let total_attempts = store.total_step_attempts_for_run(&plan_run.id)?;
+                emit_plan_completed(observer.as_ref(), plan_run, total_attempts);
+            }
             Ok(if completed {
                 StepOutcome::Completed
             } else {
@@ -808,6 +1019,14 @@ where
                 summary_json: initial_summary_json.clone(),
                 checks_json: initial_checks_json.clone(),
             })?;
+            emit_plan_step_attempt_started(
+                observer.as_ref(),
+                plan_run,
+                step_index,
+                id,
+                attempt,
+                None,
+            );
             let spawn_request = SpawnRequest {
                 parent_session_id: plan_run.owner_session_id.clone(),
                 task: spawn.task.clone(),
@@ -855,6 +1074,21 @@ where
                     let checks_json = initial_checks_json.clone();
                     finalize_attempt(store, attempt_id, "crashed", &summary_json, &checks_json)
                         .context("failed to finalize crashed spawn attempt")?;
+                    emit_plan_step_attempt_finished(
+                        observer.as_ref(),
+                        plan_run,
+                        step_index,
+                        id,
+                        attempt,
+                        "crashed",
+                        None,
+                    );
+                    emit_plan_waiting_t2(
+                        observer.as_ref(),
+                        plan_run,
+                        step_index,
+                        Some("spawn_failed"),
+                    );
                     return Ok(StepOutcome::WaitingT2 { failure });
                 }
             };
@@ -862,15 +1096,18 @@ where
                 store.get_session_metadata(&spawn_result.child_session_id)?,
             );
             let Some(metadata_json) = metadata_json else {
-                return handle_spawn_missing_metadata(SpawnMissingMetadataArgs {
-                    store,
-                    plan_run,
-                    step_index,
-                    step_id: id,
-                    attempt,
-                    spawn_result: &spawn_result,
-                    attempt_id,
-                })
+                return handle_spawn_missing_metadata(
+                    observer.clone(),
+                    SpawnMissingMetadataArgs {
+                        store,
+                        plan_run,
+                        step_index,
+                        step_id: id,
+                        attempt,
+                        spawn_result: &spawn_result,
+                        attempt_id,
+                    },
+                )
                 .await;
             };
             let context = SpawnDrainContext {
@@ -879,7 +1116,8 @@ where
                 session_dir,
                 spawn_result: spawn_result.clone(),
             };
-            let drain_result = match finish_spawned_child_drain(
+            let drain_result = match crate::agent::finish_spawned_child_drain_observed(
+                observer.clone(),
                 context,
                 &metadata_json,
                 _make_provider,
@@ -922,6 +1160,21 @@ where
                         .context("failed to record spawned child session")?;
                     finalize_attempt(store, attempt_id, "crashed", &summary_json, &checks_json)
                         .context("failed to finalize crashed spawn attempt")?;
+                    emit_plan_step_attempt_finished(
+                        observer.as_ref(),
+                        plan_run,
+                        step_index,
+                        id,
+                        attempt,
+                        "crashed",
+                        Some(&spawn_result.child_session_id),
+                    );
+                    emit_plan_waiting_t2(
+                        observer.as_ref(),
+                        plan_run,
+                        step_index,
+                        Some("spawn_failed"),
+                    );
                     return Ok(StepOutcome::WaitingT2 { failure });
                 }
             };
@@ -975,6 +1228,16 @@ where
                     .context("failed to record spawned child session")?;
                 finalize_attempt(store, attempt_id, "failed", &summary_json, &checks_json)
                     .context("failed to finalize failed spawn attempt")?;
+                emit_plan_step_attempt_finished(
+                    observer.as_ref(),
+                    plan_run,
+                    step_index,
+                    id,
+                    attempt,
+                    "failed",
+                    Some(&drain_result.child_session_id),
+                );
+                emit_plan_waiting_t2(observer.as_ref(), plan_run, step_index, Some(reason));
                 return Ok(StepOutcome::WaitingT2 { failure });
             }
 
@@ -989,6 +1252,7 @@ where
                         active_child_session_id: NullableUpdate::Null,
                         ..PlanRunUpdateFields::default()
                     },
+                    &plan_run.updated_at,
                 )
                 .context("failed to advance spawn step")?;
             store
@@ -997,10 +1261,32 @@ where
             if !advanced {
                 finalize_attempt(store, attempt_id, "failed", &summary_json, &checks_json)
                     .context("failed to finalize raced spawn attempt")?;
-                return Ok(StepOutcome::Failed);
+                emit_plan_step_attempt_finished(
+                    observer.as_ref(),
+                    plan_run,
+                    step_index,
+                    id,
+                    attempt,
+                    "failed",
+                    Some(&drain_result.child_session_id),
+                );
+                return Ok(StepOutcome::Stale);
             }
             finalize_attempt(store, attempt_id, "passed", &summary_json, &checks_json)
                 .context("failed to finalize passed spawn attempt")?;
+            emit_plan_step_attempt_finished(
+                observer.as_ref(),
+                plan_run,
+                step_index,
+                id,
+                attempt,
+                "passed",
+                Some(&drain_result.child_session_id),
+            );
+            if completed {
+                let total_attempts = store.total_step_attempts_for_run(&plan_run.id)?;
+                emit_plan_completed(observer.as_ref(), plan_run, total_attempts);
+            }
             Ok(if completed {
                 StepOutcome::Completed
             } else {
@@ -1024,13 +1310,42 @@ where
     P: crate::llm::LlmProvider + Send,
     TS: TokenSink + Send,
 {
+    let observer = crate::observe::runtime_observer(session_dir);
+    tick_plan_runner_observed(
+        observer,
+        store,
+        config,
+        session_dir,
+        make_provider,
+        token_sink,
+        approval_handler,
+    )
+    .await
+}
+
+pub async fn tick_plan_runner_observed<F, Fut, P, TS>(
+    observer: Arc<dyn Observer>,
+    store: &mut Store,
+    config: &Config,
+    session_dir: &Path,
+    make_provider: &mut F,
+    token_sink: &mut TS,
+    approval_handler: &mut (dyn ApprovalHandler + Send),
+) -> Result<Option<StepOutcome>>
+where
+    F: FnMut(&Config) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<P>> + Send,
+    P: crate::llm::LlmProvider + Send,
+    TS: TokenSink + Send,
+{
     let Some(plan_run) =
         store.claim_next_runnable_plan_run(config.queue.stale_processing_timeout_secs)?
     else {
         return Ok(None);
     };
 
-    let outcome = run_plan_step(
+    let outcome = run_plan_step_observed(
+        observer.clone(),
         store,
         config,
         session_dir,
@@ -1048,7 +1363,7 @@ where
                 .map(|current| current.status != "waiting_t2")
                 .unwrap_or(true);
             if should_notify {
-                notify_plan_failure(store, &plan_run, &failure)
+                notify_plan_failure_observed(observer.clone(), store, &plan_run, &failure)
                     .context("failed to notify T2 of plan failure")?;
             }
             Ok(Some(StepOutcome::WaitingT2 { failure }))
@@ -1064,24 +1379,41 @@ where
                 "message": error.to_string(),
             })
             .to_string();
-            if let Err(cleanup_error) = store.update_plan_run_status_preserving_failed(
-                &plan_run.id,
-                "failed",
-                PlanRunUpdateFields {
-                    last_failure_json: NullableUpdate::Value(failure_json),
-                    active_child_session_id: NullableUpdate::Null,
-                    ..PlanRunUpdateFields::default()
-                },
-            ) {
-                return Err(cleanup_error.context(format!(
-                    "failed to mark plan run failed after runner error: {error}"
-                )));
+            let cleanup_applied = store
+                .update_plan_run_status_preserving_failed(
+                    &plan_run.id,
+                    "failed",
+                    PlanRunUpdateFields {
+                        last_failure_json: NullableUpdate::Value(failure_json),
+                        active_child_session_id: NullableUpdate::Null,
+                        ..PlanRunUpdateFields::default()
+                    },
+                    &plan_run.updated_at,
+                )
+                .context("failed to mark plan run failed after runner error")?;
+            if !cleanup_applied {
+                if let Err(cleanup_error) = store.release_plan_run_claim(&plan_run.id) {
+                    return Err(cleanup_error.context(format!(
+                        "failed to release plan run claim after runner error: {error}"
+                    )));
+                }
+                return Err(anyhow!(
+                    "plan run changed before runner error cleanup could be applied"
+                )
+                .context(error));
             }
             if let Err(cleanup_error) = store.release_plan_run_claim(&plan_run.id) {
                 return Err(cleanup_error.context(format!(
                     "failed to release plan run claim after runner error: {error}"
                 )));
             }
+            let total_attempts = store.total_step_attempts_for_run(&plan_run.id)?;
+            emit_plan_failed(
+                observer.as_ref(),
+                &plan_run,
+                total_attempts,
+                Some(&error.to_string()),
+            );
             Err(error)
         }
     }
@@ -1094,6 +1426,8 @@ mod tests {
         ChatMessage, MessageContent, Principal, StaticProvider, StopReason, StreamedTurn,
         spawned_t3_test_config, temp_sessions_dir,
     };
+    use crate::observe::TraceEvent;
+    use crate::observe::test_support::RecordingObserver;
     use crate::plan::PlanActionKind;
     use crate::session::Session;
     use crate::skills::SkillCatalog;
@@ -1395,6 +1729,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tick_plan_runner_reports_stale_when_another_worker_advances_the_run() {
+        let root = temp_sessions_dir("tick_race");
+        let config = test_config(&root);
+        let db_path = root.join("store.sqlite");
+        let mut store = Store::new(&db_path).unwrap();
+        let owner_session_id = "owner";
+        let owner_session_dir = root.join(owner_session_id);
+        std::fs::create_dir_all(&owner_session_dir).unwrap();
+        let _session = Session::new(&owner_session_dir).unwrap();
+        let plan_action = PlanAction {
+            kind: PlanActionKind::Plan,
+            plan_run_id: None,
+            replace_from_step: None,
+            note: None,
+            steps: vec![PlanStepSpec::Shell {
+                id: "step-shell".to_string(),
+                command: "sleep 2".to_string(),
+                timeout_ms: None,
+                checks: vec![ShellCheckSpec {
+                    id: "check-shell".to_string(),
+                    command: "echo shell-ok".to_string(),
+                    expect: ShellExpectation {
+                        exit_code: Some(0),
+                        stdout_contains: Some("shell-ok".to_string()),
+                        stderr_contains: None,
+                        stdout_equals: None,
+                    },
+                }],
+                max_attempts: 1,
+            }],
+        };
+        let plan_run = insert_plan_run(&mut store, owner_session_id, "plan-race", &plan_action);
+        let mut make_provider = |_config: &crate::config::Config| {
+            let provider = StaticProvider {
+                turn: child_turn("child ok"),
+            };
+            async move { Ok::<StaticProvider, anyhow::Error>(provider) }
+        };
+        let mut token_sink = |_token: String| {};
+        store
+            .update_plan_run_status(
+                &plan_run.id,
+                "completed",
+                PlanRunUpdateFields {
+                    current_step_index: Some(1),
+                    ..PlanRunUpdateFields::default()
+                },
+            )
+            .unwrap();
+        let mut approval_handler =
+            |_severity: &crate::gate::Severity, _reason: &str, _command: &str| true;
+
+        let outcome = run_plan_step_observed(
+            std::sync::Arc::new(crate::observe::test_support::RecordingObserver::new()),
+            &mut store,
+            &config,
+            &root,
+            &plan_run,
+            &mut make_provider,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, StepOutcome::Stale);
+        let updated = store.get_plan_run(&plan_run.id).unwrap().unwrap();
+        assert_eq!(updated.status, "completed");
+        assert_eq!(updated.current_step_index, 1);
+    }
+
+    #[tokio::test]
     async fn run_plan_step_spawn_step_records_child_and_advances() {
         let root = temp_sessions_dir("spawn_step");
         let config = test_config(&root);
@@ -1447,6 +1853,116 @@ mod tests {
             summary.last_assistant_response.as_deref(),
             Some("child complete")
         );
+    }
+
+    #[tokio::test]
+    async fn run_plan_step_observed_emits_completion_event() {
+        let root = temp_sessions_dir("complete_event");
+        let config = test_config(&root);
+        let mut store = Store::new(root.join("store.sqlite")).unwrap();
+        let owner_session_id = "owner";
+        let owner_session_dir = root.join(owner_session_id);
+        std::fs::create_dir_all(&owner_session_dir).unwrap();
+        let _session = Session::new(&owner_session_dir).unwrap();
+        let plan_run = insert_plan_run(
+            &mut store,
+            owner_session_id,
+            "plan-complete-event",
+            &shell_plan("echo shell-ok", "echo shell-ok", "shell-ok"),
+        );
+        let observer = RecordingObserver::new();
+        let mut make_provider = |_config: &crate::config::Config| {
+            let provider = StaticProvider {
+                turn: child_turn("child ok"),
+            };
+            async move { Ok::<StaticProvider, anyhow::Error>(provider) }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler =
+            |_severity: &crate::gate::Severity, _reason: &str, _command: &str| true;
+
+        let outcome = run_plan_step_observed(
+            std::sync::Arc::new(observer.clone()),
+            &mut store,
+            &config,
+            &root,
+            &plan_run,
+            &mut make_provider,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, StepOutcome::Completed);
+        let events = observer.events();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                TraceEvent::PlanStepAttemptStarted { .. },
+                TraceEvent::PlanStepAttemptFinished { status, .. },
+                TraceEvent::PlanCompleted { total_attempts, .. }
+            ]
+            if status == "passed" && *total_attempts == 1
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn run_plan_step_observed_emits_waiting_t2_event() {
+        let root = temp_sessions_dir("waiting_t2_event");
+        let config = test_config(&root);
+        let mut store = Store::new(root.join("store.sqlite")).unwrap();
+        let owner_session_id = "owner";
+        let owner_session_dir = root.join(owner_session_id);
+        std::fs::create_dir_all(&owner_session_dir).unwrap();
+        let _session = Session::new(&owner_session_dir).unwrap();
+        let plan_run = insert_plan_run(
+            &mut store,
+            owner_session_id,
+            "plan-waiting-event",
+            &shell_plan("echo shell-ok", "echo shell-ok", "shell-ok"),
+        );
+        let observer = RecordingObserver::new();
+        let mut make_provider = |_config: &crate::config::Config| {
+            let provider = StaticProvider {
+                turn: child_turn("child ok"),
+            };
+            async move { Ok::<StaticProvider, anyhow::Error>(provider) }
+        };
+        let mut token_sink = |_token: String| {};
+        let mut approval_handler =
+            |_severity: &crate::gate::Severity, _reason: &str, _command: &str| false;
+
+        let outcome = run_plan_step_observed(
+            std::sync::Arc::new(observer.clone()),
+            &mut store,
+            &config,
+            &root,
+            &plan_run,
+            &mut make_provider,
+            &mut token_sink,
+            &mut approval_handler,
+        )
+        .await
+        .unwrap();
+
+        let failure = match outcome {
+            StepOutcome::WaitingT2 { failure } => failure,
+            other => panic!("expected waiting_t2, got {other:?}"),
+        };
+        let events = observer.events();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                TraceEvent::PlanStepAttemptStarted { .. },
+                TraceEvent::PlanStepAttemptFinished { status, .. },
+                TraceEvent::PlanWaitingT2 { reason, .. }
+            ]
+            if status == "failed" && reason.as_deref() == Some("shell_denied")
+        ));
+        assert_eq!(failure.reason, "shell_denied");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -1514,6 +2030,7 @@ mod tests {
             "plan-spawn-drain",
             &spawn_plan("child-ok"),
         );
+        let observer = RecordingObserver::new();
         let mut make_provider = |_config: &crate::config::Config| async move {
             Err::<StaticProvider, anyhow::Error>(anyhow::Error::msg("provider error"))
         };
@@ -1521,7 +2038,8 @@ mod tests {
         let mut approval_handler =
             |_severity: &crate::gate::Severity, _reason: &str, _command: &str| true;
 
-        let outcome = run_plan_step(
+        let outcome = run_plan_step_observed(
+            std::sync::Arc::new(observer.clone()),
             &mut store,
             &config,
             &root,
@@ -1537,6 +2055,23 @@ mod tests {
             StepOutcome::WaitingT2 { failure } => failure,
             other => panic!("expected waiting_t2, got {other:?}"),
         };
+        let events = observer.events();
+        assert!(events.len() >= 3);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TraceEvent::PlanStepAttemptStarted { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TraceEvent::PlanStepAttemptFinished { status, .. }
+                if status == "crashed"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TraceEvent::PlanWaitingT2 { reason, .. }
+                if reason.as_deref() == Some("spawn_failed")
+        )));
         crate::plan::notify::notify_plan_failure(&mut store, &plan_run, &failure).unwrap();
         let updated = store.get_plan_run(&plan_run.id).unwrap().unwrap();
         assert_eq!(updated.status, "waiting_t2");
@@ -1561,6 +2096,7 @@ mod tests {
             "plan-spawn-metadata",
             &spawn_plan("child-ok"),
         );
+        let observer = RecordingObserver::new();
         let mut make_provider = |_config: &crate::config::Config| {
             let provider = StaticProvider {
                 turn: child_turn("child complete"),
@@ -1580,7 +2116,8 @@ mod tests {
 
         let _reset_flag = ResetFlag;
         set_force_missing_spawn_metadata(true);
-        let outcome = run_plan_step(
+        let outcome = run_plan_step_observed(
+            std::sync::Arc::new(observer.clone()),
             &mut store,
             &config,
             &root,
@@ -1596,6 +2133,16 @@ mod tests {
             StepOutcome::WaitingT2 { failure } => failure,
             other => panic!("expected waiting_t2, got {other:?}"),
         };
+        let events = observer.events();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                TraceEvent::PlanStepAttemptStarted { .. },
+                TraceEvent::PlanStepAttemptFinished { status, .. },
+                TraceEvent::PlanWaitingT2 { reason, .. }
+            ]
+            if status == "crashed" && reason.as_deref() == Some("spawn_failed")
+        ));
         crate::plan::notify::notify_plan_failure(&mut store, &plan_run, &failure).unwrap();
         let updated = store.get_plan_run(&plan_run.id).unwrap().unwrap();
         assert_eq!(updated.status, "waiting_t2");
@@ -1680,6 +2227,7 @@ mod tests {
                     current_step_index: Some(0),
                     ..Default::default()
                 },
+                &plan_run.updated_at,
             )
             .unwrap();
         let resumed_plan_run = store.get_plan_run(&plan_run.id).unwrap().unwrap();
@@ -1880,16 +2428,20 @@ mod tests {
                 checks_json: "[]".to_string(),
             })
             .unwrap();
+        let observer = RecordingObserver::new();
 
-        let outcome = handle_spawn_missing_metadata(SpawnMissingMetadataArgs {
-            store: &mut store,
-            plan_run: &plan_run,
-            step_index: 0,
-            step_id: "step-spawn",
-            attempt: 0,
-            spawn_result: &spawn_result,
-            attempt_id,
-        })
+        let outcome = handle_spawn_missing_metadata(
+            std::sync::Arc::new(observer.clone()),
+            SpawnMissingMetadataArgs {
+                store: &mut store,
+                plan_run: &plan_run,
+                step_index: 0,
+                step_id: "step-spawn",
+                attempt: 0,
+                spawn_result: &spawn_result,
+                attempt_id,
+            },
+        )
         .await
         .unwrap();
 
@@ -1897,6 +2449,15 @@ mod tests {
             StepOutcome::WaitingT2 { failure } => failure,
             other => panic!("expected waiting_t2, got {other:?}"),
         };
+        let events = observer.events();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                TraceEvent::PlanStepAttemptFinished { status, .. },
+                TraceEvent::PlanWaitingT2 { reason, .. }
+            ]
+            if status == "crashed" && reason.as_deref() == Some("spawn_failed")
+        ));
         assert_eq!(failure.reason, "spawn_failed");
         crate::plan::notify::notify_plan_failure(&mut store, &plan_run, &failure).unwrap();
 
@@ -1970,7 +2531,7 @@ mod tests {
         let owner_session_dir = root.join(owner_session_id);
         std::fs::create_dir_all(&owner_session_dir).unwrap();
         let _session = Session::new(&owner_session_dir).unwrap();
-        let _plan_run = insert_plan_run(
+        let plan_run = insert_plan_run(
             &mut store,
             owner_session_id,
             "plan-bad",
@@ -1984,6 +2545,7 @@ mod tests {
                     definition_json: Some("{".to_string()),
                     ..PlanRunUpdateFields::default()
                 },
+                &plan_run.updated_at,
             )
             .unwrap();
 

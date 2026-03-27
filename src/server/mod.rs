@@ -28,9 +28,10 @@ pub async fn run(port: u16) -> Result<()> {
     let config = config::Config::load("agents.toml").context("failed to load configuration")?;
     let api_key = std::env::var("AUTOPOIESIS_API_KEY")
         .context("set AUTOPOIESIS_API_KEY before running serve")?;
+    let sessions_dir = std::path::PathBuf::from("sessions");
 
-    let mut store =
-        store::Store::new("sessions/queue.sqlite").context("failed to open session store")?;
+    let mut store = store::Store::new(sessions_dir.join("queue.sqlite"))
+        .context("failed to open session store")?;
     match store.recover_stale_messages(config.queue.stale_processing_timeout_secs) {
         Ok(recovered) if recovered > 0 => {
             info!(recovered, "recovered stale messages from previous crash");
@@ -40,7 +41,11 @@ pub async fn run(port: u16) -> Result<()> {
             warn!(%error, "failed to recover stale messages");
         }
     }
-    match plan::recover_crashed_plans(&mut store, config.queue.stale_processing_timeout_secs) {
+    match plan::recover_crashed_plans(
+        &mut store,
+        sessions_dir.as_path(),
+        config.queue.stale_processing_timeout_secs,
+    ) {
         Ok(recovered) if recovered > 0 => {
             info!(recovered, "recovered crashed plan runs from previous crash");
         }
@@ -52,7 +57,7 @@ pub async fn run(port: u16) -> Result<()> {
     let state = ServerState::new(
         std::sync::Arc::new(tokio::sync::Mutex::new(store)),
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        std::path::PathBuf::from("sessions"),
+        sessions_dir,
         api_key,
         config.operator_key.clone(),
         config,

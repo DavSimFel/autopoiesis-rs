@@ -762,6 +762,43 @@ fn check_inbound_returns_modify_when_guard_rewrites_inbound_content() {
 }
 
 #[test]
+fn check_inbound_trace_attributes_modify_to_the_rewriting_guard() {
+    struct RewriteGuard;
+
+    impl Guard for RewriteGuard {
+        fn name(&self) -> &str {
+            "rewrite"
+        }
+
+        fn check(&self, event: &mut GuardEvent, _context: &crate::gate::GuardContext) -> Verdict {
+            match event {
+                GuardEvent::Inbound(messages) => {
+                    if let Some(MessageContent::Text { text }) = messages
+                        .first_mut()
+                        .and_then(|message| message.content.first_mut())
+                    {
+                        *text = "[REDACTED]".to_string();
+                    }
+                    Verdict::Allow
+                }
+                _ => Verdict::Allow,
+            }
+        }
+    }
+
+    let turn = Turn::new().guard(RewriteGuard);
+    let mut messages = vec![ChatMessage::user("sk-1234567890abcdef1234567890abcdef")];
+
+    let traced = turn.check_inbound_with_trace(&mut messages, None);
+
+    assert!(matches!(traced.verdict, GuardResult::Modify));
+    assert_eq!(traced.guard_outcomes.len(), 1);
+    let outcome = &traced.guard_outcomes[0];
+    assert_eq!(outcome.gate_id.as_deref(), Some("rewrite"));
+    assert!(outcome.modified);
+}
+
+#[test]
 fn check_inbound_returns_modify_when_inbound_guard_rewrites_messages() {
     struct RedactingInbound;
 

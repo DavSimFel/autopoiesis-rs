@@ -1,0 +1,1 @@
+P1 [src/lib.rs](/root/autopoiesis-rs/src/lib.rs#L13): the tracked diff now imports `crate::observe`, but `git status --short` still shows `?? src/observe/`. As submitted, this patch does not build from a clean checkout because the new module tree is not actually part of the tracked change set.

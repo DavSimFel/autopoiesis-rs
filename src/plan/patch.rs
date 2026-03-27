@@ -1,18 +1,90 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 
+use crate::observe::{Observer, TraceEvent};
+use crate::plan::notify::emit_failure_notified_to_t2;
 use crate::plan::{PlanAction, PlanActionKind, PlanStepSpec, validate_plan_action};
 use crate::store::{PlanRun, Store};
 use crate::time::utc_timestamp;
 
 static NEXT_PLAN_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+fn emit_plan_run_created(
+    observer: &dyn Observer,
+    plan_run_id: &str,
+    owner_session_id: &str,
+    caused_by_turn_id: Option<&str>,
+) {
+    observer.emit(&TraceEvent::PlanRunCreated {
+        session_id: owner_session_id.to_string(),
+        plan_run_id: plan_run_id.to_string(),
+        caused_by_turn_id: caused_by_turn_id.map(ToString::to_string),
+        owner_session_id: owner_session_id.to_string(),
+    });
+}
+
+fn emit_plan_run_patched(
+    observer: &dyn Observer,
+    plan_run_id: &str,
+    owner_session_id: &str,
+    caused_by_turn_id: Option<&str>,
+) {
+    observer.emit(&TraceEvent::PlanRunPatched {
+        session_id: owner_session_id.to_string(),
+        plan_run_id: plan_run_id.to_string(),
+        caused_by_turn_id: caused_by_turn_id.map(ToString::to_string),
+        owner_session_id: owner_session_id.to_string(),
+    });
+}
+
+fn emit_plan_completed(observer: &dyn Observer, plan_run: &PlanRun, total_attempts: i64) {
+    observer.emit(&TraceEvent::PlanCompleted {
+        session_id: plan_run.owner_session_id.clone(),
+        plan_run_id: plan_run.id.clone(),
+        total_attempts,
+    });
+}
+
+fn emit_plan_failed(
+    observer: &dyn Observer,
+    plan_run: &PlanRun,
+    total_attempts: i64,
+    reason: Option<String>,
+) {
+    observer.emit(&TraceEvent::PlanFailed {
+        session_id: plan_run.owner_session_id.clone(),
+        plan_run_id: plan_run.id.clone(),
+        total_attempts,
+        reason,
+    });
+}
+
+#[cfg(test)]
 pub(crate) fn apply_plan_patch(
     store: &mut Store,
     owner_session_id: &str,
+    plan_run_id: &str,
+    action: &PlanAction,
+) -> Result<()> {
+    apply_plan_patch_observed(
+        Arc::new(crate::observe::NoopObserver),
+        store,
+        owner_session_id,
+        None,
+        plan_run_id,
+        action,
+    )
+}
+
+pub(crate) fn apply_plan_patch_observed(
+    observer: Arc<dyn Observer>,
+    store: &mut Store,
+    owner_session_id: &str,
+    caused_by_turn_id: Option<&str>,
     plan_run_id: &str,
     action: &PlanAction,
 ) -> Result<()> {
@@ -89,12 +161,36 @@ pub(crate) fn apply_plan_patch(
         })
         .context("failed to store patched plan run atomically")?;
 
+    emit_plan_run_patched(
+        observer.as_ref(),
+        &plan_run.id,
+        owner_session_id,
+        caused_by_turn_id,
+    );
+
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn apply_plan_action(
     store: &mut Store,
     owner_session_id: &str,
+    action: &PlanAction,
+) -> Result<()> {
+    apply_plan_action_observed(
+        Arc::new(crate::observe::NoopObserver),
+        store,
+        owner_session_id,
+        None,
+        action,
+    )
+}
+
+pub(crate) fn apply_plan_action_observed(
+    observer: Arc<dyn Observer>,
+    store: &mut Store,
+    owner_session_id: &str,
+    caused_by_turn_id: Option<&str>,
     action: &PlanAction,
 ) -> Result<()> {
     validate_plan_action(action)?;
@@ -105,21 +201,47 @@ pub(crate) fn apply_plan_action(
                 let Some(plan_run_id) = action.plan_run_id.as_deref() else {
                     unreachable!("checked is_some above");
                 };
-                apply_plan_patch(store, owner_session_id, plan_run_id, action)
+                apply_plan_patch_observed(
+                    observer,
+                    store,
+                    owner_session_id,
+                    caused_by_turn_id,
+                    plan_run_id,
+                    action,
+                )
             } else {
-                create_plan_run_from_action(store, owner_session_id, action)
+                create_plan_run_from_action_observed(
+                    observer,
+                    store,
+                    owner_session_id,
+                    caused_by_turn_id,
+                    action,
+                )
             }
         }
-        PlanActionKind::Done => {
-            apply_plan_terminal_action(store, owner_session_id, action, "completed")
-        }
-        PlanActionKind::Escalate => apply_plan_escalation(store, owner_session_id, action),
+        PlanActionKind::Done => apply_plan_terminal_action_observed(
+            observer,
+            store,
+            owner_session_id,
+            caused_by_turn_id,
+            action,
+            "completed",
+        ),
+        PlanActionKind::Escalate => apply_plan_escalation_observed(
+            observer,
+            store,
+            owner_session_id,
+            caused_by_turn_id,
+            action,
+        ),
     }
 }
 
-fn create_plan_run_from_action(
+fn create_plan_run_from_action_observed(
+    observer: Arc<dyn Observer>,
     store: &mut Store,
     owner_session_id: &str,
+    caused_by_turn_id: Option<&str>,
     action: &PlanAction,
 ) -> Result<()> {
     ensure!(
@@ -142,12 +264,21 @@ fn create_plan_run_from_action(
         )
         .context("failed to create plan run from T2 output")?;
 
+    emit_plan_run_created(
+        observer.as_ref(),
+        &plan_run_id,
+        owner_session_id,
+        caused_by_turn_id,
+    );
+
     Ok(())
 }
 
-fn apply_plan_terminal_action(
+fn apply_plan_terminal_action_observed(
+    observer: Arc<dyn Observer>,
     store: &mut Store,
     owner_session_id: &str,
+    _caused_by_turn_id: Option<&str>,
     action: &PlanAction,
     status: &str,
 ) -> Result<()> {
@@ -192,6 +323,8 @@ fn apply_plan_terminal_action(
                     Ok(())
                 })
                 .context("failed to mark plan run completed atomically")?;
+            let total_attempts = store.total_step_attempts_for_run(&plan_run.id)?;
+            emit_plan_completed(observer.as_ref(), &plan_run, total_attempts);
         }
         other => return Err(anyhow::anyhow!("unexpected terminal status: {other}")),
     }
@@ -199,9 +332,11 @@ fn apply_plan_terminal_action(
     Ok(())
 }
 
-fn apply_plan_escalation(
+fn apply_plan_escalation_observed(
+    observer: Arc<dyn Observer>,
     store: &mut Store,
     owner_session_id: &str,
+    _caused_by_turn_id: Option<&str>,
     action: &PlanAction,
 ) -> Result<()> {
     let plan_run_id = action
@@ -257,6 +392,15 @@ fn apply_plan_escalation(
             Ok(())
         })
         .context("failed to apply plan escalation atomically")?;
+
+    let total_attempts = store.total_step_attempts_for_run(&plan_run.id)?;
+    emit_plan_failed(
+        observer.as_ref(),
+        &plan_run,
+        total_attempts,
+        action.note.clone(),
+    );
+    emit_failure_notified_to_t2(observer.as_ref(), &plan_run);
 
     Ok(())
 }
@@ -343,6 +487,7 @@ fn generate_plan_run_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observe::test_support::RecordingObserver;
     use crate::store::{NullableUpdate, PlanRunUpdateFields};
 
     fn test_store(prefix: &str) -> (Store, std::path::PathBuf) {
@@ -652,6 +797,57 @@ mod tests {
     }
 
     #[test]
+    fn apply_plan_action_observed_escalate_emits_failed_and_notified_events() {
+        let (mut store, root) = test_store("escalate_observed");
+        let current = plan_action(Some("plan-1"), None, vec![shell_step("step-1", "echo one")]);
+        let current_json = serde_json::to_string(&current).unwrap();
+        store.create_session("owner", None).unwrap();
+        let _plan_run = create_waiting_plan_run(&mut store, "plan-1", "owner", &current_json, 0);
+        store
+            .record_step_attempt(crate::store::StepAttemptRecord {
+                plan_run_id: "plan-1".to_string(),
+                revision: 1,
+                step_index: 0,
+                step_id: "step-1".to_string(),
+                attempt: 0,
+                status: "running".to_string(),
+                child_session_id: None,
+                summary_json: "{}".to_string(),
+                checks_json: "[]".to_string(),
+            })
+            .unwrap();
+        let observer = RecordingObserver::new();
+        let escalate = PlanAction {
+            kind: PlanActionKind::Escalate,
+            plan_run_id: Some("plan-1".to_string()),
+            replace_from_step: None,
+            note: Some("need human review".to_string()),
+            steps: vec![],
+        };
+
+        apply_plan_action_observed(
+            std::sync::Arc::new(observer.clone()),
+            &mut store,
+            "owner",
+            Some("turn-3"),
+            &escalate,
+        )
+        .unwrap();
+
+        let events = observer.events();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                TraceEvent::PlanFailed { total_attempts, reason, .. },
+                TraceEvent::FailureNotifiedToT2 { .. }
+            ]
+            if *total_attempts == 1
+                && reason.as_deref() == Some("need human review")
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn apply_plan_action_creates_normalized_new_run() {
         let (mut store, root) = test_store("create");
         store.create_session("owner", None).unwrap();
@@ -672,6 +868,72 @@ mod tests {
         assert!(stored.plan_run_id.is_some());
         assert_eq!(stored.replace_from_step, None);
         assert_eq!(stored.steps, action.steps);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apply_plan_action_observed_emits_created_turn_id() {
+        let (mut store, root) = test_store("create_observed");
+        store.create_session("owner", None).unwrap();
+        let observer = RecordingObserver::new();
+        let action = plan_action(None, None, vec![shell_step("step-1", "echo one")]);
+
+        apply_plan_action_observed(
+            std::sync::Arc::new(observer.clone()),
+            &mut store,
+            "owner",
+            Some("turn-1"),
+            &action,
+        )
+        .unwrap();
+
+        let events = observer.events();
+        assert!(matches!(
+            events.as_slice(),
+            [TraceEvent::PlanRunCreated { caused_by_turn_id, .. }]
+            if caused_by_turn_id.as_deref() == Some("turn-1")
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apply_plan_patch_observed_emits_patched_turn_id() {
+        let (mut store, root) = test_store("patch_observed");
+        let current = plan_action(
+            Some("plan-1"),
+            None,
+            vec![
+                shell_step("step-1", "echo one"),
+                shell_step("step-2", "echo two"),
+            ],
+        );
+        let current_json = serde_json::to_string(&current).unwrap();
+        let _plan_run = create_waiting_plan_run(&mut store, "plan-1", "owner", &current_json, 1);
+        let observer = RecordingObserver::new();
+        let patch = plan_action(
+            Some("plan-1"),
+            Some(1),
+            vec![shell_step("step-2b", "echo patched")],
+        );
+
+        apply_plan_patch_observed(
+            std::sync::Arc::new(observer.clone()),
+            &mut store,
+            "owner",
+            Some("turn-2"),
+            "plan-1",
+            &patch,
+        )
+        .unwrap();
+
+        let events = observer.events();
+        assert!(matches!(
+            events.as_slice(),
+            [TraceEvent::PlanRunPatched { caused_by_turn_id, .. }]
+            if caused_by_turn_id.as_deref() == Some("turn-2")
+        ));
 
         std::fs::remove_dir_all(root).unwrap();
     }

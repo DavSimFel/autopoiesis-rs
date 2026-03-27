@@ -20,8 +20,9 @@ mod usage;
 
 pub use audit::format_denial_message;
 pub use child_drain::spawn_and_drain;
-pub(crate) use child_drain::{SpawnDrainContext, finish_spawned_child_drain};
+pub(crate) use child_drain::{SpawnDrainContext, finish_spawned_child_drain_observed};
 pub use loop_impl::run_agent_loop;
+pub(crate) use loop_impl::run_agent_loop_observed;
 pub use queue::drain_queue;
 
 /// Agent verdict returned after processing a queued message or turn.

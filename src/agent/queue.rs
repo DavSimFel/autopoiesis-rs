@@ -31,10 +31,12 @@ where
     TS: TokenSink + Send + ?Sized,
     AH: ApprovalHandler + Send + ?Sized,
 {
+    let observer = crate::observe::runtime_observer(session.sessions_dir());
     drain::process_queued_message(
         message,
         session,
         turn,
+        observer,
         make_provider,
         token_sink,
         approval_handler,
@@ -63,10 +65,12 @@ where
     AH: ApprovalHandler + Send + ?Sized,
     TB: FnMut() -> Result<Turn> + Send,
 {
+    let observer = crate::observe::runtime_observer(session.sessions_dir());
     drain::process_queued_message_with_turn_builder(
         message,
         session,
         turn_builder,
+        observer,
         make_provider,
         token_sink,
         approval_handler,

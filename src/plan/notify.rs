@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 #[cfg(test)]
 use std::cell::Cell;
 
+use crate::observe::{Observer, TraceEvent};
 use crate::plan::runner::{CheckVerdict, ObservedOutput, PlanFailureDetails};
 use crate::store::{NullableUpdate, PlanRun, Store};
 use crate::time::utc_timestamp;
@@ -65,11 +68,24 @@ pub(crate) fn notify_plan_failure(
     store: &mut Store,
     plan_run: &PlanRun,
     failure: &PlanFailureDetails,
-) -> Result<()> {
-    store
+) -> Result<bool> {
+    let notified = store
         .with_transaction(|tx| notify_plan_failure_in_transaction(tx, plan_run, failure))
         .context("failed to notify plan failure atomically")?;
 
+    Ok(notified)
+}
+
+pub(crate) fn notify_plan_failure_observed(
+    observer: Arc<dyn Observer>,
+    store: &mut Store,
+    plan_run: &PlanRun,
+    failure: &PlanFailureDetails,
+) -> Result<()> {
+    let notified = notify_plan_failure(store, plan_run, failure)?;
+    if notified {
+        emit_failure_notified_to_t2(observer.as_ref(), plan_run);
+    }
     Ok(())
 }
 
@@ -77,7 +93,7 @@ pub(crate) fn notify_plan_failure_in_transaction(
     tx: &rusqlite::Transaction<'_>,
     plan_run: &PlanRun,
     failure: &PlanFailureDetails,
-) -> Result<()> {
+) -> Result<bool> {
     let current_status: Option<String> = tx
         .query_row(
             "SELECT status FROM plan_runs WHERE id = ?1",
@@ -87,7 +103,7 @@ pub(crate) fn notify_plan_failure_in_transaction(
         .optional()
         .context("failed to inspect plan run before notifying failure")?;
     match current_status.as_deref() {
-        Some("failed") => return Ok(()),
+        Some("failed") => return Ok(false),
         Some(_) => {}
         None => {
             return Err(anyhow::anyhow!(
@@ -177,7 +193,15 @@ pub(crate) fn notify_plan_failure_in_transaction(
         }
     }
 
-    Ok(())
+    Ok(true)
+}
+
+pub(crate) fn emit_failure_notified_to_t2(observer: &dyn Observer, plan_run: &PlanRun) {
+    observer.emit(&TraceEvent::FailureNotifiedToT2 {
+        session_id: plan_run.owner_session_id.clone(),
+        plan_run_id: plan_run.id.clone(),
+        owner_session_id: plan_run.owner_session_id.clone(),
+    });
 }
 
 fn build_plan_failure_payload(
@@ -217,6 +241,7 @@ fn verdict_to_string(verdict: &CheckVerdict) -> &'static str {
 mod tests {
     use super::set_force_notify_failure_tx_error;
     use super::*;
+    use crate::observe::test_support::RecordingObserver;
     use crate::plan::runner::{CheckOutcome, ObservedOutput, PlanFailureDetails};
     use crate::store::{NullableUpdate, PlanRunUpdateFields};
 
@@ -293,6 +318,38 @@ mod tests {
         assert_eq!(message.source, format!("agent-plan-{}", plan_run.id));
         assert_eq!(message.content, payload_json);
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn notify_plan_failure_observed_emits_failure_notified_event() {
+        let (mut store, root) = test_store();
+        let plan_run = test_plan_run(&mut store);
+        let observer = RecordingObserver::new();
+        let failure = PlanFailureDetails {
+            step_index: 1,
+            step_id: "step-1".to_string(),
+            attempt: 0,
+            reason: "boom".to_string(),
+            payload_child_session_id: None,
+            active_child_session_update: NullableUpdate::Unchanged,
+            checks: vec![],
+        };
+
+        notify_plan_failure_observed(
+            std::sync::Arc::new(observer.clone()),
+            &mut store,
+            &plan_run,
+            &failure,
+        )
+        .unwrap();
+
+        let events = observer.events();
+        assert!(matches!(
+            events.as_slice(),
+            [TraceEvent::FailureNotifiedToT2 { plan_run_id, .. }]
+            if plan_run_id == &plan_run.id
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 

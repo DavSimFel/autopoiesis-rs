@@ -1,15 +1,30 @@
 use anyhow::{Context, Result};
+use std::path::Path;
+use std::sync::Arc;
 
-use crate::plan::notify::notify_plan_failure_in_transaction;
+use crate::observe::{Observer, TraceEvent, runtime_observer};
+use crate::plan::notify::{emit_failure_notified_to_t2, notify_plan_failure_in_transaction};
 use crate::plan::{CheckOutcome, PlanAction, PlanFailureDetails, PlanStepSpec};
 use crate::store::{NullableUpdate, PlanRun, StepAttempt, Store};
 
-pub fn recover_crashed_plans(store: &mut Store, stale_after_secs: u64) -> Result<u64> {
+pub fn recover_crashed_plans(
+    store: &mut Store,
+    sessions_dir: &Path,
+    stale_after_secs: u64,
+) -> Result<u64> {
+    recover_crashed_plans_observed(runtime_observer(sessions_dir), store, stale_after_secs)
+}
+
+pub fn recover_crashed_plans_observed(
+    observer: Arc<dyn Observer>,
+    store: &mut Store,
+    stale_after_secs: u64,
+) -> Result<u64> {
     let stale_runs = store.list_stale_running_plan_runs(stale_after_secs)?;
     let mut recovered = 0u64;
 
     for plan_run in stale_runs {
-        crash_plan_run_to_waiting_t2(store, &plan_run)
+        crash_plan_run_to_waiting_t2_observed(observer.clone(), store, &plan_run)
             .with_context(|| format!("failed to recover crashed plan run {}", plan_run.id))?;
         recovered += 1;
     }
@@ -17,25 +32,47 @@ pub fn recover_crashed_plans(store: &mut Store, stale_after_secs: u64) -> Result
     Ok(recovered)
 }
 
-pub(crate) fn crash_plan_run_to_waiting_t2(
+pub(crate) fn crash_plan_run_to_waiting_t2_observed(
+    observer: Arc<dyn Observer>,
     store: &mut Store,
     plan_run: &PlanRun,
 ) -> Result<PlanFailureDetails> {
     let max_attempt_index = store
         .max_step_attempt_index_for_run(&plan_run.id)
         .context("failed to derive maximum step attempt index for crashed plan run")?;
-    store
+    let (failure, notified) = store
         .with_transaction(|tx| {
             let crashed_attempts =
                 Store::crash_running_step_attempts_for_run_in_transaction(tx, &plan_run.id)
                     .context("failed to crash running step attempts for stale plan run")?;
             let failure =
                 build_failure_details(tx, plan_run, &crashed_attempts, max_attempt_index)?;
-            notify_plan_failure_in_transaction(tx, plan_run, &failure)
+            let notified = notify_plan_failure_in_transaction(tx, plan_run, &failure)
                 .context("failed to transition plan run to waiting_t2 and enqueue failure")?;
-            Ok(failure)
+            Ok((failure, notified))
         })
-        .context("failed to hand off crashed plan run to T2")
+        .context("failed to hand off crashed plan run to T2")?;
+
+    emit_plan_recovered(observer.as_ref(), plan_run);
+    observer.emit(&TraceEvent::PlanWaitingT2 {
+        session_id: plan_run.owner_session_id.clone(),
+        plan_run_id: plan_run.id.clone(),
+        step_index: failure.step_index,
+        reason: Some(failure.reason.clone()),
+    });
+    if notified {
+        emit_failure_notified_to_t2(observer.as_ref(), plan_run);
+    }
+
+    Ok(failure)
+}
+
+fn emit_plan_recovered(observer: &dyn Observer, plan_run: &PlanRun) {
+    observer.emit(&TraceEvent::PlanRecovered {
+        session_id: plan_run.owner_session_id.clone(),
+        plan_run_id: plan_run.id.clone(),
+        reason: Some("crashed".to_string()),
+    });
 }
 
 fn build_failure_details(
@@ -133,6 +170,8 @@ fn nullable_update_for_child_session(child_session_id: Option<String>) -> Nullab
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observe::TraceEvent;
+    use crate::observe::test_support::RecordingObserver;
     use crate::plan::notify::set_force_notify_failure_tx_error_after;
     use crate::store::StepAttemptRecord;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -215,7 +254,7 @@ mod tests {
             .unwrap();
         stale_claim(&mut store, "plan-1", 301);
 
-        let recovered = recover_crashed_plans(&mut store, 300).unwrap();
+        let recovered = recover_crashed_plans(&mut store, Path::new("sessions"), 300).unwrap();
         assert_eq!(recovered, 1);
 
         let plan_run = store.get_plan_run("plan-1").unwrap().unwrap();
@@ -230,6 +269,56 @@ mod tests {
             store.dequeue_next_message("owner").unwrap().unwrap().source,
             "agent-plan-plan-1"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn crash_plan_run_to_waiting_t2_observed_emits_recovery_events() {
+        let (mut store, root) = test_store();
+        store.create_session("owner", None).unwrap();
+        store
+            .create_plan_run("plan-1", "owner", &valid_definition("step-1"), None, None)
+            .unwrap();
+        store
+            .update_plan_run_status("plan-1", "running", Default::default())
+            .unwrap();
+        store
+            .record_step_attempt(StepAttemptRecord {
+                plan_run_id: "plan-1".to_string(),
+                revision: 1,
+                step_index: 0,
+                step_id: "step-1".to_string(),
+                attempt: 0,
+                status: "running".to_string(),
+                child_session_id: Some("child-a".to_string()),
+                summary_json: r#"{"kind":"plan_step_summary"}"#.to_string(),
+                checks_json: r#"[]"#.to_string(),
+            })
+            .unwrap();
+        let plan_run = store.get_plan_run("plan-1").unwrap().unwrap();
+        let observer = RecordingObserver::new();
+
+        let failure = crash_plan_run_to_waiting_t2_observed(
+            std::sync::Arc::new(observer.clone()),
+            &mut store,
+            &plan_run,
+        )
+        .unwrap();
+
+        let events = observer.events();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                TraceEvent::PlanRecovered { plan_run_id, .. },
+                TraceEvent::PlanWaitingT2 { plan_run_id: waiting_id, .. },
+                TraceEvent::FailureNotifiedToT2 { plan_run_id: notified_id, .. }
+            ]
+            if plan_run_id == &plan_run.id
+                && waiting_id == &plan_run.id
+                && notified_id == &plan_run.id
+        ));
+        assert_eq!(failure.reason, "crashed");
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -259,7 +348,7 @@ mod tests {
             .unwrap();
         stale_claim(&mut store, "plan-1", 301);
 
-        let recovered = recover_crashed_plans(&mut store, 300).unwrap();
+        let recovered = recover_crashed_plans(&mut store, Path::new("sessions"), 300).unwrap();
         assert_eq!(recovered, 1);
 
         let message = store.dequeue_next_message("owner").unwrap().unwrap();
@@ -306,7 +395,7 @@ mod tests {
             .unwrap();
         stale_claim(&mut store, "plan-1", 301);
 
-        let recovered = recover_crashed_plans(&mut store, 300).unwrap();
+        let recovered = recover_crashed_plans(&mut store, Path::new("sessions"), 300).unwrap();
         assert_eq!(recovered, 1);
 
         let message = store.dequeue_next_message("owner").unwrap().unwrap();
@@ -357,7 +446,7 @@ mod tests {
             .unwrap();
         stale_claim(&mut store, "plan-1", 301);
 
-        let recovered = recover_crashed_plans(&mut store, 300).unwrap();
+        let recovered = recover_crashed_plans(&mut store, Path::new("sessions"), 300).unwrap();
         assert_eq!(recovered, 1);
 
         let message = store.dequeue_next_message("owner").unwrap().unwrap();
@@ -397,7 +486,8 @@ mod tests {
         }
 
         set_force_notify_failure_tx_error_after(Some(2));
-        let err = recover_crashed_plans(&mut store, 300).expect_err("second recovery should fail");
+        let err = recover_crashed_plans(&mut store, Path::new("sessions"), 300)
+            .expect_err("second recovery should fail");
         set_force_notify_failure_tx_error_after(None);
 
         assert!(
@@ -439,8 +529,14 @@ mod tests {
             .unwrap();
         stale_claim(&mut store, "plan-1", 301);
 
-        assert_eq!(recover_crashed_plans(&mut store, 300).unwrap(), 1);
-        assert_eq!(recover_crashed_plans(&mut store, 300).unwrap(), 0);
+        assert_eq!(
+            recover_crashed_plans(&mut store, Path::new("sessions"), 300).unwrap(),
+            1
+        );
+        assert_eq!(
+            recover_crashed_plans(&mut store, Path::new("sessions"), 300).unwrap(),
+            0
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

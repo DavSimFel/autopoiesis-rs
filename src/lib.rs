@@ -10,6 +10,7 @@ pub mod identity;
 pub mod llm;
 pub mod logging;
 pub mod model_selection;
+pub mod observe;
 pub mod plan;
 pub mod principal;
 pub mod read_tool;

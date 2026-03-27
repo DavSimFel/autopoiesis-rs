@@ -21,6 +21,7 @@ impl ToSql for PlanRunUpdateValue {
 
 use super::{NullableUpdate, PlanRun, PlanRunUpdateFields, Store};
 use crate::time::utc_timestamp;
+use std::time::SystemTime;
 
 const PLAN_RUN_COLUMNS_SQL: &str = r#"
                 id,
@@ -67,6 +68,7 @@ fn build_plan_run_status_update_sql(
     status: &str,
     updated_fields: &PlanRunUpdateFields,
     include_failed_guard: bool,
+    expected_updated_at: Option<&str>,
 ) -> Result<(String, Vec<PlanRunUpdateValue>)> {
     validate_plan_run_status(status)?;
     if let Some(revision) = updated_fields.revision
@@ -82,7 +84,7 @@ fn build_plan_run_status_update_sql(
         ));
     }
 
-    let updated_at = utc_timestamp();
+    let updated_at = super::format_system_time(SystemTime::now());
     let mut sql = String::from("UPDATE plan_runs SET status = ?1, updated_at = ?2");
     let mut bindings: Vec<PlanRunUpdateValue> = vec![
         PlanRunUpdateValue::Text(status.to_string()),
@@ -147,6 +149,10 @@ fn build_plan_run_status_update_sql(
         sql.push_str(&format!(" WHERE id = ?{next_index}"));
     }
     bindings.push(PlanRunUpdateValue::Text(id.to_string()));
+    if let Some(expected_updated_at) = expected_updated_at {
+        sql.push_str(&format!(" AND updated_at = ?{}", next_index + 1));
+        bindings.push(PlanRunUpdateValue::Text(expected_updated_at.to_string()));
+    }
 
     Ok((sql, bindings))
 }
@@ -241,7 +247,8 @@ pub(super) fn update_plan_run_status(
     status: &str,
     updated_fields: PlanRunUpdateFields,
 ) -> Result<()> {
-    let (sql, bindings) = build_plan_run_status_update_sql(id, status, &updated_fields, false)?;
+    let (sql, bindings) =
+        build_plan_run_status_update_sql(id, status, &updated_fields, false, None)?;
     let changed =
         execute_plan_run_update(conn, &sql, &bindings, "failed to update plan run status")?;
     if changed == 0 {
@@ -258,8 +265,15 @@ pub(super) fn update_plan_run_status_preserving_failed(
     id: &str,
     status: &str,
     updated_fields: PlanRunUpdateFields,
+    expected_updated_at: &str,
 ) -> Result<bool> {
-    let (sql, bindings) = build_plan_run_status_update_sql(id, status, &updated_fields, true)?;
+    let (sql, bindings) = build_plan_run_status_update_sql(
+        id,
+        status,
+        &updated_fields,
+        true,
+        Some(expected_updated_at),
+    )?;
     let changed =
         execute_plan_run_update(conn, &sql, &bindings, "failed to update plan run status")?;
     Ok(changed > 0)
@@ -279,7 +293,7 @@ fn claim_pending_plan_run_in_transaction(
     let stale_after_secs = stale_after_secs.min(i64::MAX as u64) as i64;
     let stale_before = crate::store::unix_timestamp().saturating_sub(stale_after_secs);
     let claimed_at = crate::store::unix_timestamp();
-    let updated_at = utc_timestamp();
+    let updated_at = super::format_system_time(SystemTime::now());
     let mut statement = tx
         .prepare(&build_claim_plan_run_sql("created_at ASC, id ASC"))
         .context("failed to prepare plan run claim query")?;
@@ -301,7 +315,7 @@ pub(super) fn claim_next_runnable_plan_run(
     let stale_after_secs = stale_after_secs.min(i64::MAX as u64) as i64;
     let stale_before = crate::store::unix_timestamp().saturating_sub(stale_after_secs);
     let claimed_at = crate::store::unix_timestamp();
-    let updated_at = utc_timestamp();
+    let updated_at = super::format_system_time(SystemTime::now());
     let mut statement = conn
         .prepare(&build_claim_plan_run_sql("created_at ASC, id ASC"))
         .context("failed to prepare runnable plan run claim query")?;
@@ -324,7 +338,7 @@ pub(super) fn release_plan_run_claim(conn: &Connection, id: &str) -> Result<()> 
                  updated_at = ?2
              WHERE id = ?1
                AND status != 'running'",
-            params![id, utc_timestamp()],
+            params![id, super::format_system_time(SystemTime::now())],
         )
         .context("failed to release plan run claim")?;
     if changed == 0 {
@@ -431,7 +445,7 @@ pub(super) fn recover_stale_plan_runs(store: &mut Store, stale_after_secs: u64) 
                  WHERE status = 'pending'
                    AND claimed_at IS NOT NULL
                    AND claimed_at <= ?1",
-                params![stale_before, utc_timestamp()],
+                params![stale_before, super::format_system_time(SystemTime::now())],
             )
             .context("failed to recover stale pending plan runs")?;
         let leaked_count = tx
@@ -442,7 +456,7 @@ pub(super) fn recover_stale_plan_runs(store: &mut Store, stale_after_secs: u64) 
                  WHERE status IN ('waiting_t2', 'completed', 'failed')
                    AND claimed_at IS NOT NULL
                    AND claimed_at <= ?1",
-                params![stale_before, utc_timestamp()],
+                params![stale_before, super::format_system_time(SystemTime::now())],
             )
             .context("failed to clear stale plan run claims")?;
         Ok((pending_count + leaked_count) as u64)
@@ -459,7 +473,7 @@ pub(super) fn resume_waiting_plan_run(conn: &Connection, id: &str) -> Result<boo
                  updated_at = ?2
              WHERE id = ?1
                AND status = 'waiting_t2'",
-            params![id, utc_timestamp()],
+            params![id, super::format_system_time(SystemTime::now())],
         )
         .context("failed to resume waiting plan run")?;
     Ok(changed > 0)
@@ -475,7 +489,7 @@ pub(super) fn cancel_plan_run(conn: &Connection, id: &str) -> Result<bool> {
                  updated_at = ?2
              WHERE id = ?1
                AND status IN ('pending', 'running', 'waiting_t2')",
-            params![id, utc_timestamp()],
+            params![id, super::format_system_time(SystemTime::now())],
         )
         .context("failed to cancel plan run")?;
     Ok(changed > 0)
@@ -586,8 +600,15 @@ impl super::Store {
         id: &str,
         status: &str,
         updated_fields: PlanRunUpdateFields,
+        expected_updated_at: &str,
     ) -> Result<bool> {
-        update_plan_run_status_preserving_failed(&self.conn, id, status, updated_fields)
+        update_plan_run_status_preserving_failed(
+            &self.conn,
+            id,
+            status,
+            updated_fields,
+            expected_updated_at,
+        )
     }
 
     pub fn list_stale_running_plan_runs(&self, stale_after_secs: u64) -> Result<Vec<PlanRun>> {
