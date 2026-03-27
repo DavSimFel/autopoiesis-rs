@@ -288,8 +288,13 @@ async fn run_check(
         format!("{call_id_prefix}-check-{}", check.id),
     );
 
-    match crate::plan::executor::guarded_shell_execute_call(turn, &call, session, approval_handler)
-        .await
+    match crate::agent::shell_execute::guarded_shell_execute_call(
+        turn,
+        &call,
+        session,
+        approval_handler,
+    )
+    .await
     {
         Ok(result) if result.was_denied => CheckOutcome {
             check_id: check.id.clone(),
@@ -612,7 +617,7 @@ where
                 "shell",
             );
             let call = build_shell_call(command, *timeout_ms, call_id);
-            let result = match crate::plan::executor::guarded_shell_execute_call(
+            let result = match crate::agent::shell_execute::guarded_shell_execute_call(
                 &shell_turn,
                 &call,
                 &session,

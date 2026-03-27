@@ -230,3 +230,70 @@ where
 
     Ok(refreshed)
 }
+
+impl super::Store {
+    pub fn create_subscription_for_session(
+        &mut self,
+        session_id: Option<&str>,
+        topic: &str,
+        path: &str,
+        filter: Option<&str>,
+    ) -> Result<i64> {
+        create_subscription_for_session(&self.conn, session_id, topic, path, filter)
+    }
+
+    pub fn create_subscription(
+        &mut self,
+        topic: &str,
+        path: &str,
+        filter: Option<&str>,
+    ) -> Result<i64> {
+        self.create_subscription_for_session(None, topic, path, filter)
+    }
+
+    pub fn delete_subscription_for_session(
+        &mut self,
+        session_id: Option<&str>,
+        topic: &str,
+        path: &str,
+        filter: Option<&str>,
+    ) -> Result<usize> {
+        delete_subscription_for_session(&self.conn, session_id, topic, path, filter)
+    }
+
+    pub fn delete_subscription(&mut self, topic: &str, path: &str) -> Result<usize> {
+        self.delete_subscription_for_session(None, topic, path, None)
+    }
+
+    pub fn list_subscriptions(&self, topic: Option<&str>) -> Result<Vec<SubscriptionRow>> {
+        list_subscriptions(&self.conn, topic)
+    }
+
+    pub fn list_subscriptions_for_session(&self, session_id: &str) -> Result<Vec<SubscriptionRow>> {
+        list_subscriptions_for_session(&self.conn, session_id)
+    }
+
+    pub fn refresh_subscription_timestamps(&mut self) -> Result<u64> {
+        #[cfg(test)]
+        {
+            return self.refresh_subscription_timestamps_with(|path| {
+                std::fs::metadata(path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+            });
+        }
+
+        #[cfg(not(test))]
+        {
+            refresh_subscription_timestamps(&self.conn)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refresh_subscription_timestamps_with<F>(&mut self, modified_for: F) -> Result<u64>
+    where
+        F: FnMut(&Path) -> Option<SystemTime>,
+    {
+        refresh_subscription_timestamps_with(&self.conn, modified_for)
+    }
+}

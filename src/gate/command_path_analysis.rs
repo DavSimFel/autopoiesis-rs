@@ -19,6 +19,12 @@ fn command_references_protected_path(command: &str) -> bool {
         .any(|fragment| command.contains(fragment))
 }
 
+#[derive(Copy, Clone)]
+enum PathReference<'a> {
+    Protected,
+    Target(&'a str),
+}
+
 pub(crate) fn command_writes_identity_template_path(command: &str) -> bool {
     let command = command.to_lowercase();
     if command.contains("perl -") && identity_template_perl_script_contains_write_api(&command) {
@@ -1016,106 +1022,6 @@ fn git_path_spec_argument(token: &str) -> Option<&str> {
     token.split_once(':').map(|(_, path)| path)
 }
 
-fn git_option_value_references_protected_path(argv: &[String]) -> bool {
-    let mut index = 1usize;
-
-    while index < argv.len() {
-        let token = &argv[index];
-        if !token.starts_with('-') {
-            break;
-        }
-
-        if matches!(
-            token.as_str(),
-            "-c" | "--git-dir"
-                | "--work-tree"
-                | "--namespace"
-                | "--super-prefix"
-                | "--exec-path"
-                | "--config-env"
-                | "-C"
-        ) {
-            if let Some(value) = argv.get(index + 1)
-                && git_config_value_references_protected_path(value)
-            {
-                return true;
-            }
-            index += 1;
-        }
-
-        index += 1;
-    }
-
-    false
-}
-
-fn git_config_value_references_protected_path(value: &str) -> bool {
-    let Some((key, command)) = value.split_once('=') else {
-        return false;
-    };
-
-    if !git_config_key_executes_shell_command(key) {
-        return false;
-    }
-
-    let command = command.trim_start_matches('!').trim();
-    if let Ok(argv) = shell_words::split(command) {
-        simple_command_reads_protected_path(&argv)
-    } else {
-        command_references_protected_path(command)
-    }
-}
-
-fn git_option_value_references_target_path(argv: &[String], target: &str) -> bool {
-    let mut index = 1usize;
-
-    while index < argv.len() {
-        let token = &argv[index];
-        if !token.starts_with('-') {
-            break;
-        }
-
-        if matches!(
-            token.as_str(),
-            "-c" | "--git-dir"
-                | "--work-tree"
-                | "--namespace"
-                | "--super-prefix"
-                | "--exec-path"
-                | "--config-env"
-                | "-C"
-        ) {
-            if let Some(value) = argv.get(index + 1)
-                && git_config_value_references_target_path(value, target)
-            {
-                return true;
-            }
-            index += 1;
-        }
-
-        index += 1;
-    }
-
-    false
-}
-
-fn git_config_value_references_target_path(value: &str, target: &str) -> bool {
-    let Some((key, command)) = value.split_once('=') else {
-        return false;
-    };
-
-    if !git_config_key_executes_shell_command(key) {
-        return false;
-    }
-
-    let command = command.trim_start_matches('!').trim();
-    if let Ok(argv) = shell_words::split(command) {
-        simple_command_reads_target_path(&argv, target)
-    } else {
-        command_argument_references_target_path(command, target)
-    }
-}
-
 fn git_config_key_executes_shell_command(key: &str) -> bool {
     matches!(key, k if k.starts_with("alias."))
         || matches!(
@@ -1154,38 +1060,41 @@ fn git_subcommand_and_args(argv: &[String]) -> Option<(&str, &[String])> {
     None
 }
 
-fn command_argument_references_protected_path(argument: &str) -> bool {
-    if let Some(candidate) = git_path_spec_argument(argument) {
-        is_protected_path_value(candidate) || is_protected_git_pathspec_value(candidate)
-    } else {
-        is_protected_path_value(argument)
+fn command_argument_references_path(argument: &str, reference: PathReference<'_>) -> bool {
+    match reference {
+        PathReference::Protected => {
+            if let Some(candidate) = git_path_spec_argument(argument) {
+                is_protected_path_value(candidate) || is_protected_git_pathspec_value(candidate)
+            } else {
+                is_protected_path_value(argument)
+            }
+        }
+        PathReference::Target(target) => {
+            let target = normalize_lexical_path(&target.to_lowercase());
+            if target.is_empty() {
+                return false;
+            }
+
+            let argument = argument.to_lowercase();
+            let candidate = if let Some(candidate) = git_path_spec_argument(&argument) {
+                candidate
+            } else {
+                &argument
+            };
+
+            let Some(candidate_path) = resolve_path_like(candidate) else {
+                return false;
+            };
+            let Some(target_path) = resolve_path_like(&target) else {
+                return false;
+            };
+
+            path_matches_target(&candidate_path, &target_path)
+        }
     }
 }
 
-fn command_argument_references_target_path(argument: &str, target: &str) -> bool {
-    let target = normalize_lexical_path(&target.to_lowercase());
-    if target.is_empty() {
-        return false;
-    }
-
-    let argument = argument.to_lowercase();
-    let candidate = if let Some(candidate) = git_path_spec_argument(&argument) {
-        candidate
-    } else {
-        &argument
-    };
-
-    let Some(candidate_path) = resolve_path_like(candidate) else {
-        return false;
-    };
-    let Some(target_path) = resolve_path_like(&target) else {
-        return false;
-    };
-
-    path_matches_target(&candidate_path, &target_path)
-}
-
-fn grep_file_operands_refer_protected_path(args: &[String]) -> bool {
+fn grep_file_operands_refer_path(args: &[String], reference: PathReference<'_>) -> bool {
     let mut options_done = false;
     let mut pattern_specified = false;
     let mut index = 0usize;
@@ -1215,7 +1124,7 @@ fn grep_file_operands_refer_protected_path(args: &[String]) -> bool {
             if argument == "-f" {
                 pattern_specified = true;
                 if let Some(value) = args.get(index + 1) {
-                    if command_argument_references_protected_path(value) {
+                    if command_argument_references_path(value, reference) {
                         return true;
                     }
                     index += 2;
@@ -1224,7 +1133,7 @@ fn grep_file_operands_refer_protected_path(args: &[String]) -> bool {
             } else if let Some(value) = argument.strip_prefix("-f") {
                 if !value.is_empty() {
                     pattern_specified = true;
-                    if command_argument_references_protected_path(value) {
+                    if command_argument_references_path(value, reference) {
                         return true;
                     }
                     index += 1;
@@ -1232,7 +1141,7 @@ fn grep_file_operands_refer_protected_path(args: &[String]) -> bool {
                 }
             } else if let Some(value) = argument.strip_prefix("--file=") {
                 pattern_specified = true;
-                if command_argument_references_protected_path(value) {
+                if command_argument_references_path(value, reference) {
                     return true;
                 }
                 index += 1;
@@ -1240,7 +1149,7 @@ fn grep_file_operands_refer_protected_path(args: &[String]) -> bool {
             } else if argument == "--file" {
                 pattern_specified = true;
                 if let Some(value) = args.get(index + 1) {
-                    if command_argument_references_protected_path(value) {
+                    if command_argument_references_path(value, reference) {
                         return true;
                     }
                     index += 2;
@@ -1258,7 +1167,7 @@ fn grep_file_operands_refer_protected_path(args: &[String]) -> bool {
             continue;
         }
 
-        if command_argument_references_protected_path(argument) {
+        if command_argument_references_path(argument, reference) {
             return true;
         }
 
@@ -1268,81 +1177,31 @@ fn grep_file_operands_refer_protected_path(args: &[String]) -> bool {
     false
 }
 
-fn grep_file_operands_refer_target_path(args: &[String], target: &str) -> bool {
-    let mut options_done = false;
-    let mut pattern_specified = false;
-    let mut index = 0usize;
+fn git_option_value_references_path(argv: &[String], reference: PathReference<'_>) -> bool {
+    let mut index = 1usize;
 
-    while let Some(argument) = args.get(index) {
-        if argument == "--" {
-            options_done = true;
-            index += 1;
-            continue;
+    while index < argv.len() {
+        let token = &argv[index];
+        if !token.starts_with('-') {
+            break;
         }
 
-        if !options_done && argument.starts_with('-') && argument != "-" {
-            if argument == "-e" {
-                pattern_specified = true;
-                if args.get(index + 1).is_some() {
-                    index += 2;
-                    continue;
-                }
-            } else if let Some(value) = argument.strip_prefix("-e")
-                && !value.is_empty()
+        if matches!(
+            token.as_str(),
+            "-c" | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--super-prefix"
+                | "--exec-path"
+                | "--config-env"
+                | "-C"
+        ) {
+            if let Some(value) = argv.get(index + 1)
+                && git_config_value_references_path(value, reference)
             {
-                pattern_specified = true;
-                index += 1;
-                continue;
+                return true;
             }
-
-            if argument == "-f" {
-                pattern_specified = true;
-                if let Some(value) = args.get(index + 1) {
-                    if command_argument_references_target_path(value, target) {
-                        return true;
-                    }
-                    index += 2;
-                    continue;
-                }
-            } else if let Some(value) = argument.strip_prefix("-f") {
-                if !value.is_empty() {
-                    pattern_specified = true;
-                    if command_argument_references_target_path(value, target) {
-                        return true;
-                    }
-                    index += 1;
-                    continue;
-                }
-            } else if let Some(value) = argument.strip_prefix("--file=") {
-                pattern_specified = true;
-                if command_argument_references_target_path(value, target) {
-                    return true;
-                }
-                index += 1;
-                continue;
-            } else if argument == "--file" {
-                pattern_specified = true;
-                if let Some(value) = args.get(index + 1) {
-                    if command_argument_references_target_path(value, target) {
-                        return true;
-                    }
-                    index += 2;
-                    continue;
-                }
-            }
-
             index += 1;
-            continue;
-        }
-
-        if !pattern_specified {
-            pattern_specified = true;
-            index += 1;
-            continue;
-        }
-
-        if command_argument_references_target_path(argument, target) {
-            return true;
         }
 
         index += 1;
@@ -1351,9 +1210,31 @@ fn grep_file_operands_refer_target_path(args: &[String], target: &str) -> bool {
     false
 }
 
-pub(crate) fn simple_command_reads_protected_path(argv: &[String]) -> bool {
+fn git_config_value_references_path(value: &str, reference: PathReference<'_>) -> bool {
+    let Some((key, command)) = value.split_once('=') else {
+        return false;
+    };
+
+    if !git_config_key_executes_shell_command(key) {
+        return false;
+    }
+
+    let command = command.trim_start_matches('!').trim();
+    if let Ok(argv) = shell_words::split(command) {
+        simple_command_reads_path(&argv, reference)
+    } else {
+        match reference {
+            PathReference::Protected => command_references_protected_path(command),
+            PathReference::Target(target) => {
+                command_argument_references_path(command, PathReference::Target(target))
+            }
+        }
+    }
+}
+
+fn simple_command_reads_path(argv: &[String], reference: PathReference<'_>) -> bool {
     if let Some(expanded) = env_split_string_command(argv)
-        && simple_command_reads_protected_path(&expanded)
+        && simple_command_reads_path(&expanded, reference)
     {
         return true;
     }
@@ -1368,10 +1249,10 @@ pub(crate) fn simple_command_reads_protected_path(argv: &[String]) -> bool {
     match program.as_str() {
         "cat" | "head" | "tail" | "sed" | "awk" => args
             .iter()
-            .any(|argument| command_argument_references_protected_path(argument)),
-        "grep" => grep_file_operands_refer_protected_path(args),
+            .any(|argument| command_argument_references_path(argument, reference)),
+        "grep" => grep_file_operands_refer_path(args, reference),
         "git" => {
-            if git_option_value_references_protected_path(argv) {
+            if git_option_value_references_path(argv, reference) {
                 return true;
             }
 
@@ -1384,61 +1265,24 @@ pub(crate) fn simple_command_reads_protected_path(argv: &[String]) -> bool {
             }
 
             if subcommand == "grep" {
-                return grep_file_operands_refer_protected_path(sub_args);
+                return grep_file_operands_refer_path(sub_args, reference);
             }
 
             sub_args
                 .iter()
                 .filter(|argument| !argument.starts_with('-'))
-                .any(|argument| command_argument_references_protected_path(argument))
+                .any(|argument| command_argument_references_path(argument, reference))
         }
         _ => false,
     }
 }
 
+pub(crate) fn simple_command_reads_protected_path(argv: &[String]) -> bool {
+    simple_command_reads_path(argv, PathReference::Protected)
+}
+
 pub(crate) fn simple_command_reads_target_path(argv: &[String], target: &str) -> bool {
-    if let Some(expanded) = env_split_string_command(argv)
-        && simple_command_reads_target_path(&expanded, target)
-    {
-        return true;
-    }
-
-    let argv = strip_env_wrapper(argv);
-    let Some((program, args)) = argv.split_first() else {
-        return false;
-    };
-
-    let program = program.to_lowercase();
-
-    match program.as_str() {
-        "cat" | "head" | "tail" | "sed" | "awk" => args
-            .iter()
-            .any(|argument| command_argument_references_target_path(argument, target)),
-        "grep" => grep_file_operands_refer_target_path(args, target),
-        "git" => {
-            if git_option_value_references_target_path(argv, target) {
-                return true;
-            }
-
-            if let Some((subcommand, sub_args)) = git_subcommand_and_args(argv) {
-                if !READ_ONLY_GIT_SUBCOMMANDS.contains(&subcommand) {
-                    return false;
-                }
-
-                if subcommand == "grep" {
-                    return grep_file_operands_refer_target_path(sub_args, target);
-                }
-
-                return sub_args
-                    .iter()
-                    .filter(|argument| !argument.starts_with('-'))
-                    .any(|argument| command_argument_references_target_path(argument, target));
-            }
-
-            false
-        }
-        _ => false,
-    }
+    simple_command_reads_path(argv, PathReference::Target(target))
 }
 
 #[cfg(test)]
@@ -1691,6 +1535,14 @@ mod tests {
             &[
                 "cat".to_string(),
                 "custom-skills/code-review.toml".to_string()
+            ],
+            "custom-skills"
+        ));
+        assert!(simple_command_reads_target_path(
+            &[
+                "env".to_string(),
+                "-S".to_string(),
+                "cat custom-skills/code-review.toml".to_string(),
             ],
             "custom-skills"
         ));

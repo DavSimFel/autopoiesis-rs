@@ -158,6 +158,36 @@ trait DrainProcessor {
     ) -> Pin<Box<dyn Future<Output = Result<QueueOutcome>> + Send + 'a>>;
 }
 
+fn process_non_user_message(
+    message: &QueuedMessage,
+    session: &mut Session,
+) -> Result<QueueOutcome> {
+    match message.role.as_str() {
+        "system" => {
+            session.append(
+                ChatMessage::system_with_principal(
+                    message.content.clone(),
+                    Some(Principal::from_source(&message.source)),
+                ),
+                None,
+            )?;
+            Ok(QueueOutcome::Stored)
+        }
+        "assistant" => {
+            let mut assistant = ChatMessage::with_role_with_principal(
+                crate::llm::ChatRole::Assistant,
+                Some(Principal::from_source(&message.source)),
+            );
+            assistant
+                .content
+                .push(MessageContent::text(message.content.clone()));
+            session.append(assistant, None)?;
+            Ok(QueueOutcome::Stored)
+        }
+        other => Ok(QueueOutcome::UnsupportedRole(other.to_string())),
+    }
+}
+
 struct FixedTurnProcessor<'a, F, Fut, P> {
     turn: &'a Turn,
     make_provider: &'a mut F,
@@ -480,42 +510,22 @@ where
     TS: TokenSink + Send + ?Sized,
     AH: ApprovalHandler + Send + ?Sized,
 {
-    match message.role.as_str() {
-        "user" => Ok(QueueOutcome::Agent(
-            crate::agent::run_agent_loop(
-                make_provider,
-                session,
-                message.content.clone(),
-                Principal::from_source(&message.source),
-                turn,
-                token_sink,
-                approval_handler,
-            )
-            .await?,
-        )),
-        "system" => {
-            session.append(
-                ChatMessage::system_with_principal(
-                    message.content.clone(),
-                    Some(Principal::from_source(&message.source)),
-                ),
-                None,
-            )?;
-            Ok(QueueOutcome::Stored)
-        }
-        "assistant" => {
-            let mut assistant = ChatMessage::with_role_with_principal(
-                crate::llm::ChatRole::Assistant,
-                Some(Principal::from_source(&message.source)),
-            );
-            assistant
-                .content
-                .push(MessageContent::text(message.content.clone()));
-            session.append(assistant, None)?;
-            Ok(QueueOutcome::Stored)
-        }
-        other => Ok(QueueOutcome::UnsupportedRole(other.to_string())),
+    if message.role.as_str() != "user" {
+        return process_non_user_message(message, session);
     }
+
+    Ok(QueueOutcome::Agent(
+        crate::agent::run_agent_loop(
+            make_provider,
+            session,
+            message.content.clone(),
+            Principal::from_source(&message.source),
+            turn,
+            token_sink,
+            approval_handler,
+        )
+        .await?,
+    ))
 }
 
 #[tracing::instrument(
@@ -539,43 +549,21 @@ where
     AH: ApprovalHandler + Send + ?Sized,
     TB: FnMut() -> Result<Turn> + Send,
 {
-    match message.role.as_str() {
-        "user" => {
-            let turn = turn_builder()?;
-            Ok(QueueOutcome::Agent(
-                crate::agent::run_agent_loop(
-                    make_provider,
-                    session,
-                    message.content.clone(),
-                    Principal::from_source(&message.source),
-                    &turn,
-                    token_sink,
-                    approval_handler,
-                )
-                .await?,
-            ))
-        }
-        "system" => {
-            session.append(
-                ChatMessage::system_with_principal(
-                    message.content.clone(),
-                    Some(Principal::from_source(&message.source)),
-                ),
-                None,
-            )?;
-            Ok(QueueOutcome::Stored)
-        }
-        "assistant" => {
-            let mut assistant = ChatMessage::with_role_with_principal(
-                crate::llm::ChatRole::Assistant,
-                Some(Principal::from_source(&message.source)),
-            );
-            assistant
-                .content
-                .push(MessageContent::text(message.content.clone()));
-            session.append(assistant, None)?;
-            Ok(QueueOutcome::Stored)
-        }
-        other => Ok(QueueOutcome::UnsupportedRole(other.to_string())),
+    if message.role.as_str() != "user" {
+        return process_non_user_message(message, session);
     }
+
+    let turn = turn_builder()?;
+    Ok(QueueOutcome::Agent(
+        crate::agent::run_agent_loop(
+            make_provider,
+            session,
+            message.content.clone(),
+            Principal::from_source(&message.source),
+            &turn,
+            token_sink,
+            approval_handler,
+        )
+        .await?,
+    ))
 }

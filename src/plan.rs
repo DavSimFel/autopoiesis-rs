@@ -2,7 +2,6 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-pub(crate) mod executor;
 pub(crate) mod notify;
 pub(crate) mod patch;
 pub mod recovery;

@@ -1,7 +1,7 @@
 //! Step attempt persistence helpers.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Params, params};
 
 use super::{PlanRun, StepAttempt, StepAttemptRecord, Store, step_attempt_from_row};
 use crate::time::utc_timestamp;
@@ -22,6 +22,42 @@ fn validate_step_attempt_terminal_status(status: &str) -> Result<()> {
             "invalid plan step attempt terminal status: {other}"
         )),
     }
+}
+
+fn execute_running_step_attempt_update<P>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+    context: &str,
+) -> Result<()>
+where
+    P: Params,
+{
+    let changed = conn
+        .execute(sql, params)
+        .with_context(|| context.to_string())?;
+    if changed == 0 {
+        return Err(anyhow::anyhow!(
+            "failed to update plan step attempt: attempt not found or already finalized"
+        ));
+    }
+    Ok(())
+}
+
+fn collect_step_attempt_rows<T, F>(
+    statement: &mut rusqlite::Statement<'_>,
+    params: impl Params,
+    context: &str,
+    mut map: F,
+) -> Result<Vec<T>>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+{
+    let rows = statement
+        .query_map(params, |row| map(row))
+        .with_context(|| context.to_string())?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| context.to_string())
 }
 
 pub(super) fn next_step_attempt_index_for_run(
@@ -60,10 +96,9 @@ pub(super) fn crash_running_step_attempts_for_run_in_transaction(
     tx: &rusqlite::Transaction<'_>,
     plan_run_id: &str,
 ) -> Result<Vec<StepAttempt>> {
-    let attempts = {
-        let mut statement = tx
-            .prepare(
-                "SELECT
+    let mut statement = tx
+        .prepare(
+            "SELECT
                     id,
                     plan_run_id,
                     revision,
@@ -81,32 +116,27 @@ pub(super) fn crash_running_step_attempts_for_run_in_transaction(
                    AND status = 'running'
                    AND finished_at IS NULL
                  ORDER BY revision DESC, step_index DESC, attempt DESC, id DESC",
-            )
-            .context("failed to prepare crashed step attempt recovery query")?;
-        statement
-            .query_map(params![plan_run_id], step_attempt_from_row)
-            .context("failed to query crashed step attempts")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to collect crashed step attempts")?
-    };
+        )
+        .context("failed to prepare crashed step attempt recovery query")?;
+    let attempts = collect_step_attempt_rows(
+        &mut statement,
+        params![plan_run_id],
+        "failed to query crashed step attempts",
+        step_attempt_from_row,
+    )?;
 
     for attempt in &attempts {
-        let changed = tx
-            .execute(
-                "UPDATE plan_step_attempts
-                 SET status = 'crashed',
-                     finished_at = ?2
-                 WHERE id = ?1
-                   AND status = 'running'
-                   AND finished_at IS NULL",
-                params![attempt.id, utc_timestamp()],
-            )
-            .context("failed to crash plan step attempt")?;
-        if changed == 0 {
-            return Err(anyhow::anyhow!(
-                "failed to crash plan step attempt: attempt not found or already finalized"
-            ));
-        }
+        execute_running_step_attempt_update(
+            tx,
+            "UPDATE plan_step_attempts
+             SET status = 'crashed',
+                 finished_at = ?2
+             WHERE id = ?1
+               AND status = 'running'
+               AND finished_at IS NULL",
+            params![attempt.id, utc_timestamp()],
+            "failed to crash plan step attempt",
+        )?;
     }
 
     Ok(attempts)
@@ -180,22 +210,17 @@ pub(super) fn update_step_attempt_status(
             "invalid plan step attempt finished_at: finished_at must not be empty"
         ));
     }
-    let changed = conn
-        .execute(
-            "UPDATE plan_step_attempts
-             SET status = ?2,
-                 finished_at = ?3
-             WHERE id = ?1
-               AND status = 'running'
-               AND finished_at IS NULL",
-            params![attempt_id, status, finished_at],
-        )
-        .context("failed to update plan step attempt")?;
-    if changed == 0 {
-        return Err(anyhow::anyhow!(
-            "failed to update plan step attempt: attempt not found or already finalized"
-        ));
-    }
+    execute_running_step_attempt_update(
+        conn,
+        "UPDATE plan_step_attempts
+         SET status = ?2,
+             finished_at = ?3
+         WHERE id = ?1
+           AND status = 'running'
+           AND finished_at IS NULL",
+        params![attempt_id, status, finished_at],
+        "failed to update plan step attempt",
+    )?;
     Ok(())
 }
 
@@ -272,29 +297,28 @@ pub(super) fn finalize_stale_step_attempts(
     plan_run_id: &str,
     revision: i64,
 ) -> Result<u64> {
-    let attempts = {
-        let mut statement = conn
-            .prepare(
-                "SELECT id, summary_json, checks_json
+    let mut statement = conn
+        .prepare(
+            "SELECT id, summary_json, checks_json
                  FROM plan_step_attempts
                  WHERE plan_run_id = ?1
                    AND revision = ?2
                    AND status = 'running'
                    AND finished_at IS NULL",
-            )
-            .context("failed to prepare stale step attempt recovery query")?;
-        statement
-            .query_map(params![plan_run_id, revision], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .context("failed to query stale step attempts")?
-            .collect::<Result<Vec<_>, _>>()
-            .context("failed to read stale step attempts")?
-    };
+        )
+        .context("failed to prepare stale step attempt recovery query")?;
+    let attempts = collect_step_attempt_rows(
+        &mut statement,
+        params![plan_run_id, revision],
+        "failed to query stale step attempts",
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    )?;
 
     let mut finalized = 0;
     for attempt in attempts {
@@ -345,4 +369,83 @@ pub(super) fn get_step_attempts(
         .context("failed to collect plan step attempts")?;
 
     Ok(attempts)
+}
+
+impl super::Store {
+    pub fn next_step_attempt_index_for_run(&self, plan_run: &PlanRun) -> Result<i64> {
+        next_step_attempt_index_for_run(&self.conn, plan_run)
+    }
+
+    pub fn max_step_attempt_index_for_run(&self, plan_run_id: &str) -> Result<i64> {
+        max_step_attempt_index_for_run(&self.conn, plan_run_id)
+    }
+
+    pub fn crash_running_step_attempts_for_run(
+        &mut self,
+        plan_run_id: &str,
+    ) -> Result<Vec<StepAttempt>> {
+        crash_running_step_attempts_for_run(self, plan_run_id)
+    }
+
+    pub(crate) fn crash_running_step_attempts_for_run_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        plan_run_id: &str,
+    ) -> Result<Vec<StepAttempt>> {
+        crash_running_step_attempts_for_run_in_transaction(tx, plan_run_id)
+    }
+
+    pub fn record_step_attempt(&mut self, record: StepAttemptRecord) -> Result<i64> {
+        record_step_attempt(&self.conn, record)
+    }
+
+    pub fn update_step_attempt_status(
+        &mut self,
+        attempt_id: i64,
+        status: &str,
+        finished_at: &str,
+    ) -> Result<()> {
+        update_step_attempt_status(&self.conn, attempt_id, status, finished_at)
+    }
+
+    pub fn update_step_attempt_child_session(
+        &mut self,
+        attempt_id: i64,
+        child_session_id: Option<&str>,
+    ) -> Result<()> {
+        update_step_attempt_child_session(&self.conn, attempt_id, child_session_id)
+    }
+
+    pub fn finalize_step_attempt(
+        &mut self,
+        attempt_id: i64,
+        status: &str,
+        finished_at: &str,
+        summary_json: &str,
+        checks_json: &str,
+    ) -> Result<()> {
+        finalize_step_attempt(
+            &self.conn,
+            attempt_id,
+            status,
+            finished_at,
+            summary_json,
+            checks_json,
+        )
+    }
+
+    pub fn finalize_stale_step_attempts(
+        &mut self,
+        plan_run_id: &str,
+        revision: i64,
+    ) -> Result<u64> {
+        finalize_stale_step_attempts(&self.conn, plan_run_id, revision)
+    }
+
+    pub fn get_step_attempts(
+        &self,
+        plan_run_id: &str,
+        step_index: i64,
+    ) -> Result<Vec<StepAttempt>> {
+        get_step_attempts(&self.conn, plan_run_id, step_index)
+    }
 }

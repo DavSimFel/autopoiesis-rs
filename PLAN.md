@@ -1,333 +1,357 @@
-# Session 9 Plan
-
-## 1. Files Read
-
-Required standards/config/docs:
-
-```text
-CODE_STANDARD.md
-Cargo.toml
-agents.toml
-AGENTS.md
-README.md
-docs/risks.md
-docs/architecture/overview.md
-docs/specs/restructure-plan.md
-xtask/lint.sh
-tests/MANUAL.md
-tests/integration.rs
-tests/plan_engine.rs
-tests/shipped_shell_policy.rs
-tests/tier_integration.rs
-tests/xtask_lint_paths.sh
-```
-
-All Rust source under `src/`:
-
-```text
-src/agent/audit.rs
-src/agent/loop_impl.rs
-src/agent/loop_impl/tests.rs
-src/agent/mod.rs
-src/agent/queue.rs
-src/agent/queue/tests.rs
-src/agent/shell_execute.rs
-src/agent/spawn.rs
-src/agent/spawn/tests.rs
-src/agent/tests.rs
-src/agent/tests/common.rs
-src/agent/tests/regression_tests.rs
-src/agent/usage.rs
-src/app/args.rs
-src/app/mod.rs
-src/app/plan_commands.rs
-src/app/session_run.rs
-src/app/subscription_commands.rs
-src/app/tracing.rs
-src/auth.rs
-src/config/agents.rs
-src/config/domains.rs
-src/config/file_schema.rs
-src/config/load.rs
-src/config/mod.rs
-src/config/models.rs
-src/config/policy.rs
-src/config/runtime.rs
-src/config/spawn_runtime.rs
-src/config/tests.rs
-src/context/history.rs
-src/context/identity_prompt.rs
-src/context/mod.rs
-src/context/skill_instructions.rs
-src/context/skill_summaries.rs
-src/context/subscriptions.rs
-src/context/tests.rs
-src/delegation.rs
-src/gate/budget.rs
-src/gate/command_path_analysis.rs
-src/gate/exfil_detector.rs
-src/gate/mod.rs
-src/gate/output_cap.rs
-src/gate/protected_paths.rs
-src/gate/secret_catalog.rs
-src/gate/secret_redactor.rs
-src/gate/shell_safety.rs
-src/gate/streaming_redact.rs
-src/identity.rs
-src/lib.rs
-src/llm/history_groups.rs
-src/llm/mod.rs
-src/llm/openai.rs
-src/logging.rs
-src/main.rs
-src/model_selection.rs
-src/plan.rs
-src/plan/executor.rs
-src/plan/notify.rs
-src/plan/patch.rs
-src/plan/recovery.rs
-src/plan/runner.rs
-src/principal.rs
-src/read_tool.rs
-src/server/auth.rs
-src/server/http.rs
-src/server/mod.rs
-src/server/queue.rs
-src/server/queue_worker.rs
-src/server/session_lock.rs
-src/server/state.rs
-src/server/ws.rs
-src/session/budget.rs
-src/session/delegation_hint.rs
-src/session/jsonl.rs
-src/session/mod.rs
-src/session/tests.rs
-src/session/trimming.rs
-src/session_runtime/drain.rs
-src/session_runtime/factory.rs
-src/session_runtime/mod.rs
-src/skills.rs
-src/spawn.rs
-src/store/message_queue.rs
-src/store/migrations.rs
-src/store/mod.rs
-src/store/plan_runs.rs
-src/store/sessions.rs
-src/store/step_attempts.rs
-src/store/subscriptions.rs
-src/subscription.rs
-src/template.rs
-src/terminal_ui.rs
-src/time.rs
-src/tool.rs
-src/turn/builders.rs
-src/turn/mod.rs
-src/turn/tests.rs
-src/turn/tiers.rs
-src/turn/verdicts.rs
-src/util.rs
-```
-
-## 2. Exact Changes Per File
-
-Delete list:
-
-- `src/spawn.rs`
-- `src/agent/spawn.rs`
-- `src/agent/spawn/tests.rs`
-- `src/llm/openai.rs`
-- `src/util.rs`
-
-Planned file changes:
-
-- `src/child_session/mod.rs` (new)
-  Public child-session facade. Reexport only the requested public surface: `SpawnRequest`, `SpawnResult`, `SpawnDrainResult`, `spawn_child()`, and `enqueue_child_completion()`. Keep `should_enqueue_child_completion()`, assistant-response helpers, and child-metadata parsing `pub(crate)` so the cleanup does not accidentally widen the public API.
-
-- `src/child_session/create.rs` (new, moved out of `src/spawn.rs`)
-  Move `SpawnRequest`, `SpawnResult`, `ChildSessionMetadata`, `parse_child_session_metadata()`, `validate_spawn_budget()`, `resolve_model()`, `validate_tier()`, `resolve_spawn_tier()`, `validate_requested_skills()`, `generate_child_session_id()`, and `spawn_child()`. Keep the existing spawn validation/model/skill tests here.
-
-- `src/child_session/completion.rs` (new, moved out of `src/spawn.rs`)
-  Move `enqueue_child_completion()`, `should_enqueue_child_completion()`, `build_completion_message()`, and assistant-response extraction. Keep only `enqueue_child_completion()` public; the other helpers stay crate-private. Add the bug fix here: treat empty or whitespace-only assistant text as absent before composing the parent completion payload. Use the latest non-empty agent assistant text from session history before falling back to `No assistant response was produced.`. Move the completion-focused unit tests here and tighten them around non-blank payloads.
-
-- `src/agent/child_drain.rs` (rename from `src/agent/spawn.rs`)
-  Rename the module/file only, update imports from `crate::spawn::*` to `crate::child_session::*`, and keep `SpawnDrainContext`, `finish_spawned_child_drain()`, `spawn_and_drain_with_provider()`, `spawn_and_drain()`, and T2 plan handoff intact. No stream/runtime behavior change beyond the module rename.
-
-- `src/agent/child_drain/tests.rs` (rename from `src/agent/spawn/tests.rs`)
-  Update the module import from `crate::agent::spawn` to `crate::agent::child_drain`. Keep the existing runtime-config, plan-handoff, stale-history, and approval tests. Add or update the regression coverage so a tool-call-only child turn cannot yield a blank parent completion.
-
-- `src/agent/mod.rs`
-  Change `mod spawn;` to `mod child_drain;`. Reexport child-session DTOs from `crate::child_session` instead of `crate::spawn`. Reexport `spawn_and_drain`, `SpawnDrainContext`, and `finish_spawned_child_drain` from `child_drain`. Update the wrapper `spawn_child()` to call `crate::child_session::spawn_child()`. Final state: no public `spawn` module path remains.
-
-- `src/session_runtime/drain.rs`
-  Replace `use crate::spawn;` and every `crate::spawn::*` call with `crate::child_session::*` or direct helper imports. Keep queue-claim and completion-enqueue control flow unchanged.
-
-- `src/plan/runner.rs`
-  Replace `crate::spawn::SpawnRequest`, `crate::spawn::SpawnResult`, and `crate::spawn::spawn_child()` with `crate::child_session::*`. Keep the `SpawnDrainContext` / `finish_spawned_child_drain()` import aligned with the renamed `agent::child_drain` reexports. Update `utc_timestamp` import at the same time.
-
-- `src/llm/openai/mod.rs` (new)
-  Keep `OpenAIProvider`, `new()`, `with_client()`, the HTTP transport loop, chunk buffering, trailing-buffer parse, terminal-event enforcement, and `impl LlmProvider`. Keep the public path `crate::llm::openai::OpenAIProvider` stable so root integration tests do not need an OpenAI import path rewrite.
-
-- `src/llm/openai/request.rs` (new)
-  Move `build_input()` and `build_tools()` here, along with the request-shape tests that assert first-system-message instructions extraction, later system replay, audit-note replay, tool-call mapping, tool-result mapping, and flat `tools` payload shape.
-
-- `src/llm/openai/sse.rs` (new)
-  Move `SseEvent`, `parse_sse_line()`, `upsert_tool_call()`, `finalize_function_call()`, `finalize_output_item()`, `SseStreamState`, `apply_sse_event()`, `require_terminal_sse_event()`, and `note_terminal_sse_event()` here, with the parser/state-machine tests. Preserve the exact stream behavior: function-call ordering, interleaved deltas, trailing buffer parsing, multiple events per chunk, missing-id/name drop behavior, and terminal-event failure.
-
-- `src/llm/mod.rs`
-  Keep `pub mod openai;` but point it at the new directory module layout. No public API rename.
-
-- `src/store/mod.rs`
-  Replace `use crate::util::utc_timestamp;` with `use crate::time::utc_timestamp;` everywhere in this file, including test code. Leave `format_system_time()` in place so this cleanup does not silently change the public `store` surface or broaden scope beyond the requested `util.rs` removal.
-
-- `src/agent/loop_impl.rs`
-  Replace `use crate::util::utc_timestamp;` with `use crate::time::utc_timestamp;`.
-
-- `src/plan/notify.rs`
-  Replace `use crate::util::utc_timestamp;` with `use crate::time::utc_timestamp;`.
-
-- `src/plan/patch.rs`
-  Replace `use crate::util::utc_timestamp;` with `use crate::time::utc_timestamp;`.
-
-- `src/session/jsonl.rs`
-  Replace `use crate::util::utc_timestamp;` with `use crate::time::utc_timestamp;`.
-
-- `src/store/message_queue.rs`
-  Replace `use crate::util::utc_timestamp;` with `use crate::time::utc_timestamp;`.
-
-- `src/store/plan_runs.rs`
-  Replace `use crate::util::utc_timestamp;` with `use crate::time::utc_timestamp;`.
-
-- `src/store/sessions.rs`
-  Replace `use crate::util::utc_timestamp;` with `use crate::time::utc_timestamp;`.
-
-- `src/store/step_attempts.rs`
-  Replace `use crate::util::utc_timestamp;` with `use crate::time::utc_timestamp;`.
-
-- `src/util.rs`
-  Delete it after every call site moves to `crate::time`. No compatibility alias in the final tree.
-
-- `src/lib.rs`
-  Add `pub mod child_session;`. Remove `pub mod spawn;` and `pub mod util;`. Keep `pub mod time;`. Update any root reexports so downstream code reaches child-session types via `child_session`, not `spawn`.
-
-- `src/server/queue.rs`
-  Update the regression test `drain_queue_enqueues_completion_when_persisted_history_exists_but_new_assistant_response_is_empty` to assert the parent completion is non-blank and uses the newest non-empty agent assistant text (or the fallback string if none exists), instead of tolerating an empty payload body.
-
-- `tests/tier_integration.rs`
-  Replace `autopoiesis::spawn::{SpawnRequest, SpawnResult}` and every `autopoiesis::spawn::*` call with `autopoiesis::child_session::*`. Keep the tier/runtime/skill/completion assertions the same apart from the renamed path.
-
-- `tests/MANUAL.md`
-  Add an architecture spot-check item so the manual checklist reflects the new paths: `src/child_session/`, `src/agent/child_drain.rs`, `src/llm/openai/{mod,request,sse}.rs`, and the removal of `src/util.rs`.
-
-- `README.md`
-  Update the architecture tree from `spawn.rs`, `agent/spawn.rs`, `llm/openai.rs`, and `util.rs` to the new module tree. Also refresh the stale current-state file/line counts if README is intended to describe the checked-in repo.
-
-- `docs/architecture/overview.md`
-  Update current-state path references to `src/child_session/*`, `src/agent/child_drain.rs`, and `src/llm/openai/{mod,request,sse}.rs`. Replace the `src/util.rs` note with `src/time.rs`. Refresh the stale file/line/test counts.
-
-- `AGENTS.md`
-  Update the note that currently says `src/llm/openai.rs` has the SSE parser to point at `src/llm/openai/sse.rs`. If the on-disk AGENTS summary is kept current, also refresh the module tree wording for child-session helpers.
-
-Files read but not expected to need path edits:
-
-- `tests/integration.rs`
-  The import path `autopoiesis::llm::openai::OpenAIProvider` should remain stable after the split, so this file should only change if the module split accidentally breaks visibility.
-
-- `tests/plan_engine.rs`
-  No path change expected. Read for plan-run/spawn-step invariants only.
-
-- `tests/shipped_shell_policy.rs`
-  No path change expected. Read for shipped-config coverage only.
-
-- `tests/constitution/results/1st_person/07_irreversible_delete.txt`
-  Explicitly treat this as a historical text fixture unless the constitution-result corpus is being regenerated in the same session. If it is left unchanged, exclude `tests/constitution/results/` from the stale-path verification sweep instead of leaving those references as accidental stragglers.
-
-- `docs/specs/restructure-plan.md`
-  Explicitly treat this as a historical planning/spec document unless the restructure spec itself is being refreshed in the same session. If it is left unchanged, exclude it from the stale-path verification sweep so intentional historical path references do not create false failures.
-
-## 3. What Tests To Write
-
-- Child completion regression in `src/child_session/completion.rs`
-  Assert that `build_completion_message()` ignores `Some("")` and `Some("   ")`.
-  Assert that an empty fresh assistant response falls back to the newest non-empty agent assistant text in session history.
-  Assert that if there is no non-empty agent assistant text at all, the payload uses `No assistant response was produced.`.
-
-- Queue/drain regression in `src/server/queue.rs`
-  Tighten `drain_queue_enqueues_completion_when_persisted_history_exists_but_new_assistant_response_is_empty` so it rejects blank payloads, not just stale-history leakage.
-
-- Child-drain stale-history invariant in `src/agent/child_drain/tests.rs`
-  Keep the existing assertion that non-agent/inbound assistant history does not become `last_assistant_response`.
-  If the completion fix is scoped only to payload building, also assert that `finish_spawned_child_drain()` return semantics stay unchanged.
-
-- OpenAI request-builder tests
-  Move the current `build_input*` and `build_tools*` tests into `request.rs` unchanged. The invariant is request-shape stability, not new behavior.
-
-- OpenAI SSE/parser tests
-  Move the current parser/state tests into `sse.rs` unchanged. The invariant is byte-for-byte stream behavior preservation: chunk splits, trailing buffer handling, terminal-event enforcement, tool-call ordering, and missing-id/name rejection.
-
-- OpenAI transport test
-  Keep the HTTP-level `stream_completion_requires_terminal_sse_event_through_http` test in `openai/mod.rs` so the split still proves end-to-end behavior did not change.
-
-- Public-path compilation coverage
-  `tests/tier_integration.rs` becomes the root-level proof that the public import path is now `autopoiesis::child_session::*` and not `autopoiesis::spawn::*`.
-
-## 4. Order Of Operations
-
-1. Move the time helpers first.
-   Do only the requested `util.rs` cleanup: flip every `crate::util::utc_timestamp` call site to `crate::time::utc_timestamp`, including `src/store/mod.rs`, run the focused store/session/plan tests, then delete `src/util.rs`.
-
-2. Introduce `src/child_session/`.
-   Move `src/spawn.rs` into `src/child_session/create.rs` and `src/child_session/completion.rs`, add `src/child_session/mod.rs`, port the existing spawn/completion tests into the new files, and update `src/lib.rs`, `src/agent/mod.rs`, `src/session_runtime/drain.rs`, `src/plan/runner.rs`, and `tests/tier_integration.rs` in the same compile boundary before deleting `src/spawn.rs`.
-
-3. Rename the agent drain module.
-   Rename `src/agent/spawn.rs` to `src/agent/child_drain.rs` and `src/agent/spawn/tests.rs` to `src/agent/child_drain/tests.rs`, update `agent/mod.rs` and any internal imports, then run the focused child-drain, plan-runner, and tier tests.
-
-4. Land the blank-completion fix while the completion helpers are isolated.
-   Implement the blank-as-absent normalization inside `child_session/completion.rs`, update the server queue regression and the completion unit tests, and re-run the focused completion/drain tests before touching OpenAI.
-
-5. Split `src/llm/openai.rs` in one compile-boundary patch.
-   Because Rust cannot keep both `src/llm/openai.rs` and `src/llm/openai/mod.rs` at once, add `src/llm/openai/{mod.rs,request.rs,sse.rs}`, move the code in one step, update tests in the same patch, then delete `src/llm/openai.rs`.
-
-6. Update docs and the manual checklist last.
-   Patch `tests/MANUAL.md`, `README.md`, `docs/architecture/overview.md`, and `AGENTS.md` after the final source paths exist so the docs reflect the final tree, not an intermediate one. Treat `tests/constitution/results/` and `docs/specs/restructure-plan.md` as historical unless they are explicitly regenerated or refreshed in this session.
-
-7. Run verification in this order.
-   Focused tests after each step:
-   `cargo test child_completion`
-   `cargo test finish_spawned_child_drain`
-   `cargo test drain_queue_enqueues_completion_when_persisted_history_exists_but_new_assistant_response_is_empty`
-   `cargo test openai`
-   `cargo test --test tier_integration`
-
-   Tree-sweep verification before the full suite:
-   Run a targeted grep for stale code/doc paths and old module imports, excluding `tests/constitution/results/` and `docs/specs/restructure-plan.md` if those references are intentionally left historical.
-   Check for `crate::spawn`, `autopoiesis::spawn`, `crate::util`, `src/spawn.rs`, `src/agent/spawn.rs`, `src/llm/openai.rs`, and `src/util.rs` in `src/`, `tests/`, `README.md`, `docs/`, and `AGENTS.md`.
-
-   Final required checks:
-   `cargo build --release`
-   `cargo fmt --check`
-   `cargo clippy -- -D warnings`
-   `cargo test`
-   `xtask/lint.sh`
-
-   Conditional live check if auth exists:
-   `cargo test --features integration --test integration`
-
-## 5. Risk Assessment
-
-- `src/llm/openai.rs` is the highest-risk split.
-  The parser is protocol-sensitive. A visibility-only refactor can still change stream behavior if the chunk loop, trailing-buffer parse, or stop-reason state machine drifts. Mitigation: move the existing logic with minimal edits and keep the current tests, not rewritten approximations.
-
-- The blank-completion fix can easily widen behavior if applied in the wrong place.
-  If blank filtering is pushed into the generic `last_assistant_response` path, it may change `SpawnDrainResult.last_assistant_response` and plan-step summaries, not just parent completion payloads. Mitigation: scope the normalization to completion payload construction unless a caller explicitly wants normalized text.
-
-- `spawn.rs` to `child_session/` is a public API rename.
-  Internal callers are straightforward, but root tests and any downstream code using `autopoiesis::spawn::*` will fail. Mitigation: switch every internal caller first, then remove the old module, and grep the tree for `crate::spawn`, `autopoiesis::spawn`, and `agent::spawn`.
-
-- `util.rs` removal is mechanically simple but touches persistence code everywhere.
-  Timestamp helpers are used by store/session/plan code, so a missed import causes broad compile failures. Mitigation: do the time move first and finish it fully before the larger rename/split work.
-
-- Moving `format_system_time()` out of `src/store/mod.rs` must preserve exact formatting.
-  Subscription ordering and update tests rely on the current microsecond UTC string shape. Mitigation: copy the implementation exactly and add direct format tests in `src/time.rs`.
-
-- The docs are already stale on current counts and paths.
-  `README.md` and `docs/architecture/overview.md` still describe the old tree and old file counts. Mitigation: update them only after the source moves are complete, then refresh the counts once from the final tree.
+# PLAN
+
+## Tool Output Summaries
+
+- `npx jscpd src/ --min-lines 5 --min-tokens 50`
+  - 94 Rust files analyzed
+  - 23,308 total lines
+  - 170 clone groups
+  - 1,938 duplicated lines
+  - 8.31% duplicated lines / 9.33% duplicated tokens
+  - Production hotspots confirmed by direct file reads: `src/store/mod.rs`, `src/store/plan_runs.rs`, `src/store/step_attempts.rs`, `src/gate/command_path_analysis.rs`, `src/session_runtime/drain.rs`, `src/agent/queue.rs`, `src/plan/executor.rs`
+- `tokei src/ --sort lines`
+  - 104 Rust files
+  - 37,925 total lines
+  - 34,144 code
+  - 3,720 blanks
+  - 61 comments
+- Grep / structural evidence collected before planning
+  - `src/store/mod.rs:183-507` is a 325-line `impl Store` block dominated by forwarding methods; the pure forwarding surface across sessions, queue, plan runs, step attempts, and subscriptions is about 303 lines.
+  - `src/plan/executor.rs:1-20` is a pure wrapper around `crate::agent::shell_execute::guarded_shell_execute_call`.
+  - `src/session_runtime/drain.rs:407-460`, `src/session_runtime/drain.rs:468-580`, and `src/agent/queue.rs:19-129` form a 278-line queue/drain wrapper and duplicated-role cluster.
+  - `src/store/plan_runs.rs:50-137`, `src/store/plan_runs.rs:179-205`, `src/store/plan_runs.rs:208-238`, `src/store/plan_runs.rs:247-345`, `src/store/plan_runs.rs:386-418`, `src/store/plan_runs.rs:421-487`, `src/store/plan_runs.rs:519-549`, and `src/store/plan_runs.rs:551-588` form about 414 lines of repeated plan-run SQL/update/query patterns.
+  - `src/store/step_attempts.rs:59-113`, `src/store/step_attempts.rs:171-267`, and `src/store/step_attempts.rs:270-313` form about 196 lines of repeated step-attempt validation/finalization logic.
+  - `src/gate/command_path_analysis.rs:45-277` and `src/gate/command_path_analysis.rs:287-430` contain the write-side `identity_template_*` detection chains; `src/gate/command_path_analysis.rs:1019-1442` contains the protected/target read-side pairs.
+- Signature Test output
+  - `src/plan/runner.rs` contains these 5+ parameter helpers:
+    - `build_step_call_id` at line 120
+    - `run_check` at line 278
+    - `run_checks` at line 339
+    - `finalize_attempt` at line 357
+    - `build_step_crash` at line 456
+    - `build_waiting_t2_failure_details` at line 476
+  - This scan was run. The signatures are real, but they are not a better first optimization target than the larger verified store/gate/drain duplication surfaces above.
+- One More Case Test output
+  - `src/session_runtime/drain.rs:483-518` and `src/session_runtime/drain.rs:542-580` duplicate the same `match message.role.as_str()` bookkeeping arms.
+  - `src/store/plan_runs.rs:101-127` duplicates the same `NullableUpdate` branch shape twice.
+  - `src/plan/notify.rs:116-178` repeats the same `waiting_t2` update statement across the three `NullableUpdate` arms.
+  - `src/plan/patch.rs:170-197` is a one-arm status dispatcher worth leaving alone for now because it is small relative to the larger confirmed wins.
+
+## Files Read
+
+- Control/config/docs: `FEEDBACK.md`, `TASK.md`, previous `PLAN.md`, `Cargo.toml`, `agents.toml`, `docs/risks.md`, `docs/architecture/overview.md`
+- `src/agent/`: `audit.rs`, `child_drain.rs`, `child_drain/tests.rs`, `loop_impl.rs`, `loop_impl/tests.rs`, `mod.rs`, `queue.rs`, `queue/tests.rs`, `shell_execute.rs`, `tests.rs`, `tests/common.rs`, `tests/regression_tests.rs`, `usage.rs`
+- `src/app/`: `args.rs`, `mod.rs`, `plan_commands.rs`, `session_run.rs`, `subscription_commands.rs`, `tracing.rs`
+- `src/`: `auth.rs`, `delegation.rs`, `identity.rs`, `lib.rs`, `logging.rs`, `main.rs`, `model_selection.rs`, `plan.rs`, `principal.rs`, `read_tool.rs`, `skills.rs`, `subscription.rs`, `template.rs`, `terminal_ui.rs`, `time.rs`, `tool.rs`
+- `src/child_session/`: `completion.rs`, `create.rs`, `mod.rs`
+- `src/config/`: `agents.rs`, `domains.rs`, `file_schema.rs`, `load.rs`, `mod.rs`, `models.rs`, `policy.rs`, `runtime.rs`, `spawn_runtime.rs`, `tests.rs`
+- `src/context/`: `history.rs`, `identity_prompt.rs`, `mod.rs`, `skill_instructions.rs`, `skill_summaries.rs`, `subscriptions.rs`, `tests.rs`
+- `src/gate/`: `budget.rs`, `command_path_analysis.rs`, `exfil_detector.rs`, `mod.rs`, `output_cap.rs`, `protected_paths.rs`, `secret_catalog.rs`, `secret_redactor.rs`, `shell_safety.rs`, `streaming_redact.rs`
+- `src/llm/`: `history_groups.rs`, `mod.rs`, `openai/mod.rs`, `openai/request.rs`, `openai/sse.rs`
+- `src/plan/`: `executor.rs`, `notify.rs`, `patch.rs`, `recovery.rs`, `runner.rs`
+- `src/server/`: `auth.rs`, `http.rs`, `mod.rs`, `queue.rs`, `queue_worker.rs`, `session_lock.rs`, `state.rs`, `ws.rs`
+- `src/session/`: `budget.rs`, `delegation_hint.rs`, `jsonl.rs`, `mod.rs`, `tests.rs`, `trimming.rs`
+- `src/session_runtime/`: `drain.rs`, `factory.rs`, `mod.rs`
+- `src/store/`: `message_queue.rs`, `migrations.rs`, `mod.rs`, `plan_runs.rs`, `sessions.rs`, `step_attempts.rs`, `subscriptions.rs`
+- `src/turn/`: `builders.rs`, `mod.rs`, `tests.rs`, `tiers.rs`, `verdicts.rs`
+
+## Planned Optimizations
+
+### 1. Delete the thin plan shell-executor wrapper
+
+- What
+  - Remove `src/plan/executor.rs` and call the shared guarded shell executor directly from `src/plan/runner.rs`.
+- Where
+  - `src/plan/executor.rs:1-20`
+  - `src/plan/runner.rs`
+  - `src/plan.rs`
+- Measured line count
+  - 20 production lines exactly.
+- Exact changes per file
+  - `src/plan/runner.rs`: replace both `crate::plan::executor::guarded_shell_execute_call(...)` call sites with `crate::agent::shell_execute::guarded_shell_execute_call(...)`.
+  - `src/plan/executor.rs`: delete the wrapper function.
+  - `src/plan.rs`: remove `pub(crate) mod executor;`.
+  - `src/agent/shell_execute.rs` or `src/plan/runner.rs`: host any relocated regression that only existed to cover the wrapper.
+- Expected production lines saved
+  - 20.
+- Risk
+  - Low.
+
+### 2. Collapse the queue/drain wrapper layer and unify the duplicated role handlers
+
+- What
+  - Merge the duplicated fixed-turn and fresh-turn queue-processing paths and shrink `src/agent/queue.rs` to the minimum stable API surface.
+- Where
+  - `src/agent/queue.rs:19-129`
+  - `src/session_runtime/drain.rs:407-460`
+  - `src/session_runtime/drain.rs:468-580`
+- Measured line count
+  - 278 lines of wrapper/duplicated surface.
+- Exact changes per file
+  - `src/session_runtime/drain.rs`: add one shared helper for `"system"`, `"assistant"`, and unsupported roles so only the `"user"` arm differs between fixed-turn and fresh-turn processing.
+  - `src/session_runtime/drain.rs`: keep `drain_queue_with_stats(...)` and `drain_queue_with_stats_fresh_turns(...)`, but route both through the same processor shape instead of two hand-written `match message.role.as_str()` blocks.
+  - `src/session_runtime/drain.rs`: factor the `StoreDrainBackend::new(store)` / `SharedStoreDrainBackend::new(store)` wrappers into a smaller explicit helper so `drain_queue_with_store(...)` and `drain_queue_with_shared_store(...)` stop re-spelling the same call body.
+  - `src/agent/queue.rs`: keep `pub async fn drain_queue(...)` as the stable entry point, but remove redundant wrapper bodies wherever a re-export or one-line delegating shim is enough.
+- Expected production lines saved
+  - About 145.
+- Risk
+  - Medium.
+
+### 3. Move `Store` methods into responsibility modules and delete the forwarding block in `src/store/mod.rs`
+
+- What
+  - Keep `Store` construction, migrations, transactions, and shared types in `src/store/mod.rs`, but move the responsibility-specific `impl Store` methods into the modules that already contain the real behavior.
+- Where
+  - `src/store/mod.rs:183-507`
+  - `src/store/sessions.rs`
+  - `src/store/message_queue.rs`
+  - `src/store/plan_runs.rs`
+  - `src/store/step_attempts.rs`
+  - `src/store/subscriptions.rs`
+- Measured line count
+  - 325 lines in the forwarding block, about 303 of them pure delegation.
+- Exact changes per file
+  - `src/store/mod.rs`: keep `Store`, constructors, migration/bootstrap wiring, transaction helpers, row decoders shared across modules, and shared clock/path helpers; delete the forwarding methods for sessions, queue, plan runs, step attempts, and subscriptions.
+  - `src/store/sessions.rs`: add a local `impl Store` for session creation/listing/parent lookup methods.
+  - `src/store/message_queue.rs`: add a local `impl Store` for queue enqueue/dequeue/status methods and keep `enqueue_message_in_transaction(...)` beside the queue SQL.
+  - `src/store/plan_runs.rs`: add a local `impl Store` for plan-run lifecycle methods and keep the claim/recovery internals private.
+  - `src/store/step_attempts.rs`: add a local `impl Store` for step-attempt lifecycle methods and keep the transaction helper private or `pub(crate)` only where needed.
+  - `src/store/subscriptions.rs`: add a local `impl Store` for create/delete/list/refresh subscription methods and keep the `#[cfg(test)]` refresh helper in the same responsibility boundary.
+- Expected production lines saved
+  - About 285.
+- Risk
+  - Medium-low.
+
+### 4. Factor the repeated plan-run SQL/update/query boilerplate
+
+- What
+  - Remove the repeated `plan_runs` SELECT projection, repeated claim query bodies, repeated status-update execution, and repeated transition helpers in `src/store/plan_runs.rs`.
+- Where
+  - `src/store/plan_runs.rs:50-137`
+  - `src/store/plan_runs.rs:179-205`
+  - `src/store/plan_runs.rs:208-238`
+  - `src/store/plan_runs.rs:247-345`
+  - `src/store/plan_runs.rs:386-418`
+  - `src/store/plan_runs.rs:421-487`
+  - `src/store/plan_runs.rs:519-549`
+  - `src/store/plan_runs.rs:551-588`
+- Measured line count
+  - About 414 lines of repeated or near-identical SQL/update/query structure.
+- Exact changes per file
+  - `src/store/plan_runs.rs`: introduce one shared plan-run column projection constant or builder used by `get_plan_run`, `list_plan_runs_by_session`, `list_recent_plan_runs`, `list_recent_active_plan_runs`, and `list_stale_running_plan_runs`.
+  - `src/store/plan_runs.rs`: introduce one internal helper that executes a status update SQL string and owns the `changed == 0` / `bool` handling so `update_plan_run_status(...)` and `update_plan_run_status_preserving_failed(...)` stop duplicating the same call pattern.
+  - `src/store/plan_runs.rs`: collapse the two `NullableUpdate` match blocks in `build_plan_run_status_update_sql(...)` into one helper that appends a nullable column assignment.
+  - `src/store/plan_runs.rs`: collapse `claim_pending_plan_run_in_transaction(...)` and `claim_next_runnable_plan_run(...)` into one parameterized claim helper with caller-specific context strings.
+  - `src/store/plan_runs.rs`: collapse `resume_waiting_plan_run(...)` and `cancel_plan_run(...)` into a shared transition helper that varies only the target status and allowed source statuses.
+- Expected production lines saved
+  - About 140.
+- Risk
+  - Medium.
+
+### 5. Factor the repeated step-attempt validation and running-attempt finalization boilerplate
+
+- What
+  - Reduce the repeated running-only update guards, repeated validation blocks, and repeated stale/crash finalization loops in `src/store/step_attempts.rs`.
+- Where
+  - `src/store/step_attempts.rs:59-113`
+  - `src/store/step_attempts.rs:171-267`
+  - `src/store/step_attempts.rs:270-313`
+- Measured line count
+  - About 196 lines of repeated step-attempt logic.
+- Exact changes per file
+  - `src/store/step_attempts.rs`: add one helper for "update a running unfinished step attempt and error if nothing changed" so `update_step_attempt_status(...)`, `update_step_attempt_child_session(...)`, and `finalize_step_attempt(...)` stop repeating the same changed-row guard.
+  - `src/store/step_attempts.rs`: move the repeated field validation in `record_step_attempt(...)` and `finalize_step_attempt(...)` into small named validators.
+  - `src/store/step_attempts.rs`: reuse one query helper to load the running attempts that need to be crashed or finalized, then feed them through one finalization path instead of maintaining two separate loop bodies.
+- Expected production lines saved
+  - About 70.
+- Risk
+  - Medium.
+
+### 6. Generalize the write-side `identity_template_*` detection chains in `command_path_analysis.rs`
+
+- What
+  - Refactor the write-side heuristics into shared helpers instead of parallel command/interpreter/redirection scanners.
+- Where
+  - `src/gate/command_path_analysis.rs:45-277`
+  - `src/gate/command_path_analysis.rs:287-430`
+- Measured line count
+  - About 377 lines of write-side heuristic surface.
+- Exact changes per file
+  - `src/gate/command_path_analysis.rs`: introduce one shared helper for inline-script interpreters so the `perl`, `python`, `ruby`, and `node` branches stop re-spelling the same "scan args after a code flag and check the script" loop.
+  - `src/gate/command_path_analysis.rs`: factor direct-write command handling into smaller helpers for destination-argument commands, in-place edit commands, redirection-driven writes, and raw target mentions.
+  - `src/gate/command_path_analysis.rs`: keep `command_writes_identity_template_path(...)` and `command_writes_target_path(...)` as the outward entry points, but route target-path detection through the same write-detector helpers after path-rewrite normalization.
+  - `src/gate/command_path_analysis.rs`: keep the existing recursion depth cap, shell-wrapper handling, and target-path canonicalization behavior unchanged.
+- Expected production lines saved
+  - About 155.
+- Risk
+  - High.
+
+### 7. Generalize protected-path vs target-path read analysis in `command_path_analysis.rs`
+
+- What
+  - Preserve the existing read-side public entry points but unify the protected-path and target-path matcher families behind one internal predicate shape.
+- Where
+  - `src/gate/command_path_analysis.rs:1019-1442`
+- Measured line count
+  - 424 lines of paired read-side matching logic.
+- Exact changes per file
+  - `src/gate/command_path_analysis.rs`: introduce one internal matcher abstraction representing either protected-path matching or target-path matching.
+  - `src/gate/command_path_analysis.rs`: collapse the paired helpers `git_option_value_references_*`, `git_config_value_references_*`, `command_argument_references_*`, `grep_file_operands_refer_*`, and `simple_command_reads_*`.
+  - `src/gate/command_path_analysis.rs`: keep the current public signatures `simple_command_reads_protected_path(...)` and `simple_command_reads_target_path(...)`.
+  - `src/gate/command_path_analysis.rs`: preserve the current `git` option parsing rules, `READ_ONLY_GIT_SUBCOMMANDS`, `git_path_spec_argument(...)`, and `env` wrapper handling exactly.
+- Expected production lines saved
+  - About 135.
+- Risk
+  - High.
+
+### 8. Consolidate duplicated test fixtures into shared test support
+
+- What
+  - Treat test helpers as real code, but limit this pass to true clones and high-reuse setup. Deduplicate the repeated temp-root/store builders in crate-level test support, and keep the duplicated `ServerState` builders in server-local test support so the refactor does not depend on widening `ServerState` visibility.
+- Where
+  - `src/lib.rs`
+  - `src/test_support.rs`
+  - `src/server/mod.rs`
+  - `src/server/test_support.rs`
+  - `src/plan/notify.rs:223-234`
+  - `src/plan/patch.rs:348-359`
+  - `src/plan/recovery.rs:140-151`
+  - `src/server/auth.rs:107-152`
+  - `src/server/http.rs:175-226`
+- Measured line count
+  - 134 test lines of duplicated fixture/setup surface.
+- Exact changes per file
+  - `src/lib.rs`: add crate-root `#[cfg(test)] mod test_support;` wiring for generic temp-root/store helpers shared across the plan tests.
+  - `src/test_support.rs`: add the shared temp-root/store helper used by `notify`, `patch`, and `recovery` tests.
+  - `src/server/mod.rs`: add `#[cfg(test)] mod test_support;` so server-local test helpers stay inside the `server` visibility boundary.
+  - `src/server/test_support.rs`: add the shared server-state builder used by the server test modules without forcing broader `ServerState` visibility.
+  - `src/plan/notify.rs`, `src/plan/patch.rs`, and `src/plan/recovery.rs`: replace the local `test_store(...)` clones with `crate::test_support` helpers and keep the unique per-file fixtures local.
+  - `src/server/auth.rs` and `src/server/http.rs`: replace the duplicated `test_state()` setup with the shared `server::test_support` helper.
+  - Keep test names and assertions intact; do not move one-off helpers such as `test_plan_run(...)`, `create_waiting_plan_run(...)`, `valid_definition(...)`, or `stale_claim(...)` unless the implementation diff creates a second real call site.
+- Expected test lines saved
+  - About 85 test lines.
+- Risk
+  - Low.
+
+## Tests To Write
+
+- Shell executor regression
+  - Assert plan shell steps and shell checks still execute through `crate::agent::shell_execute::guarded_shell_execute_call`.
+  - Assert approval-allowed and approval-denied behavior is unchanged after deleting `src/plan/executor.rs`.
+- Queue/drain parity regressions
+  - Run the same queued `"system"`, `"assistant"`, and unsupported-role messages through both the fixed-turn path and the fresh-turn-builder path.
+  - Assert identical `QueueOutcome`, identical persisted history, and identical queue row terminal states.
+  - Assert the turn builder is never invoked for bookkeeping-only rows.
+  - Assert child-completion enqueueing still happens only after a non-denied agent turn.
+  - Run equivalent queue drains through both `drain_queue_with_store(...)` and `drain_queue_with_shared_store(...)` and assert identical claim, mark, and child-completion behavior.
+  - For the `*_with_stats*` wrappers, assert `processed_any` and `last_assistant_response` parity in addition to the verdict and queue-state parity.
+- Store relocation smoke test
+  - Exercise one method from each moved `Store` responsibility through `Store` itself: session create/read, queue enqueue/dequeue/mark, plan-run create/read, step-attempt record/finalize, subscription create/list/delete.
+  - Assert the public method names and behavior are unchanged after moving the `impl Store` blocks.
+- `create_child_session_with_task(...)` atomicity regression
+  - Force the enqueue leg to fail.
+  - Assert there is no orphaned child session row and no queued task row after rollback.
+- Subscription refresh override regression
+  - Assert `refresh_subscription_timestamps_with(...)` still uses the injected modified-time callback in tests and does not fall back to filesystem metadata.
+- Plan-run SQL regressions
+  - Assert `claim_next_pending_plan_run(...)` and `claim_next_runnable_plan_run(...)` preserve ordering, stale-claim semantics, and returned row contents.
+  - Assert `update_plan_run_status_preserving_failed(...)` still refuses to update a failed run.
+  - Assert `resume_waiting_plan_run(...)` only resumes `waiting_t2`.
+  - Assert `cancel_plan_run(...)` only cancels `pending`, `running`, or `waiting_t2`.
+  - Add explicit coverage for all three `NullableUpdate` arms so the helperized update path preserves `Unchanged`, `Null`, and `Value`.
+- Step-attempt regressions
+  - Assert running-only guards still reject updates for finalized attempts.
+  - Add a direct regression for `update_step_attempt_child_session(...)` so the shared running-attempt helper cannot break child-session writes while status/finalization tests still pass.
+  - Assert `crash_running_step_attempts_for_run_in_transaction(...)` and `finalize_stale_step_attempts(...)` preserve status, `finished_at`, summary JSON, and checks JSON behavior.
+  - Add one more case for "already finalized" vs "missing attempt" so the shared update helper does not collapse distinct error conditions incorrectly.
+- `command_path_analysis.rs` write-side regressions
+  - Add table-driven cases for `touch`, `rm`, `rmdir`, `tee`, `chmod`, `chown`, `cp`, `install`, `ln`, `dd`, `mv`, `sed -i`, and `git checkout` / `git restore`.
+  - Preserve positive and negative interpreter cases for `perl`, `python`, `ruby`, and `node`.
+  - Assert redirection parsing still catches real writes and ignores quoted or malformed `>` text.
+  - Add explicit coverage for `env` wrappers, `busybox sh -c`, single-token inner-script reparse, and the recursion-depth cap so the helperized detector cannot silently broaden or narrow those heuristics.
+  - Preserve the existing symlink/alias target-path rewrite cases.
+- `command_path_analysis.rs` read-side regressions
+  - Add table-driven protected-vs-target parity cases for `cat`, `head`, `tail`, `sed`, `awk`, `grep -f`, `grep --file`, plain grep file operands, and read-only `git` commands.
+  - Assert `git -c`, `--git-dir`, `--work-tree`, and alias/config shell-command cases preserve current behavior exactly.
+  - Add explicit positive `env`-wrapped read cases such as `env cat ...` and `env grep ...` so the unified matcher preserves the existing wrapped-read match path.
+  - Add explicit positive and negative git pathspec cases so the unified matcher preserves both the `git_path_spec_argument(...)` match path and the false-path behavior.
+  - Add explicit negative cases for non-read-only git subcommands and `env`-expanded commands so the unified matcher cannot overmatch on the false paths.
+- Test-support regressions
+  - Assert shared temp-root helpers still produce isolated roots and cleanly separate queue/session state across tests.
+  - Keep the total test count at 595.
+
+## Order Of Operations
+
+1. Delete `src/plan/executor.rs` and switch `src/plan/runner.rs` to the shared shell executor.
+   - Smallest deletion-first change.
+   - Land the shell-path regression in the same commit.
+2. Refactor `src/session_runtime/drain.rs` and then shrink `src/agent/queue.rs`.
+   - Keep this as one queue/drain-only commit.
+   - Land the fixed-turn vs fresh-turn parity tests in the same commit.
+3. Move the `Store` impl blocks out of `src/store/mod.rs` and into the responsibility modules without changing SQL behavior.
+   - This is the module-boundary cleanup commit.
+   - Land the `Store` smoke test, `create_child_session_with_task(...)` rollback test, and subscription refresh override regression in the same commit.
+   - Update any inline unit-test imports in the touched store modules in the same commit so visibility changes do not leave the tree temporarily broken.
+4. Refactor `src/store/plan_runs.rs` only.
+   - Keep claim/update/list SQL dedup isolated from `step_attempts`.
+   - Land the plan-run transition and `NullableUpdate` regression cases in the same commit.
+   - Keep any `src/store/plan_runs.rs` inline unit-test edits in this same commit rather than deferring them.
+5. Refactor `src/store/step_attempts.rs` only.
+   - Keep the running-attempt/finalization changes isolated from `plan_runs`.
+   - Land the running-only and stale-finalization regressions in the same commit.
+   - Keep any `src/store/step_attempts.rs` inline unit-test edits in this same commit rather than deferring them.
+6. Refactor the write-side `identity_template_*` detection code in `src/gate/command_path_analysis.rs`.
+   - Ship the write-side table-driven regression cases in the same commit.
+7. Refactor the protected-vs-target read-side matcher family in `src/gate/command_path_analysis.rs`.
+   - Ship the read-side table-driven regression cases in the same commit.
+8. Consolidate the test fixtures into shared `#[cfg(test)]` support.
+   - Keep this test-only.
+   - Do not mix it into a production refactor commit.
+   - Add the crate-root generic helper wiring and the server-local helper wiring in the same commit as the shared helpers so the test tree compiles at every step without widening `ServerState` visibility first.
+9. After each commit:
+   - Run targeted tests for the touched surface first.
+   - Then run `cargo fmt --check`.
+   - Then run `cargo clippy -- -D warnings`.
+   - Then run `cargo build --release`.
+   - Then run `cargo test`.
+   - Confirm the total test count stays at 595.
+
+## Risk Assessment
+
+- Low risk
+  - Delete `src/plan/executor.rs`
+  - Consolidate test fixtures
+- Medium risk
+  - Queue/drain consolidation
+  - `Store` impl relocation
+  - `src/store/plan_runs.rs` SQL dedup
+  - `src/store/step_attempts.rs` finalization/validation dedup
+- High risk
+  - `command_path_analysis.rs` write-side heuristic refactor
+  - `command_path_analysis.rs` read-side matcher unification
+
+Primary regression risks to watch:
+
+- Queue rows must still always end as `processed` or `failed`.
+- Child-session completion messages must still enqueue only when the current semantics say they should.
+- Fresh turn construction must still happen only for queued user messages.
+- `create_child_session_with_task(...)` must stay atomic.
+- `update_plan_run_status_preserving_failed(...)` must not resurrect failed plan runs.
+- Stale/crashed step attempts must keep the same terminal status and JSON payload behavior.
+- Protected-path and target-path detection must not weaken for `git` alias/config execution paths, pathspecs, symlinks, or shell-wrapper forms.
+
+## Total Expected Savings
+
+- Production
+  - thin plan executor wrapper deletion: 20
+  - queue/drain consolidation: about 145
+  - `Store` forwarding removal: about 285
+  - `plan_runs.rs` SQL/update/query dedup: about 140
+  - `step_attempts.rs` validation/finalization dedup: about 70
+  - `command_path_analysis.rs` write-side dedup: about 155
+  - `command_path_analysis.rs` read-side dedup: about 135
+  - total expected production savings: about 950
+- Tests
+  - shared plan/server test support: about 85
+- Combined tracked savings
+  - about 1,035 total lines

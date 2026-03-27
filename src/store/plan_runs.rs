@@ -22,6 +22,21 @@ impl ToSql for PlanRunUpdateValue {
 use super::{NullableUpdate, PlanRun, PlanRunUpdateFields, Store};
 use crate::time::utc_timestamp;
 
+const PLAN_RUN_COLUMNS_SQL: &str = r#"
+                id,
+                owner_session_id,
+                topic,
+                trigger_source,
+                status,
+                revision,
+                current_step_index,
+                active_child_session_id,
+                definition_json,
+                last_failure_json,
+                claimed_at,
+                created_at,
+                updated_at"#;
+
 pub(super) fn validate_plan_run_status(status: &str) -> Result<()> {
     match status {
         "pending" | "running" | "waiting_t2" | "completed" | "failed" => Ok(()),
@@ -136,6 +151,34 @@ fn build_plan_run_status_update_sql(
     Ok((sql, bindings))
 }
 
+fn execute_plan_run_update(
+    conn: &Connection,
+    sql: &str,
+    bindings: &[PlanRunUpdateValue],
+    context: &str,
+) -> Result<usize> {
+    conn.execute(sql, rusqlite::params_from_iter(bindings.iter()))
+        .with_context(|| context.to_string())
+}
+
+fn build_claim_plan_run_sql(order_by: &str) -> String {
+    format!(
+        "UPDATE plan_runs
+         SET status = 'running', claimed_at = ?2, updated_at = ?3
+         WHERE id = (
+             SELECT id
+             FROM plan_runs
+             WHERE status = 'pending'
+               AND (claimed_at IS NULL OR claimed_at <= ?1)
+             ORDER BY {order_by}
+             LIMIT 1
+         )
+         AND status = 'pending'
+         AND (claimed_at IS NULL OR claimed_at <= ?1)
+         RETURNING {PLAN_RUN_COLUMNS_SQL}"
+    )
+}
+
 pub(super) fn create_plan_run(
     conn: &Connection,
     id: &str,
@@ -178,24 +221,11 @@ pub(super) fn create_plan_run(
 
 pub(super) fn get_plan_run(conn: &Connection, id: &str) -> Result<Option<PlanRun>> {
     let mut statement = conn
-        .prepare(
-            "SELECT
-                id,
-                owner_session_id,
-                topic,
-                trigger_source,
-                status,
-                revision,
-                current_step_index,
-                active_child_session_id,
-                definition_json,
-                last_failure_json,
-                claimed_at,
-                created_at,
-                updated_at
+        .prepare(&format!(
+            "SELECT {PLAN_RUN_COLUMNS_SQL}
              FROM plan_runs
-             WHERE id = ?1",
-        )
+             WHERE id = ?1"
+        ))
         .context("failed to prepare get_plan_run query")?;
 
     match statement.query_row(params![id], plan_run_from_row) {
@@ -212,9 +242,8 @@ pub(super) fn update_plan_run_status(
     updated_fields: PlanRunUpdateFields,
 ) -> Result<()> {
     let (sql, bindings) = build_plan_run_status_update_sql(id, status, &updated_fields, false)?;
-    let changed = conn
-        .execute(&sql, rusqlite::params_from_iter(bindings.iter()))
-        .context("failed to update plan run status")?;
+    let changed =
+        execute_plan_run_update(conn, &sql, &bindings, "failed to update plan run status")?;
     if changed == 0 {
         return Err(anyhow::anyhow!(
             "failed to update plan run status: plan run not found"
@@ -231,9 +260,8 @@ pub(super) fn update_plan_run_status_preserving_failed(
     updated_fields: PlanRunUpdateFields,
 ) -> Result<bool> {
     let (sql, bindings) = build_plan_run_status_update_sql(id, status, &updated_fields, true)?;
-    let changed = conn
-        .execute(&sql, rusqlite::params_from_iter(bindings.iter()))
-        .context("failed to update plan run status")?;
+    let changed =
+        execute_plan_run_update(conn, &sql, &bindings, "failed to update plan run status")?;
     Ok(changed > 0)
 }
 
@@ -253,34 +281,7 @@ fn claim_pending_plan_run_in_transaction(
     let claimed_at = crate::store::unix_timestamp();
     let updated_at = utc_timestamp();
     let mut statement = tx
-        .prepare(
-            "UPDATE plan_runs
-             SET status = 'running', claimed_at = ?2, updated_at = ?3
-             WHERE id = (
-                 SELECT id
-                 FROM plan_runs
-                 WHERE status = 'pending'
-                   AND (claimed_at IS NULL OR claimed_at <= ?1)
-                 ORDER BY created_at ASC, id ASC
-                 LIMIT 1
-             )
-             AND status = 'pending'
-             AND (claimed_at IS NULL OR claimed_at <= ?1)
-             RETURNING
-                id,
-                owner_session_id,
-                topic,
-                trigger_source,
-                status,
-                revision,
-                current_step_index,
-                active_child_session_id,
-                definition_json,
-                last_failure_json,
-                claimed_at,
-                created_at,
-                updated_at",
-        )
+        .prepare(&build_claim_plan_run_sql("created_at ASC, id ASC"))
         .context("failed to prepare plan run claim query")?;
 
     match statement.query_row(
@@ -302,36 +303,7 @@ pub(super) fn claim_next_runnable_plan_run(
     let claimed_at = crate::store::unix_timestamp();
     let updated_at = utc_timestamp();
     let mut statement = conn
-        .prepare(
-            "UPDATE plan_runs
-             SET status = 'running', claimed_at = ?2, updated_at = ?3
-             WHERE id = (
-                 SELECT id
-                 FROM plan_runs
-                 WHERE status = 'pending'
-                   AND (claimed_at IS NULL OR claimed_at <= ?1)
-                 ORDER BY
-                     created_at ASC,
-                     id ASC
-                 LIMIT 1
-             )
-             AND status = 'pending'
-             AND (claimed_at IS NULL OR claimed_at <= ?1)
-             RETURNING
-                id,
-                owner_session_id,
-                topic,
-                trigger_source,
-                status,
-                revision,
-                current_step_index,
-                active_child_session_id,
-                definition_json,
-                last_failure_json,
-                claimed_at,
-                created_at,
-                updated_at",
-        )
+        .prepare(&build_claim_plan_run_sql("created_at ASC, id ASC"))
         .context("failed to prepare runnable plan run claim query")?;
 
     match statement.query_row(
@@ -388,25 +360,12 @@ pub(super) fn list_plan_runs_by_session(
     owner_session_id: &str,
 ) -> Result<Vec<PlanRun>> {
     let mut statement = conn
-        .prepare(
-            "SELECT
-                id,
-                owner_session_id,
-                topic,
-                trigger_source,
-                status,
-                revision,
-                current_step_index,
-                active_child_session_id,
-                definition_json,
-                last_failure_json,
-                claimed_at,
-                created_at,
-                updated_at
+        .prepare(&format!(
+            "SELECT {PLAN_RUN_COLUMNS_SQL}
              FROM plan_runs
              WHERE owner_session_id = ?1
-             ORDER BY created_at ASC, id ASC",
-        )
+             ORDER BY created_at ASC, id ASC"
+        ))
         .context("failed to prepare list_plan_runs_by_session query")?;
 
     let plan_runs = statement
@@ -420,25 +379,12 @@ pub(super) fn list_plan_runs_by_session(
 
 pub(super) fn list_recent_plan_runs(conn: &Connection, limit: usize) -> Result<Vec<PlanRun>> {
     let mut statement = conn
-        .prepare(
-            "SELECT
-                id,
-                owner_session_id,
-                topic,
-                trigger_source,
-                status,
-                revision,
-                current_step_index,
-                active_child_session_id,
-                definition_json,
-                last_failure_json,
-                claimed_at,
-                created_at,
-                updated_at
+        .prepare(&format!(
+            "SELECT {PLAN_RUN_COLUMNS_SQL}
              FROM plan_runs
              ORDER BY updated_at DESC, created_at DESC, id DESC
-             LIMIT ?1",
-        )
+             LIMIT ?1"
+        ))
         .context("failed to prepare list_recent_plan_runs query")?;
 
     let plan_runs = statement
@@ -455,26 +401,13 @@ pub(super) fn list_recent_active_plan_runs(
     limit: usize,
 ) -> Result<Vec<PlanRun>> {
     let mut statement = conn
-        .prepare(
-            "SELECT
-                id,
-                owner_session_id,
-                topic,
-                trigger_source,
-                status,
-                revision,
-                current_step_index,
-                active_child_session_id,
-                definition_json,
-                last_failure_json,
-                claimed_at,
-                created_at,
-                updated_at
+        .prepare(&format!(
+            "SELECT {PLAN_RUN_COLUMNS_SQL}
              FROM plan_runs
              WHERE status IN ('pending', 'running', 'waiting_t2')
              ORDER BY updated_at DESC, created_at DESC, id DESC
-             LIMIT ?1",
-        )
+             LIMIT ?1"
+        ))
         .context("failed to prepare list_recent_active_plan_runs query")?;
 
     let plan_runs = statement
@@ -555,27 +488,14 @@ pub(super) fn list_stale_running_plan_runs(
     let stale_after_secs = stale_after_secs.min(i64::MAX as u64) as i64;
     let stale_before = crate::store::unix_timestamp().saturating_sub(stale_after_secs);
     let mut statement = conn
-        .prepare(
-            "SELECT
-                id,
-                owner_session_id,
-                topic,
-                trigger_source,
-                status,
-                revision,
-                current_step_index,
-                active_child_session_id,
-                definition_json,
-                last_failure_json,
-                claimed_at,
-                created_at,
-                updated_at
+        .prepare(&format!(
+            "SELECT {PLAN_RUN_COLUMNS_SQL}
              FROM plan_runs
              WHERE status = 'running'
                AND claimed_at IS NOT NULL
                AND claimed_at <= ?1
-             ORDER BY claimed_at ASC, created_at ASC, id ASC",
-        )
+             ORDER BY claimed_at ASC, created_at ASC, id ASC"
+        ))
         .context("failed to prepare list_stale_running_plan_runs query")?;
 
     let plan_runs = statement
@@ -585,4 +505,92 @@ pub(super) fn list_stale_running_plan_runs(
         .context("failed to collect stale running plan runs")?;
 
     Ok(plan_runs)
+}
+
+impl super::Store {
+    pub fn create_plan_run(
+        &mut self,
+        id: &str,
+        owner_session_id: &str,
+        definition_json: &str,
+        topic: Option<&str>,
+        trigger_source: Option<&str>,
+    ) -> Result<()> {
+        create_plan_run(
+            &self.conn,
+            id,
+            owner_session_id,
+            definition_json,
+            topic,
+            trigger_source,
+        )
+    }
+
+    pub fn get_plan_run(&self, id: &str) -> Result<Option<PlanRun>> {
+        get_plan_run(&self.conn, id)
+    }
+
+    pub fn update_plan_run_status(
+        &mut self,
+        id: &str,
+        status: &str,
+        updated_fields: PlanRunUpdateFields,
+    ) -> Result<()> {
+        update_plan_run_status(&self.conn, id, status, updated_fields)
+    }
+
+    pub fn claim_next_pending_plan_run(
+        &mut self,
+        stale_after_secs: u64,
+    ) -> Result<Option<PlanRun>> {
+        claim_next_pending_plan_run(self, stale_after_secs)
+    }
+
+    pub fn claim_next_runnable_plan_run(
+        &mut self,
+        stale_after_secs: u64,
+    ) -> Result<Option<PlanRun>> {
+        claim_next_runnable_plan_run(&self.conn, stale_after_secs)
+    }
+
+    pub fn release_plan_run_claim(&mut self, id: &str) -> Result<()> {
+        release_plan_run_claim(&self.conn, id)
+    }
+
+    pub fn list_plan_runs_by_session(&self, owner_session_id: &str) -> Result<Vec<PlanRun>> {
+        list_plan_runs_by_session(&self.conn, owner_session_id)
+    }
+
+    pub fn list_recent_plan_runs(&self, limit: usize) -> Result<Vec<PlanRun>> {
+        list_recent_plan_runs(&self.conn, limit)
+    }
+
+    pub fn list_recent_active_plan_runs(&self, limit: usize) -> Result<Vec<PlanRun>> {
+        list_recent_active_plan_runs(&self.conn, limit)
+    }
+
+    pub fn recover_stale_plan_runs(&mut self, stale_after_secs: u64) -> Result<u64> {
+        recover_stale_plan_runs(self, stale_after_secs)
+    }
+
+    pub fn resume_waiting_plan_run(&mut self, id: &str) -> Result<bool> {
+        resume_waiting_plan_run(&self.conn, id)
+    }
+
+    pub fn cancel_plan_run(&mut self, id: &str) -> Result<bool> {
+        cancel_plan_run(&self.conn, id)
+    }
+
+    pub fn update_plan_run_status_preserving_failed(
+        &mut self,
+        id: &str,
+        status: &str,
+        updated_fields: PlanRunUpdateFields,
+    ) -> Result<bool> {
+        update_plan_run_status_preserving_failed(&self.conn, id, status, updated_fields)
+    }
+
+    pub fn list_stale_running_plan_runs(&self, stale_after_secs: u64) -> Result<Vec<PlanRun>> {
+        list_stale_running_plan_runs(&self.conn, stale_after_secs)
+    }
 }

@@ -107,3 +107,50 @@ pub(super) fn list_child_sessions(conn: &Connection, parent_id: &str) -> Result<
 
     Ok(sessions)
 }
+
+impl super::Store {
+    pub fn create_session(&mut self, session_id: &str, metadata: Option<&str>) -> Result<()> {
+        create_session(&self.conn, session_id, metadata)
+    }
+
+    /// Insert a child session that records its parent session id.
+    pub fn create_child_session(
+        &mut self,
+        parent_id: &str,
+        child_id: &str,
+        metadata: Option<&str>,
+    ) -> Result<()> {
+        create_child_session(&self.conn, parent_id, child_id, metadata)
+    }
+
+    /// Insert a child session and queue its initial task atomically.
+    pub fn create_child_session_with_task(
+        &mut self,
+        parent_id: &str,
+        child_id: &str,
+        metadata: Option<&str>,
+        task: &str,
+        source: &str,
+    ) -> Result<()> {
+        create_child_session_with_task(self, parent_id, child_id, metadata, task, source)
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<String>> {
+        list_sessions(&self.conn)
+    }
+
+    /// Return the parent session id for a child session, if one exists.
+    pub fn get_parent_session(&self, child_id: &str) -> Result<Option<String>> {
+        get_parent_session(&self.conn, child_id)
+    }
+
+    /// Return the stored metadata for a session, if the session exists.
+    pub fn get_session_metadata(&self, session_id: &str) -> Result<Option<String>> {
+        get_session_metadata(&self.conn, session_id)
+    }
+
+    /// Return child session ids ordered by creation time.
+    pub fn list_child_sessions(&self, parent_id: &str) -> Result<Vec<String>> {
+        list_child_sessions(&self.conn, parent_id)
+    }
+}

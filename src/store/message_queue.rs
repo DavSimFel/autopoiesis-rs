@@ -108,3 +108,43 @@ pub(super) fn recover_stale_messages(conn: &Connection, stale_after_secs: u64) -
         .context("failed to recover stale messages")?;
     Ok(count as u64)
 }
+
+impl super::Store {
+    pub fn enqueue_message(
+        &mut self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        source: &str,
+    ) -> Result<i64> {
+        enqueue_message(&self.conn, session_id, role, content, source)
+    }
+
+    pub(crate) fn enqueue_message_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        source: &str,
+    ) -> Result<()> {
+        enqueue_message_in_transaction(tx, session_id, role, content, source)
+    }
+
+    pub fn dequeue_next_message(&mut self, session_id: &str) -> Result<Option<QueuedMessage>> {
+        dequeue_next_message(&self.conn, session_id)
+    }
+
+    pub fn mark_processed(&mut self, message_id: i64) -> Result<()> {
+        mark_processed(&self.conn, message_id)
+    }
+
+    pub fn mark_failed(&mut self, message_id: i64) -> Result<()> {
+        mark_failed(&self.conn, message_id)
+    }
+
+    /// Recover messages stuck in 'processing' state (e.g., after a crash).
+    /// Resets them to 'pending' so they can be retried once they are stale.
+    pub fn recover_stale_messages(&mut self, stale_after_secs: u64) -> Result<u64> {
+        recover_stale_messages(&self.conn, stale_after_secs)
+    }
+}
