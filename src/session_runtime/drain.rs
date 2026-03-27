@@ -9,10 +9,10 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::agent::{ApprovalHandler, QueueOutcome, TokenSink, TurnVerdict};
+use crate::child_session;
 use crate::llm::{ChatMessage, LlmProvider, MessageContent};
 use crate::principal::Principal;
 use crate::session::Session;
-use crate::spawn;
 use crate::store::{QueuedMessage, Store};
 use crate::turn::Turn;
 
@@ -78,7 +78,7 @@ impl DrainBackend for StoreDrainBackend<'_> {
         last_assistant_response: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            crate::spawn::enqueue_child_completion(
+            child_session::enqueue_child_completion(
                 self.store,
                 session_id,
                 session,
@@ -139,7 +139,7 @@ impl DrainBackend for SharedStoreDrainBackend {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let mut guard = self.store.lock().await;
-            crate::spawn::enqueue_child_completion(
+            child_session::enqueue_child_completion(
                 &mut guard,
                 session_id,
                 session,
@@ -276,7 +276,7 @@ where
             Ok(QueueOutcome::Agent(verdict)) => {
                 backend.mark_processed(message.id).await?;
                 if !matches!(verdict, TurnVerdict::Denied { .. }) {
-                    last_assistant_response = crate::spawn::latest_assistant_response(session);
+                    last_assistant_response = child_session::latest_assistant_response(session);
                     completed_agent_turn = true;
                 }
                 match verdict {
@@ -310,7 +310,7 @@ where
         }
     }
 
-    if spawn::should_enqueue_child_completion(completed_agent_turn) {
+    if child_session::should_enqueue_child_completion(completed_agent_turn) {
         backend
             .enqueue_child_completion(session_id, session, last_assistant_response.as_deref())
             .await?;

@@ -9,20 +9,20 @@ use crate::session::Session;
 use crate::store::{QueuedMessage, Store};
 use crate::turn::Turn;
 
-pub use crate::spawn::{SpawnDrainResult, SpawnRequest, SpawnResult};
+pub use crate::child_session::{SpawnDrainResult, SpawnRequest, SpawnResult};
 
 mod audit;
+mod child_drain;
 mod loop_impl;
 mod queue;
 pub(crate) mod shell_execute;
-mod spawn;
 mod usage;
 
 pub use audit::format_denial_message;
+pub use child_drain::spawn_and_drain;
+pub(crate) use child_drain::{SpawnDrainContext, finish_spawned_child_drain};
 pub use loop_impl::run_agent_loop;
 pub use queue::drain_queue;
-pub use spawn::spawn_and_drain;
-pub(crate) use spawn::{SpawnDrainContext, finish_spawned_child_drain};
 
 /// Agent verdict returned after processing a queued message or turn.
 pub enum TurnVerdict {
@@ -72,14 +72,14 @@ where
     }
 }
 
-/// Convenience wrapper for spawning a child session through the shared spawn module.
+/// Convenience wrapper for spawning a child session through the shared child drain module.
 pub fn spawn_child(
     store: &mut Store,
     config: &Config,
     parent_budget: BudgetSnapshot,
     request: SpawnRequest,
 ) -> Result<SpawnResult> {
-    crate::spawn::spawn_child(store, config, parent_budget, request)
+    crate::child_session::spawn_child(store, config, parent_budget, request)
 }
 
 pub async fn process_message<F, Fut, P, TS, AH>(

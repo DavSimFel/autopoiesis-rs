@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use autopoiesis::Principal;
 use autopoiesis::agent::TurnVerdict;
+use autopoiesis::child_session::{SpawnRequest, SpawnResult};
 use autopoiesis::config::Config;
 use autopoiesis::gate::BudgetSnapshot;
 use autopoiesis::llm;
@@ -15,7 +16,6 @@ use autopoiesis::llm::{
     ChatMessage, ChatRole, FunctionTool, LlmProvider, MessageContent, StopReason, StreamedTurn,
     ToolCall, TurnMeta,
 };
-use autopoiesis::spawn::{SpawnRequest, SpawnResult};
 use autopoiesis::store::Store;
 use rusqlite::Connection;
 use serde::Deserialize;
@@ -142,7 +142,7 @@ fn spawn_t2_child(
     parent_session_id: &str,
     task: impl Into<String>,
 ) -> Result<SpawnResult> {
-    autopoiesis::spawn::spawn_child(
+    autopoiesis::child_session::spawn_child(
         store,
         config,
         BudgetSnapshot::default(),
@@ -167,7 +167,7 @@ fn spawn_t3_child(
     task: impl Into<String>,
     skill_name: impl Into<String>,
 ) -> Result<SpawnResult> {
-    autopoiesis::spawn::spawn_child(
+    autopoiesis::child_session::spawn_child(
         store,
         config,
         BudgetSnapshot::default(),
@@ -648,7 +648,7 @@ token_estimate = 250
         &mut approval_handler,
     )
     .await?;
-    assert!(autopoiesis::spawn::enqueue_child_completion(
+    assert!(autopoiesis::child_session::enqueue_child_completion(
         &mut store,
         &spawn_t3.child_session_id,
         &t3_session,
@@ -698,7 +698,7 @@ token_estimate = 250
         &mut approval_handler,
     )
     .await?;
-    assert!(autopoiesis::spawn::enqueue_child_completion(
+    assert!(autopoiesis::child_session::enqueue_child_completion(
         &mut store,
         &spawn_t2.child_session_id,
         &t2_session,

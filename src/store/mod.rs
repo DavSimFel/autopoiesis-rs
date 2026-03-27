@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 #[cfg(test)]
-use crate::util::utc_timestamp;
+use crate::time::utc_timestamp;
 #[cfg(test)]
 use rusqlite::params;
 

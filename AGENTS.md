@@ -132,7 +132,7 @@ A junior dev should be able to read any file and understand what it does.
 
 ### Parsers
 
-- `src/llm/openai.rs` has the SSE parser.
+- `src/llm/openai/sse.rs` has the SSE parser.
 - `src/session.rs` handles JSONL replay.
 - Prefer libraries for new parsers unless the format is tiny and fully owned.
 

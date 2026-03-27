@@ -11,10 +11,10 @@ use crate::store::Store;
 use super::queue::drain_queue_with_stats_fresh_turns;
 use super::{ApprovalHandler, SpawnDrainResult, SpawnRequest, SpawnResult, TokenSink, TurnVerdict};
 
-pub(super) type SpawnedChildMetadata = crate::spawn::ChildSessionMetadata;
+pub(super) type SpawnedChildMetadata = crate::child_session::ChildSessionMetadata;
 
 pub(super) fn parse_spawned_child_metadata(metadata: &str) -> Result<SpawnedChildMetadata> {
-    crate::spawn::parse_child_session_metadata(metadata)
+    crate::child_session::parse_child_session_metadata(metadata)
 }
 
 pub(super) async fn spawn_and_drain_with_provider<F, Fut, P, TS>(
@@ -42,7 +42,7 @@ where
         .budget_snapshot()
         .context("failed to read parent budget snapshot")?;
 
-    let spawn_result = crate::spawn::spawn_child(store, config, parent_budget, request)?;
+    let spawn_result = crate::child_session::spawn_child(store, config, parent_budget, request)?;
     let metadata_json = store
         .get_session_metadata(&spawn_result.child_session_id)?
         .ok_or_else(|| anyhow::anyhow!("spawned child session metadata is missing"))?;

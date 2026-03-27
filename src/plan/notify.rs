@@ -6,7 +6,7 @@ use std::cell::Cell;
 
 use crate::plan::runner::{CheckVerdict, ObservedOutput, PlanFailureDetails};
 use crate::store::{NullableUpdate, PlanRun, Store};
-use crate::util::utc_timestamp;
+use crate::time::utc_timestamp;
 
 #[cfg(test)]
 thread_local! {

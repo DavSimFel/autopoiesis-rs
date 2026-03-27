@@ -19,7 +19,8 @@
 - `src/agent/usage.rs` - token charging and post-turn budget helpers.
 - `src/agent/queue.rs` - queue draining for CLI/session work.
 - `src/agent/shell_execute.rs` - guarded shell execution shared by the agent loop and plan engine.
-- `src/agent/spawn.rs` - child-session creation and drain orchestration.
+- `src/agent/child_drain.rs` - child-session drain orchestration.
+- `src/child_session/{mod,create,completion}.rs` - child-session creation, metadata, and parent completion propagation.
 - `src/server/mod.rs` - server wiring.
 - `src/server/http.rs` - HTTP control plane.
 - `src/server/ws.rs` - WebSocket streaming and approval prompts.
@@ -47,7 +48,7 @@
 - `src/turn/mod.rs` - turn facade and public reexports.
 - `src/turn/{verdicts,tiers,builders}.rs` - guard verdicts, tier resolution, and turn construction.
 - `src/tool.rs` - shell tool execution primitives.
-- `src/spawn.rs` - model selection, delegation thresholding, child spawn helpers.
+- `src/child_session/{mod,create,completion}.rs` - child session spawn helpers and completion propagation.
 - `src/skills.rs` - skill catalog loading and summaries.
 - `src/subscription.rs` - subscription records, filters, token accounting.
 - `src/delegation.rs` - delegation configuration and thresholds.
@@ -58,9 +59,9 @@
 - `src/template.rs` - template-variable resolution.
 - `src/auth.rs` - OAuth/device auth.
 - `src/llm/mod.rs` - provider trait and shared LLM types.
-- `src/llm/openai.rs` - OpenAI backend and SSE parsing.
+- `src/llm/openai/{mod,request,sse}.rs` - OpenAI backend, request shaping, and SSE parsing.
 - `src/plan.rs` - plan orchestration and CLI state transitions.
-- `src/logging.rs` - tracing formatter and user-output targets; `src/util.rs` now holds timestamp helpers.
+- `src/logging.rs` - tracing formatter and user-output targets; `src/time.rs` now holds timestamp helpers.
 
 ## Execution Flow
 

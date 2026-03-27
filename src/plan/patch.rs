@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 
 use crate::plan::{PlanAction, PlanActionKind, PlanStepSpec, validate_plan_action};
 use crate::store::{PlanRun, Store};
-use crate::util::utc_timestamp;
+use crate::time::utc_timestamp;
 
 static NEXT_PLAN_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 

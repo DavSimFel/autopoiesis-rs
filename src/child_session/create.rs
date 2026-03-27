@@ -8,10 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::gate::BudgetSnapshot;
-use crate::llm::{ChatRole, MessageContent};
 use crate::model_selection::ModelSelector;
-use crate::principal::Principal;
-use crate::session::Session;
 use crate::skills::{SkillCatalog, SkillDefinition};
 use crate::store::Store;
 
@@ -234,66 +231,6 @@ pub fn spawn_child(
     })
 }
 
-pub fn enqueue_child_completion(
-    store: &mut Store,
-    child_session_id: &str,
-    session: &Session,
-    last_assistant_response: Option<&str>,
-) -> Result<bool> {
-    let Some(parent_session_id) = store.get_parent_session(child_session_id)? else {
-        return Ok(false);
-    };
-
-    let completion = build_completion_message(child_session_id, session, last_assistant_response);
-    store
-        .enqueue_message(
-            &parent_session_id,
-            "user",
-            &completion,
-            &format!("agent-{child_session_id}"),
-        )
-        .context("failed to enqueue child completion message")?;
-
-    Ok(true)
-}
-
-pub(crate) fn should_enqueue_child_completion(processed_any: bool) -> bool {
-    processed_any
-}
-
-fn build_completion_message(
-    child_session_id: &str,
-    session: &Session,
-    last_assistant_response: Option<&str>,
-) -> String {
-    let response = last_assistant_response
-        .map(ToString::to_string)
-        .or_else(|| latest_assistant_response(session))
-        .unwrap_or_else(|| "No assistant response was produced.".to_string());
-
-    format!("Child session {child_session_id} completed.\n\n{response}")
-}
-
-pub(crate) fn latest_assistant_response(session: &Session) -> Option<String> {
-    session.history().iter().rev().find_map(|message| {
-        if message.role != ChatRole::Assistant || message.principal != Principal::Agent {
-            return None;
-        }
-
-        let text = message
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                MessageContent::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        Some(text)
-    })
-}
-
 fn generate_child_session_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -310,8 +247,10 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use crate::child_session::{enqueue_child_completion, should_enqueue_child_completion};
     use crate::llm::{ChatMessage, ChatRole, MessageContent};
     use crate::principal::Principal;
+    use crate::session::Session;
 
     fn temp_root(prefix: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

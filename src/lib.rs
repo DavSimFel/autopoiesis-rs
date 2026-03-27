@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod auth;
+pub mod child_session;
 pub mod config;
 #[path = "context/mod.rs"]
 pub mod context;
@@ -15,7 +16,6 @@ pub mod read_tool;
 pub mod server;
 pub mod session;
 pub mod skills;
-pub mod spawn;
 pub mod store;
 pub mod terminal_ui;
 
@@ -31,6 +31,5 @@ pub mod time;
 pub mod tool;
 #[path = "turn/mod.rs"]
 pub mod turn;
-pub mod util;
 
 pub use principal::Principal;

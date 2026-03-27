@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
 use super::{QueuedMessage, unix_timestamp};
-use crate::util::utc_timestamp;
+use crate::time::utc_timestamp;
 
 pub(super) fn enqueue_message(
     conn: &Connection,

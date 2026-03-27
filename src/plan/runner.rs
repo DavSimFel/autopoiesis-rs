@@ -7,6 +7,7 @@ use serde_json::json;
 use std::cell::Cell;
 
 use crate::agent::{ApprovalHandler, SpawnDrainContext, TokenSink, finish_spawned_child_drain};
+use crate::child_session::SpawnRequest;
 use crate::config::Config;
 use crate::gate::output_cap::safe_call_id_for_filename;
 use crate::llm::ToolCall;
@@ -14,10 +15,9 @@ use crate::plan::notify::notify_plan_failure;
 use crate::plan::recovery::crash_plan_run_to_waiting_t2;
 use crate::plan::{PlanAction, PlanStepSpec, ShellCheckSpec, ShellExpectation};
 use crate::session::Session;
-use crate::spawn::SpawnRequest;
 use crate::store::{NullableUpdate, PlanRun, PlanRunUpdateFields, StepAttemptRecord, Store};
+use crate::time::utc_timestamp;
 use crate::turn::build_t3_turn;
-use crate::util::utc_timestamp;
 
 #[cfg(test)]
 thread_local! {
@@ -376,7 +376,7 @@ struct SpawnMissingMetadataArgs<'a> {
     step_index: i64,
     step_id: &'a str,
     attempt: i64,
-    spawn_result: &'a crate::spawn::SpawnResult,
+    spawn_result: &'a crate::child_session::SpawnResult,
     attempt_id: i64,
 }
 
@@ -816,39 +816,43 @@ where
             let parent_budget = session
                 .budget_snapshot()
                 .context("failed to read parent budget snapshot")?;
-            let spawn_result =
-                match crate::spawn::spawn_child(store, config, parent_budget, spawn_request) {
-                    Ok(result) => result,
-                    Err(_error) => {
-                        let failure = build_waiting_t2_failure_details(
-                            step_index,
-                            id,
-                            attempt,
-                            "spawn_failed",
-                            None,
-                            NullableUpdate::Null,
-                            Vec::new(),
-                        );
-                        let summary = build_step_summary(StepSummaryArgs {
-                            kind: "plan_step_summary",
-                            plan_run,
-                            step_index,
-                            step_id: id,
-                            attempt,
-                            command: None,
-                            child_session_id: None,
-                            resolved_model: None,
-                            last_assistant_response: None,
-                            observed: None,
-                            checks: Vec::new(),
-                        });
-                        let summary_json = serialize_json(&summary, "step summary")?;
-                        let checks_json = initial_checks_json.clone();
-                        finalize_attempt(store, attempt_id, "crashed", &summary_json, &checks_json)
-                            .context("failed to finalize crashed spawn attempt")?;
-                        return Ok(StepOutcome::WaitingT2 { failure });
-                    }
-                };
+            let spawn_result = match crate::child_session::spawn_child(
+                store,
+                config,
+                parent_budget,
+                spawn_request,
+            ) {
+                Ok(result) => result,
+                Err(_error) => {
+                    let failure = build_waiting_t2_failure_details(
+                        step_index,
+                        id,
+                        attempt,
+                        "spawn_failed",
+                        None,
+                        NullableUpdate::Null,
+                        Vec::new(),
+                    );
+                    let summary = build_step_summary(StepSummaryArgs {
+                        kind: "plan_step_summary",
+                        plan_run,
+                        step_index,
+                        step_id: id,
+                        attempt,
+                        command: None,
+                        child_session_id: None,
+                        resolved_model: None,
+                        last_assistant_response: None,
+                        observed: None,
+                        checks: Vec::new(),
+                    });
+                    let summary_json = serialize_json(&summary, "step summary")?;
+                    let checks_json = initial_checks_json.clone();
+                    finalize_attempt(store, attempt_id, "crashed", &summary_json, &checks_json)
+                        .context("failed to finalize crashed spawn attempt")?;
+                    return Ok(StepOutcome::WaitingT2 { failure });
+                }
+            };
             let metadata_json = maybe_force_missing_spawn_metadata(
                 store.get_session_metadata(&spawn_result.child_session_id)?,
             );
@@ -1845,7 +1849,7 @@ mod tests {
             &spawn_plan("child-ok"),
         );
         let parent_budget = parent_session.budget_snapshot().unwrap();
-        let spawn_request = crate::spawn::SpawnRequest {
+        let spawn_request = crate::child_session::SpawnRequest {
             parent_session_id: owner_session_id.to_string(),
             task: "do the child task".to_string(),
             task_kind: None,
@@ -1856,7 +1860,7 @@ mod tests {
             skill_token_budget: None,
         };
         let spawn_result =
-            crate::spawn::spawn_child(&mut store, &config, parent_budget, spawn_request)
+            crate::child_session::spawn_child(&mut store, &config, parent_budget, spawn_request)
                 .expect("spawn child should succeed");
         let attempt_id = store
             .record_step_attempt(StepAttemptRecord {

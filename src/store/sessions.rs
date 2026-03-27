@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
-use crate::util::utc_timestamp;
+use crate::time::utc_timestamp;
 
 pub(super) fn create_session(
     conn: &Connection,

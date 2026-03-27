@@ -20,7 +20,7 @@ impl ToSql for PlanRunUpdateValue {
 }
 
 use super::{NullableUpdate, PlanRun, PlanRunUpdateFields, Store};
-use crate::util::utc_timestamp;
+use crate::time::utc_timestamp;
 
 pub(super) fn validate_plan_run_status(status: &str) -> Result<()> {
     match status {

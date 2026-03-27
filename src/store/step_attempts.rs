@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
 use super::{PlanRun, StepAttempt, StepAttemptRecord, Store, step_attempt_from_row};
-use crate::util::utc_timestamp;
+use crate::time::utc_timestamp;
 
 fn validate_step_attempt_start_status(status: &str) -> Result<()> {
     match status {

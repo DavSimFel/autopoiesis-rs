@@ -81,7 +81,11 @@ main.rs
 │  ├─ loop_impl.rs
 │  ├─ queue.rs
 │  ├─ shell_execute.rs
-│  └─ spawn.rs
+│  └─ child_drain.rs
+├─ child_session/
+│  ├─ mod.rs
+│  ├─ create.rs
+│  └─ completion.rs
 ├─ server/
 │  ├─ mod.rs
 │  ├─ http.rs
@@ -100,7 +104,10 @@ main.rs
 │  └─ command_path_analysis.rs
 ├─ llm/
 │  ├─ mod.rs
-│  └─ openai.rs
+│  └─ openai/
+│     ├─ mod.rs
+│     ├─ request.rs
+│     └─ sse.rs
 ├─ plan.rs
 ├─ plan/
 │  ├─ runner.rs
@@ -115,7 +122,6 @@ main.rs
 ├─ store.rs
 ├─ turn.rs
 ├─ tool.rs
-├─ spawn.rs
 ├─ skills.rs
 ├─ subscription.rs
 ├─ delegation.rs
@@ -126,7 +132,8 @@ main.rs
 ├─ template.rs
 ├─ auth.rs
 ├─ cli.rs
-└─ util.rs
+├─ logging.rs
+└─ time.rs
 ```
 
 ## Safety

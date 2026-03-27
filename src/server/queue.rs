@@ -668,6 +668,7 @@ mod tests {
             )
             .unwrap();
         assert!(content.contains("Child session child-persisted completed."));
+        assert!(content.contains("No assistant response was produced."));
         assert!(!content.contains("old answer"));
     }
 

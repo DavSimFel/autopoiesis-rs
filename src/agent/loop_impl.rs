@@ -8,8 +8,8 @@ use crate::gate::{GuardContext, Verdict};
 use crate::llm::{ChatMessage, LlmProvider, MessageContent, StopReason, ToolCall};
 use crate::principal::Principal;
 use crate::session::Session;
+use crate::time::utc_timestamp;
 use crate::turn::Turn;
-use crate::util::utc_timestamp;
 use tracing::{debug, info, warn};
 
 use super::TurnVerdict;

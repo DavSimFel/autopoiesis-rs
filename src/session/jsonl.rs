@@ -8,7 +8,7 @@ use tracing::{trace, warn};
 use super::{Session, SessionEntry};
 use crate::llm::{ChatMessage, ChatRole, MessageContent, TurnMeta};
 use crate::principal::Principal;
-use crate::util::utc_timestamp;
+use crate::time::utc_timestamp;
 
 impl Session {
     // Persistence boundary: serialize and replay ordered blocks exactly for canonical rows;
