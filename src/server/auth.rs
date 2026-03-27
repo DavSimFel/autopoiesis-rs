@@ -98,57 +98,12 @@ mod tests {
         response::IntoResponse,
         routing::get,
     };
-    use reqwest::Client;
-    use tokio::sync::Mutex;
     use tower::util::ServiceExt;
 
-    use crate::{config, store};
+    use crate::test_support::new_test_server_state;
 
     fn test_state() -> ServerState {
-        let root = std::env::temp_dir().join(format!(
-            "autopoiesis_server_auth_test_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let queue_path = root.join("queue.sqlite");
-        let sessions_dir = root.join("sessions");
-        std::fs::create_dir_all(&sessions_dir).unwrap();
-        let store = store::Store::new(&queue_path).unwrap();
-
-        ServerState {
-            store: std::sync::Arc::new(Mutex::new(store)),
-            session_locks: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            sessions_dir,
-            api_key: "mock-api-key".to_string(),
-            operator_key: Some("test-operator-key".to_string()),
-            config: config::Config {
-                model: "gpt-test".to_string(),
-                system_prompt: "system".to_string(),
-                base_url: "https://example.test/api".to_string(),
-                reasoning_effort: None,
-                session_name: None,
-                operator_key: Some("test-operator-key".to_string()),
-                shell_policy: config::ShellPolicy::default(),
-                budget: None,
-                read: config::ReadToolConfig::default(),
-                subscriptions: config::SubscriptionsConfig::default(),
-                queue: config::QueueConfig::default(),
-                identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
-                skills_dir: std::path::PathBuf::from("skills"),
-                skills_dir_resolved: std::path::PathBuf::from("skills"),
-                skills: crate::skills::SkillCatalog::default(),
-                agents: config::AgentsConfig::default(),
-                models: config::ModelsConfig::default(),
-                domains: config::DomainsConfig::default(),
-                active_agent: None,
-            },
-            http_client: Client::new(),
-        }
+        new_test_server_state("server_auth_test").0
     }
 
     async fn whoami(Extension(principal): Extension<Principal>) -> impl IntoResponse {

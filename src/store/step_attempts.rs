@@ -468,18 +468,10 @@ impl super::Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::new_test_store;
 
     fn test_store() -> (Store, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "autopoiesis_step_attempts_test_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let store = Store::new(root.join("queue.sqlite")).unwrap();
-        (store, root)
+        new_test_store("step_attempts_test")
     }
 
     #[test]

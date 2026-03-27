@@ -98,57 +98,11 @@ mod tests {
     use crate::llm::{ChatMessage, FunctionTool, StopReason, StreamedTurn};
     use crate::principal::Principal;
     use crate::subscription::{SubscriptionFilter, SubscriptionRecord};
-    use crate::{agent, config, llm, session, store, turn};
+    use crate::test_support::new_test_server_state;
+    use crate::{agent, llm, session, turn};
 
     fn test_state() -> (ServerState, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "autopoiesis_server_queue_test_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let queue_path = root.join("queue.sqlite");
-        let sessions_dir = root.join("sessions");
-        std::fs::create_dir_all(&sessions_dir).unwrap();
-        let store = store::Store::new(&queue_path).unwrap();
-
-        (
-            ServerState {
-                store: Arc::new(tokio::sync::Mutex::new(store)),
-                session_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-                sessions_dir,
-                api_key: "mock-api-key".to_string(),
-                operator_key: Some("test-operator-key".to_string()),
-                config: config::Config {
-                    model: "gpt-test".to_string(),
-                    system_prompt: "system".to_string(),
-                    base_url: "https://example.test/api".to_string(),
-                    reasoning_effort: None,
-                    session_name: None,
-                    operator_key: Some("test-operator-key".to_string()),
-                    shell_policy: config::ShellPolicy::default(),
-                    budget: None,
-                    read: config::ReadToolConfig::default(),
-                    subscriptions: config::SubscriptionsConfig::default(),
-                    queue: config::QueueConfig::default(),
-                    identity_files: crate::identity::t1_identity_files(
-                        "identity-templates",
-                        "silas",
-                    ),
-                    skills_dir: std::path::PathBuf::from("skills"),
-                    skills_dir_resolved: std::path::PathBuf::from("skills"),
-                    skills: crate::skills::SkillCatalog::default(),
-                    agents: config::AgentsConfig::default(),
-                    models: config::ModelsConfig::default(),
-                    domains: config::DomainsConfig::default(),
-                    active_agent: None,
-                },
-                http_client: reqwest::Client::new(),
-            },
-            queue_path,
-        )
+        new_test_server_state("server_queue_test")
     }
 
     #[derive(Clone)]
@@ -235,7 +189,8 @@ mod tests {
 
     #[tokio::test]
     async fn drain_queue_marks_target_message_processed() {
-        let (state, queue_path) = test_state();
+        let (state, root) = test_state();
+        let queue_path = root.join("queue.sqlite");
         let session_id = "ws-session";
         let message_id = {
             let mut store = state.store.lock().await;
@@ -289,7 +244,8 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_turn_builder_is_invoked_for_each_user_message() {
-        let (state, queue_path) = test_state();
+        let (state, root) = test_state();
+        let queue_path = root.join("queue.sqlite");
         let session_id = "fresh-turn-session";
         {
             let mut store = state.store.lock().await;
@@ -354,7 +310,8 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_turn_builder_matches_reference_turn_with_subscriptions() {
-        let (state, queue_path) = test_state();
+        let (state, root) = test_state();
+        let queue_path = root.join("queue.sqlite");
         let root = std::env::temp_dir().join(format!(
             "autopoiesis_server_queue_subscriptions_test_{}",
             std::time::SystemTime::now()
@@ -564,7 +521,8 @@ mod tests {
 
     #[tokio::test]
     async fn drain_queue_uses_supplied_approval_handler() {
-        let (state, queue_path) = test_state();
+        let (state, root) = test_state();
+        let queue_path = root.join("queue.sqlite");
         let session_id = "approval-session";
         let message_id = {
             let mut store = state.store.lock().await;
@@ -677,7 +635,8 @@ mod tests {
 
     #[tokio::test]
     async fn drain_queue_enqueues_child_completion_message_for_parent_session() {
-        let (state, queue_path) = test_state();
+        let (state, root) = test_state();
+        let queue_path = root.join("queue.sqlite");
         let parent_session_id = "parent-session";
         let child_session_id = "child-session";
         {
@@ -750,7 +709,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_queue_does_not_enqueue_completion_for_empty_child_queue() {
-        let (state, queue_path) = test_state();
+        let (state, root) = test_state();
         let parent_session_id = "parent-empty";
         let child_session_id = "child-empty";
         {
@@ -793,7 +752,7 @@ mod tests {
             .is_none()
         );
 
-        let conn = rusqlite::Connection::open(queue_path).unwrap();
+        let conn = rusqlite::Connection::open(root.join("queue.sqlite")).unwrap();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
@@ -807,7 +766,7 @@ mod tests {
     #[tokio::test]
     async fn drain_queue_enqueues_completion_when_persisted_history_exists_but_new_assistant_response_is_empty()
      {
-        let (state, queue_path) = test_state();
+        let (state, root) = test_state();
         let parent_session_id = "parent-persisted";
         let child_session_id = "child-persisted";
         {
@@ -870,7 +829,7 @@ mod tests {
             .is_none()
         );
 
-        let conn = rusqlite::Connection::open(queue_path).unwrap();
+        let conn = rusqlite::Connection::open(root.join("queue.sqlite")).unwrap();
         let content: String = conn
             .query_row(
                 "SELECT content FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",

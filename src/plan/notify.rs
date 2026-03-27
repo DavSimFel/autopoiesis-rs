@@ -244,18 +244,10 @@ mod tests {
     use crate::observe::test_support::RecordingObserver;
     use crate::plan::runner::{CheckOutcome, ObservedOutput, PlanFailureDetails};
     use crate::store::{NullableUpdate, PlanRunUpdateFields};
+    use crate::test_support::new_test_store;
 
     fn test_store() -> (Store, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "autopoiesis_plan_notify_test_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let store = Store::new(root.join("queue.sqlite")).unwrap();
-        (store, root)
+        new_test_store("plan_notify_test")
     }
 
     fn test_plan_run(store: &mut Store) -> PlanRun {

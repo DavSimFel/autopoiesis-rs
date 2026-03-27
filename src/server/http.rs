@@ -165,64 +165,13 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::response::{IntoResponse, Response};
-    use reqwest::Client;
     use serde_json::Value;
-    use tokio::sync::Mutex;
     use tower::util::ServiceExt;
 
-    use crate::{config, store};
+    use crate::test_support::new_test_server_state;
 
     fn test_state() -> (ServerState, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "autopoiesis_server_http_test_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let queue_path = root.join("queue.sqlite");
-        let sessions_dir = root.join("sessions");
-        std::fs::create_dir_all(&sessions_dir).unwrap();
-        let store = store::Store::new(&queue_path).unwrap();
-
-        (
-            ServerState {
-                store: std::sync::Arc::new(Mutex::new(store)),
-                session_locks: std::sync::Arc::new(std::sync::Mutex::new(
-                    std::collections::HashMap::new(),
-                )),
-                sessions_dir,
-                api_key: "mock-api-key".to_string(),
-                operator_key: Some("test-operator-key".to_string()),
-                config: config::Config {
-                    model: "gpt-test".to_string(),
-                    system_prompt: "system".to_string(),
-                    base_url: "https://example.test/api".to_string(),
-                    reasoning_effort: None,
-                    session_name: None,
-                    operator_key: Some("test-operator-key".to_string()),
-                    shell_policy: config::ShellPolicy::default(),
-                    budget: None,
-                    read: config::ReadToolConfig::default(),
-                    subscriptions: config::SubscriptionsConfig::default(),
-                    queue: config::QueueConfig::default(),
-                    identity_files: crate::identity::t1_identity_files(
-                        "identity-templates",
-                        "silas",
-                    ),
-                    skills_dir: std::path::PathBuf::from("skills"),
-                    skills_dir_resolved: std::path::PathBuf::from("skills"),
-                    skills: crate::skills::SkillCatalog::default(),
-                    agents: config::AgentsConfig::default(),
-                    models: config::ModelsConfig::default(),
-                    domains: config::DomainsConfig::default(),
-                    active_agent: None,
-                },
-                http_client: Client::new(),
-            },
-            queue_path,
-        )
+        new_test_server_state("server_http_test")
     }
 
     async fn enqueue_message_via_http(
@@ -254,8 +203,8 @@ mod tests {
             .expect("response should contain message_id")
     }
 
-    fn load_queued_message(queue_path: &std::path::PathBuf, message_id: i64) -> (String, String) {
-        let conn = rusqlite::Connection::open(queue_path).unwrap();
+    fn load_queued_message(root: &std::path::PathBuf, message_id: i64) -> (String, String) {
+        let conn = rusqlite::Connection::open(root.join("queue.sqlite")).unwrap();
         conn.query_row(
             "SELECT role, source FROM messages WHERE id = ?1",
             [message_id],
@@ -291,7 +240,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_persists_metadata_and_returns_session_id() {
-        let (state, queue_path) = test_state();
+        let (state, root) = test_state();
         let app = crate::server::router(state);
 
         let response = app
@@ -325,7 +274,7 @@ mod tests {
             .expect("response should contain session_id");
         assert!(validate_session_id(session_id));
 
-        let conn = rusqlite::Connection::open(queue_path).unwrap();
+        let conn = rusqlite::Connection::open(root.join("queue.sqlite")).unwrap();
         let metadata: String = conn
             .query_row(
                 "SELECT metadata FROM sessions WHERE id = ?1",
@@ -400,7 +349,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_with_user_api_key_forces_role_to_user() {
-        let (state, queue_path) = test_state();
+        let (state, root) = test_state();
         let app = crate::server::router(state);
 
         let response = enqueue_message_via_http(
@@ -417,14 +366,14 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let message_id = response_message_id(response).await;
-        let (role, source) = load_queued_message(&queue_path, message_id);
+        let (role, source) = load_queued_message(&root, message_id);
         assert_eq!(role, "user");
         assert_eq!(source, "http-user");
     }
 
     #[tokio::test]
     async fn enqueue_with_operator_key_keeps_requested_role() {
-        let (state, queue_path) = test_state();
+        let (state, root) = test_state();
         let app = crate::server::router(state);
 
         let response = enqueue_message_via_http(
@@ -440,14 +389,14 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let message_id = response_message_id(response).await;
-        let (role, source) = load_queued_message(&queue_path, message_id);
+        let (role, source) = load_queued_message(&root, message_id);
         assert_eq!(role, "system");
         assert_eq!(source, "http-operator");
     }
 
     #[tokio::test]
     async fn enqueue_without_role_defaults_to_user() {
-        let (state, queue_path) = test_state();
+        let (state, root) = test_state();
         let app = crate::server::router(state);
 
         let response = enqueue_message_via_http(
@@ -462,7 +411,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let message_id = response_message_id(response).await;
-        let (role, source) = load_queued_message(&queue_path, message_id);
+        let (role, source) = load_queued_message(&root, message_id);
         assert_eq!(role, "user");
         assert_eq!(source, "http-operator");
     }

@@ -174,19 +174,11 @@ mod tests {
     use crate::observe::test_support::RecordingObserver;
     use crate::plan::notify::set_force_notify_failure_tx_error_after;
     use crate::store::StepAttemptRecord;
+    use crate::test_support::new_test_store;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_store() -> (Store, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "autopoiesis_plan_recovery_test_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let store = Store::new(root.join("queue.sqlite")).unwrap();
-        (store, root)
+        new_test_store("plan_recovery_test")
     }
 
     fn valid_definition(step_id: &str) -> String {

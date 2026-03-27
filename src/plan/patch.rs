@@ -489,18 +489,10 @@ mod tests {
     use super::*;
     use crate::observe::test_support::RecordingObserver;
     use crate::store::{NullableUpdate, PlanRunUpdateFields};
+    use crate::test_support::new_test_store;
 
     fn test_store(prefix: &str) -> (Store, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "autopoiesis_plan_patch_test_{prefix}_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let store = Store::new(root.join("queue.sqlite")).unwrap();
-        (store, root)
+        new_test_store(&format!("plan_patch_test_{prefix}"))
     }
 
     fn shell_step(id: &str, command: &str) -> PlanStepSpec {
