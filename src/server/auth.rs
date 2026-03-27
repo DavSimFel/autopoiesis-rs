@@ -124,15 +124,15 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             sessions_dir,
-            api_key: "test-key".to_string(),
-            operator_key: Some("operator-key".to_string()),
+            api_key: "mock-api-key".to_string(),
+            operator_key: Some("test-operator-key".to_string()),
             config: config::Config {
                 model: "gpt-test".to_string(),
                 system_prompt: "system".to_string(),
                 base_url: "https://example.test/api".to_string(),
                 reasoning_effort: None,
                 session_name: None,
-                operator_key: Some("operator-key".to_string()),
+                operator_key: Some("test-operator-key".to_string()),
                 shell_policy: config::ShellPolicy::default(),
                 budget: None,
                 read: config::ReadToolConfig::default(),
@@ -159,11 +159,11 @@ mod tests {
     async fn principal_for_token_distinguishes_user_and_operator() {
         let state = test_state();
         assert_eq!(
-            principal_for_token(&state, "test-key"),
+            principal_for_token(&state, "mock-api-key"),
             Some(Principal::User)
         );
         assert_eq!(
-            principal_for_token(&state, "operator-key"),
+            principal_for_token(&state, "test-operator-key"),
             Some(Principal::Operator)
         );
         assert_eq!(principal_for_token(&state, "wrong"), None);
@@ -180,7 +180,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/ws/session-1?api_key=test-key")
+                    .uri("/api/ws/session-1?api_key=mock-api-key")
                     .method("GET")
                     .body(Body::empty())
                     .unwrap(),

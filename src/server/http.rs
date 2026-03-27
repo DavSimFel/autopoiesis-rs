@@ -193,15 +193,15 @@ mod tests {
                     std::collections::HashMap::new(),
                 )),
                 sessions_dir,
-                api_key: "test-key".to_string(),
-                operator_key: Some("operator-key".to_string()),
+                api_key: "mock-api-key".to_string(),
+                operator_key: Some("test-operator-key".to_string()),
                 config: config::Config {
                     model: "gpt-test".to_string(),
                     system_prompt: "system".to_string(),
                     base_url: "https://example.test/api".to_string(),
                     reasoning_effort: None,
                     session_name: None,
-                    operator_key: Some("operator-key".to_string()),
+                    operator_key: Some("test-operator-key".to_string()),
                     shell_policy: config::ShellPolicy::default(),
                     budget: None,
                     read: config::ReadToolConfig::default(),
@@ -274,7 +274,7 @@ mod tests {
                 Request::builder()
                     .uri("/api/health")
                     .method("GET")
-                    .header("x-api-key", "test-key")
+                    .header("x-api-key", "mock-api-key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -300,7 +300,7 @@ mod tests {
                     .uri("/api/sessions")
                     .method("POST")
                     .header("content-type", "application/json")
-                    .header("x-api-key", "test-key")
+                    .header("x-api-key", "mock-api-key")
                     .body(Body::from(
                         serde_json::json!({
                             "metadata": {
@@ -354,7 +354,7 @@ mod tests {
                     .uri("/api/sessions")
                     .method("POST")
                     .header("content-type", "application/json")
-                    .header("x-api-key", "test-key")
+                    .header("x-api-key", "mock-api-key")
                     .body(Body::from(r#"{"metadata":{"label":"list-test"}}"#))
                     .unwrap(),
             )
@@ -375,7 +375,7 @@ mod tests {
                 Request::builder()
                     .uri("/api/sessions")
                     .method("GET")
-                    .header("x-api-key", "test-key")
+                    .header("x-api-key", "mock-api-key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -405,7 +405,7 @@ mod tests {
 
         let response = enqueue_message_via_http(
             app,
-            "test-key",
+            "mock-api-key",
             "role-user-session",
             serde_json::json!({
                 "role": "system",
@@ -429,7 +429,7 @@ mod tests {
 
         let response = enqueue_message_via_http(
             app,
-            "operator-key",
+            "test-operator-key",
             "role-operator-session",
             serde_json::json!({
                 "role": "system",
@@ -452,7 +452,7 @@ mod tests {
 
         let response = enqueue_message_via_http(
             app,
-            "operator-key",
+            "test-operator-key",
             "default-role-session",
             serde_json::json!({
                 "content": "no explicit role",

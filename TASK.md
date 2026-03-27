@@ -1,52 +1,64 @@
-# LOC Reduction Task
+# Task: Four Targeted Fixes
 
-NO REGRESSIONS. 595 tests must pass. Reduce production lines of code by removing duplication, generalizing code paths, and improving patterns. Only real production code counts.
+Baseline: 594 tests. All 594 must still pass after each commit. No regressions.
+Commit each fix separately. Each commit must pass `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`.
 
-## Step 1: Run Analysis Tools FIRST
+---
 
-Before writing anything, run these and include output in your reasoning:
+## Fix 1: Delete src/plan/executor.rs (pure pass-through wrapper)
 
-1. `npx jscpd src/ --min-lines 5 --min-tokens 50` — find code clones
-2. `tokei src/ --sort lines` — real LOC breakdown
-3. grep-based searches per discovery rules below
+`src/plan/executor.rs` is a pure pass-through wrapper for `crate::agent::shell_execute::guarded_shell_execute_call` with zero independent logic. This violates the no-redundant-wrapper rule.
 
-## Discovery Rules
+Changes:
+- Update `src/plan/runner.rs`: replace the 2 call sites of `crate::plan::executor::guarded_shell_execute_call(...)` with `crate::agent::shell_execute::guarded_shell_execute_call(...)` directly
+- Move the test from `src/plan/executor.rs` into `src/plan/runner.rs` (inline) or `src/agent/shell_execute.rs` so coverage is preserved
+- Delete `src/plan/executor.rs`
+- Remove `pub(crate) mod executor;` from `src/plan.rs` (or `src/plan/mod.rs` — check which file declares it)
+- Commit: `refactor: delete plan/executor.rs pass-through wrapper`
 
-1. **Grep Test:** 3+ structurally identical code blocks differing only in names/values = candidate. Prove with grep.
-2. **Deletion Test:** Can you delete a function and have callers use something that already exists? Thin wrappers with no added logic/safety = candidate.
-3. **Signature Test:** Functions with 5+ params doing similar things = wants struct method or builder.
-4. **One More Case Test:** match/if-else with N arms doing nearly the same thing with different values = table or loop.
-5. **Module Boundary Test:** Module A importing 3+ things from B's internals to reconstruct what B does = wrong abstraction location.
-6. **cfg(test) Pollution Test:** #[cfg(test)] code in non-test files beyond assert imports is suspect. Test infra in prod code should be behind trait seams.
+---
 
-## Safety Rules (non-negotiable)
+## Fix 2: Turn constructor bypass in session_runtime
 
-7. **Zero behavior change.** Every optimization must be provably equivalent.
-8. **Test count must not drop.** 595 before = 595 after. Moving tests fine. Deleting tests not.
-9. **Public API freeze.** No `pub` (not `pub(crate)`) signature changes.
-10. **One pattern per commit.** Don't mix optimizations.
+`src/session_runtime/drain.rs` constructs turns directly instead of going through `build_turn_for_config()` (the unified turn constructor in `src/turn/builders.rs`). This creates an asymmetric execution environment — sessions drained via the server path get a differently-constructed turn than sessions run via the CLI path.
 
-## Search Strategy
+Changes:
+- Find where `drain.rs` constructs a `Turn` directly
+- Replace with a call to `build_turn_for_config()` using the session's config, passing the appropriate tier/config
+- Ensure the resulting turn is functionally equivalent (same guards, same tools, same subscriptions)
+- Verify the existing queue drain tests still pass
+- Commit: `refactor: route session_runtime drain through build_turn_for_config`
 
-11. Start from biggest files, work top-down.
-12. Look for parallel structures — two modules solving the same problem independently.
-13. Count, don't guess. State "removes N prod lines, touches M test lines" for each.
-14. Macros are last resort. Prefer functions, generics, traits.
+---
 
-## Known Hotspots (verify, don't assume)
+## Fix 3: Queue/drain deduplication
 
-- store/mod.rs: ~47 delegation methods possibly eliminable via distributed `impl Store` blocks in submodules
-- gate/command_path_analysis.rs: 126 mentions of identity_template, ~10 parallel detection functions
-- test_store() duplicated across plan/notify.rs, plan/patch.rs, plan/recovery.rs
-- plan/runner.rs: #[cfg(test)] thread_local pollution in prod code
-- plan/runner.rs + agent/shell_execute.rs: parallel guarded shell execution patterns
+`src/agent/queue.rs` and `src/session_runtime/drain.rs` contain massively duplicated queue draining and SQLite bookkeeping logic. The two `match message.role.as_str()` blocks handle system/assistant/unknown roles identically; only the user-turn construction differs.
 
-## Output
+Changes:
+- In `src/session_runtime/drain.rs`: extract a shared helper for the `"system"`, `"assistant"`, and unsupported-role branches that is shared between the two drain paths
+- The only injection point should be how the user-turn is built (fixed turn vs fresh-turn-builder)
+- Remove the duplicated code from `src/agent/queue.rs` — make it delegate to the shared helper
+- Keep `pub async fn drain_queue(...)` signature stable (it's called from tests and server)
+- Commit: `refactor: deduplicate queue/drain role-handling logic`
 
-Write PLAN.md with:
-1. Tool output summaries (jscpd clones found, tokei breakdown)
-2. Each optimization: what, where, lines saved (prod), risk level
-3. Order of operations (each step keeps tests green)
-4. Total expected savings
+---
 
-When completely finished, run: openclaw system event --text "Done: PLAN.md written for LOC reduction" --mode now
+## Fix 4: Replace hardcoded mock secrets with fixtures
+
+Hardcoded mock secrets like `"sk-proj-abcdefghijklmnopqrstuvwxyz012345"`, `"sk-test-key"`, `"test-key"` etc. are embedded in source files including `src/server/auth.rs`, `src/server/http.rs`, `src/server/queue.rs`, `src/gate/mod.rs`, `src/llm/openai/mod.rs`. This trains secret scanners to ignore these patterns.
+
+Changes:
+- Find all occurrences of `sk-` patterns, `"test-key"`, and similar mock secrets in non-test production paths
+- Replace with clearly non-secret-shaped fixtures: e.g. `"mock-api-key"`, `"test-operator-key"`, `"dummy-token"`, `"example-key-abc123"` — anything that won't pattern-match real secret formats
+- Update the pre-commit hook in `.git/hooks/pre-commit` to NOT flag `#[cfg(test)]` blocks for the `sk-` pattern (test data shouldn't be treated as secrets)
+- Commit: `fix: replace sk-* mock secrets with non-secret-shaped fixtures`
+
+---
+
+## After all 4 commits
+
+Run `cargo test` and confirm count is 594 (or higher if new tests were added).
+Run `cargo build --release` to confirm clean build.
+
+When completely finished, run: openclaw system event --text "Done: 4 fixes committed — executor deleted, turn constructor unified, queue deduped, mock secrets replaced" --mode now

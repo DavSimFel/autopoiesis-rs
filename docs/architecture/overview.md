@@ -5,9 +5,9 @@
 ## Snapshot
 
 - Rust source files in `src/`: `104`
-- Lines of Rust in `src/`: `38,213`
-- Lines of Rust in `tests/`: `1,572`
-- Commits on `HEAD`: `175`
+- Lines of Rust in `src/`: `38,037`
+- Lines of Rust in `tests/`: `1,873`
+- Commits on `HEAD`: `177`
 
 ## Module Map
 
@@ -36,7 +36,6 @@
 - `src/gate/protected_paths.rs` - protected-path catalogs and normalized path checks.
 - `src/gate/command_path_analysis.rs` - shell command heuristics for reads/writes to protected or target paths.
 - `src/plan/runner.rs` - plan scheduler and execution loop.
-- `src/plan/executor.rs` - step execution helpers.
 - `src/plan/notify.rs` - notifications back to T2.
 - `src/plan/patch.rs` - plan patching and revision handling.
 - `src/plan/recovery.rs` - crash recovery for stalled plan runs.

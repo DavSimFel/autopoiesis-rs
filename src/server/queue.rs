@@ -97,6 +97,7 @@ mod tests {
     use crate::gate::{Guard, GuardEvent, Severity, Verdict};
     use crate::llm::{ChatMessage, FunctionTool, StopReason, StreamedTurn};
     use crate::principal::Principal;
+    use crate::subscription::{SubscriptionFilter, SubscriptionRecord};
     use crate::{agent, config, llm, session, store, turn};
 
     fn test_state() -> (ServerState, std::path::PathBuf) {
@@ -118,15 +119,15 @@ mod tests {
                 store: Arc::new(tokio::sync::Mutex::new(store)),
                 session_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 sessions_dir,
-                api_key: "test-key".to_string(),
-                operator_key: Some("operator-key".to_string()),
+                api_key: "mock-api-key".to_string(),
+                operator_key: Some("test-operator-key".to_string()),
                 config: config::Config {
                     model: "gpt-test".to_string(),
                     system_prompt: "system".to_string(),
                     base_url: "https://example.test/api".to_string(),
                     reasoning_effort: None,
                     session_name: None,
-                    operator_key: Some("operator-key".to_string()),
+                    operator_key: Some("test-operator-key".to_string()),
                     shell_policy: config::ShellPolicy::default(),
                     budget: None,
                     read: config::ReadToolConfig::default(),
@@ -349,6 +350,216 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn fresh_turn_builder_matches_reference_turn_with_subscriptions() {
+        let (state, queue_path) = test_state();
+        let root = std::env::temp_dir().join(format!(
+            "autopoiesis_server_queue_subscriptions_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let subscription_path = root.join("subscription.txt");
+        std::fs::write(&subscription_path, "subscription payload").unwrap();
+
+        let subscriptions = vec![SubscriptionRecord {
+            id: 1,
+            session_id: None,
+            topic: "notes".to_string(),
+            path: subscription_path.clone(),
+            filter: SubscriptionFilter::Full,
+            activated_at: "2026-03-27T00:00:00Z".to_string(),
+            updated_at: "2026-03-27T00:00:00Z".to_string(),
+        }];
+
+        let mut turn_builder = crate::session_runtime::build_turn_builder_for_subscriptions(
+            state.config.clone(),
+            subscriptions.clone(),
+        );
+        let built_turn = turn_builder().unwrap();
+        let reference_turn =
+            turn::build_turn_for_config_with_subscriptions(&state.config, &subscriptions).unwrap();
+
+        let built_tool_names: Vec<_> = built_turn
+            .tool_definitions()
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        let reference_tool_names: Vec<_> = reference_turn
+            .tool_definitions()
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        assert_eq!(built_tool_names, reference_tool_names);
+        assert_eq!(
+            built_turn.needs_budget_context(),
+            reference_turn.needs_budget_context()
+        );
+        let call = llm::ToolCall {
+            id: "call-1".to_string(),
+            name: "execute".to_string(),
+            arguments: serde_json::json!({"command":"echo ok"}).to_string(),
+        };
+        fn guard_result_signature(
+            result: Verdict,
+        ) -> (
+            &'static str,
+            Option<String>,
+            Option<String>,
+            Option<Severity>,
+        ) {
+            match result {
+                Verdict::Allow => ("allow", None, None, None),
+                Verdict::Approve {
+                    reason,
+                    gate_id,
+                    severity,
+                } => ("approve", Some(reason), Some(gate_id), Some(severity)),
+                Verdict::Deny { reason, gate_id } => ("deny", Some(reason), Some(gate_id), None),
+                Verdict::Modify => ("modify", None, None, None),
+            }
+        }
+        assert_eq!(
+            guard_result_signature(built_turn.check_tool_call(&call)),
+            guard_result_signature(reference_turn.check_tool_call(&call))
+        );
+
+        let session_id = "fresh-turn-subscription-session";
+        let fresh_turn_builds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_message_texts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_message_texts_for_provider = observed_message_texts.clone();
+        #[derive(Clone)]
+        struct RecordingProvider {
+            observed_message_texts: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        }
+
+        impl llm::LlmProvider for RecordingProvider {
+            fn stream_completion<'a>(
+                &'a self,
+                messages: &'a [ChatMessage],
+                _tools: &'a [FunctionTool],
+                _on_token: &'a mut (dyn FnMut(String) + Send),
+            ) -> crate::llm::BoxFutureLlm<'a, anyhow::Result<StreamedTurn>> {
+                Box::pin(async move {
+                    let message_texts = messages
+                        .iter()
+                        .map(|message| {
+                            message
+                                .content
+                                .iter()
+                                .filter_map(|block| match block {
+                                    crate::llm::MessageContent::Text { text } => {
+                                        Some(text.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .collect::<Vec<_>>();
+                    self.observed_message_texts
+                        .lock()
+                        .unwrap()
+                        .push(message_texts);
+
+                    Ok(StreamedTurn {
+                        assistant_message: ChatMessage {
+                            role: crate::llm::ChatRole::Assistant,
+                            principal: Principal::Agent,
+                            content: vec![crate::llm::MessageContent::text("child finished")],
+                        },
+                        tool_calls: vec![],
+                        meta: Some(crate::llm::TurnMeta {
+                            model: Some("gpt-child".to_string()),
+                            input_tokens: Some(1),
+                            output_tokens: Some(1),
+                            reasoning_tokens: None,
+                            reasoning_trace: None,
+                        }),
+                        stop_reason: StopReason::Stop,
+                    })
+                })
+            }
+        }
+
+        let message_id = {
+            let mut store = state.store.lock().await;
+            store.create_session(session_id, None).unwrap();
+            let message_id = store
+                .enqueue_message(session_id, "user", "hello from the drain path", "ws")
+                .unwrap();
+            let mut session = session::Session::new(&root).unwrap();
+            let mut make_provider = {
+                move || {
+                    let provider = RecordingProvider {
+                        observed_message_texts: observed_message_texts_for_provider.clone(),
+                    };
+                    async move { Ok(provider) }
+                }
+            };
+            let mut token_sink = |_token: String| {};
+            let mut approval_handler =
+                |_severity: &crate::gate::Severity, _title: &str, _message: &str| -> bool { true };
+            let fresh_turn_builds = fresh_turn_builds.clone();
+            let mut fresh_turn_builder = {
+                let mut inner = crate::session_runtime::build_turn_builder_for_subscriptions(
+                    state.config.clone(),
+                    subscriptions.clone(),
+                );
+                move || {
+                    fresh_turn_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    inner()
+                }
+            };
+
+            let drain_result = crate::agent::drain_queue_with_stats_fresh_turns(
+                &mut store,
+                session_id,
+                &mut session,
+                &mut fresh_turn_builder,
+                &mut make_provider,
+                &mut token_sink,
+                &mut approval_handler,
+            )
+            .await;
+            assert!(drain_result.is_ok());
+            message_id
+        };
+        assert_eq!(
+            fresh_turn_builds.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let observed_message_texts = observed_message_texts.lock().unwrap();
+        assert!(
+            observed_message_texts
+                .iter()
+                .flatten()
+                .any(|text| text.contains("subscription payload")),
+            "subscription context should be assembled into the provider input"
+        );
+        assert!(
+            observed_message_texts
+                .iter()
+                .flatten()
+                .any(|text| text.contains("hello from the drain path")),
+            "the user message should still be forwarded into the provider input"
+        );
+
+        let conn = rusqlite::Connection::open(&queue_path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM messages WHERE id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "processed");
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]

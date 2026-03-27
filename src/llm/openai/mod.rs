@@ -630,8 +630,12 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let provider =
-            OpenAIProvider::new("test-key", format!("http://{}", addr), "gpt-4o-mini", None);
+        let provider = OpenAIProvider::new(
+            "mock-api-key",
+            format!("http://{}", addr),
+            "gpt-4o-mini",
+            None,
+        );
         let messages = vec![ChatMessage::user("hello")];
         let mut on_token = |_| {};
         let err = provider
