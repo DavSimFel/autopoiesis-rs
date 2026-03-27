@@ -4,10 +4,10 @@
 
 ## Snapshot
 
-- Rust source files in `src/`: `52`
-- Lines of Rust in `src/`: `34,821`
-- Rust tests in `src/` and `tests/`: `558`
-- Commits on `HEAD`: `159`
+- Rust source files in `src/`: `104`
+- Lines of Rust in `src/`: `38,213`
+- Lines of Rust in `tests/`: `1,572`
+- Commits on `HEAD`: `175`
 
 ## Module Map
 
@@ -43,8 +43,8 @@
 - `src/config/mod.rs` - config facade; `src/config/{runtime,load,spawn_runtime,agents,models,domains,policy,file_schema}.rs` own runtime state, validation, and schema parsing.
 - `src/context/mod.rs` - context facade and public reexports.
 - `src/context/{identity_prompt,skill_summaries,skill_instructions,subscriptions,history}.rs` - focused context sources and prompt assembly helpers.
-- `src/session.rs` - JSONL history and per-session metadata.
-- `src/store.rs` - SQLite sessions, queue, subscriptions, and plan tables.
+- `src/session/mod.rs` - JSONL history and per-session metadata.
+- `src/store/mod.rs` - SQLite sessions, queue, subscriptions, and plan tables.
 - `src/turn/mod.rs` - turn facade and public reexports.
 - `src/turn/{verdicts,tiers,builders}.rs` - guard verdicts, tier resolution, and turn construction.
 - `src/tool.rs` - shell tool execution primitives.
@@ -91,8 +91,8 @@ CLI / HTTP / WS
 - CLI, HTTP, and WS all enqueue into the same SQLite-backed message queue.
 - Queue claims are atomic.
 - Startup recovery only requeues stale `processing` rows.
-- `session.rs` keeps JSONL history and tool-call metadata.
-- `store.rs` owns the registry tables for sessions, subscriptions, and plan runs.
+- `session/mod.rs` keeps JSONL history and tool-call metadata.
+- `store/mod.rs` owns the registry tables for sessions, subscriptions, and plan runs.
 
 ### Tiered Turns
 

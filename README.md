@@ -116,11 +116,11 @@ main.rs
 │  ├─ patch.rs
 │  └─ recovery.rs
 ├─ lib.rs
-├─ config.rs
-├─ context.rs
-├─ session.rs
-├─ store.rs
-├─ turn.rs
+├─ config/
+├─ context/
+├─ session/
+├─ store/
+├─ turn/
 ├─ tool.rs
 ├─ skills.rs
 ├─ subscription.rs

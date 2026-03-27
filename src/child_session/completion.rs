@@ -40,7 +40,7 @@ fn build_completion_message(
     last_assistant_response: Option<&str>,
 ) -> String {
     let response = last_assistant_response
-        .filter(|response| !response.is_empty())
+        .filter(|response| !response.trim().is_empty())
         .map(ToString::to_string)
         .or_else(|| latest_assistant_response(session))
         .unwrap_or_else(|| "No assistant response was produced.".to_string());
@@ -64,7 +64,11 @@ pub(crate) fn latest_assistant_response(session: &Session) -> Option<String> {
             .collect::<Vec<_>>()
             .join("\n");
 
-        return if text.is_empty() { None } else { Some(text) };
+        return if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        };
     }
 
     None
@@ -99,6 +103,9 @@ mod tests {
 
         let empty =
             ChatMessage::with_role_with_principal(ChatRole::Assistant, Some(Principal::Agent));
+        // Whitespace-only text should not be treated as a real completion payload.
+        let mut empty = empty;
+        empty.content.push(MessageContent::text("   "));
         session.append(empty, None).unwrap();
 
         assert_eq!(latest_assistant_response(&session), None);
