@@ -2288,6 +2288,20 @@ mod tests {
     }
 
     #[test]
+    fn ensure_session_row_is_idempotent() {
+        let path = temp_db_path("ensure_session_row");
+        let mut store = Store::new(&path).unwrap();
+
+        store.ensure_session_row("shared").unwrap();
+        store.ensure_session_row("shared").unwrap();
+
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions, vec!["shared"]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn dequeue_claim_is_atomic_across_concurrent_workers() {
         use std::sync::{Arc, Barrier};
 

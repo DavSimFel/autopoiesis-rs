@@ -19,6 +19,10 @@ pub(super) fn create_session(
     Ok(())
 }
 
+pub(super) fn ensure_session_row(conn: &Connection, session_id: &str) -> Result<()> {
+    create_session(conn, session_id, None)
+}
+
 pub(super) fn create_child_session(
     conn: &Connection,
     parent_id: &str,
@@ -111,6 +115,11 @@ pub(super) fn list_child_sessions(conn: &Connection, parent_id: &str) -> Result<
 impl super::Store {
     pub fn create_session(&mut self, session_id: &str, metadata: Option<&str>) -> Result<()> {
         create_session(&self.conn, session_id, metadata)
+    }
+
+    /// Ensure a session row exists without mutating existing metadata.
+    pub fn ensure_session_row(&mut self, session_id: &str) -> Result<()> {
+        ensure_session_row(&self.conn, session_id)
     }
 
     /// Insert a child session that records its parent session id.

@@ -4,7 +4,7 @@ mod app;
 
 use anyhow::{Result, anyhow};
 use app::tracing as app_tracing;
-use app::{args, plan_commands, session_run, subscription_commands};
+use app::{args, enqueue_command, plan_commands, session_run, subscription_commands};
 use autopoiesis::auth;
 use autopoiesis::logging::STDOUT_USER_OUTPUT_TARGET;
 use autopoiesis::server;
@@ -70,6 +70,9 @@ async fn main() -> Result<()> {
         }
         Some(args::Commands::Plan { action }) => {
             plan_commands::handle_plan_command(action).await?;
+        }
+        Some(args::Commands::Enqueue(args)) => {
+            enqueue_command::handle_enqueue_command(args).await?;
         }
         Some(args::Commands::Sub { action }) => {
             subscription_commands::handle_subscription_command(action).await?;

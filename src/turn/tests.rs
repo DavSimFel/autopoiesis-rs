@@ -1296,6 +1296,33 @@ fn test_config_for_tier(tier: Option<&str>, budget: Option<BudgetConfig>) -> Con
     config
 }
 
+fn registry_config_for_manifest() -> Config {
+    let mut config = test_config_for_tier(Some("t2"), None);
+    if let Some(agent) = config.agents.entries.get_mut("silas") {
+        agent.t1 = AgentTierConfig {
+            model: Some("gpt-5.4".to_string()),
+            base_url: None,
+            system_prompt: Some("t1 manifest".to_string()),
+            session_name: Some("silas-t1".to_string()),
+            reasoning: None,
+            reasoning_effort: None,
+            delegation_token_threshold: None,
+            delegation_tool_depth: None,
+        };
+        agent.t2 = AgentTierConfig {
+            model: Some("o3".to_string()),
+            base_url: None,
+            system_prompt: Some("t2 manifest".to_string()),
+            session_name: Some("silas-t2".to_string()),
+            reasoning: Some("high".to_string()),
+            reasoning_effort: None,
+            delegation_token_threshold: None,
+            delegation_tool_depth: None,
+        };
+    }
+    config
+}
+
 #[test]
 fn build_default_turn_carries_delegation_thresholds_into_turn_config() {
     let config = crate::config::Config::load("agents.toml").expect("config should load");
@@ -1353,6 +1380,69 @@ fn build_turn_for_config_with_subscriptions_preserves_t3_subscriptions() {
         })
         .collect::<Vec<_>>();
 
+    assert!(
+        system_texts
+            .iter()
+            .any(|text| text.contains("subscribed content"))
+    );
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn build_turn_for_config_with_subscriptions_and_manifest_preserves_subscriptions() {
+    let root = std::env::temp_dir().join(format!(
+        "autopoiesis_turn_manifest_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let subscription_path = root.join("notes.txt");
+    std::fs::write(&subscription_path, "subscribed content").unwrap();
+
+    let config = registry_config_for_manifest();
+    let registry = crate::session_registry::SessionRegistry::from_config(&config).unwrap();
+    let manifest = crate::context::SessionManifest::from_registry(&registry);
+    let turn = build_turn_for_config_with_subscriptions_and_manifest(
+        &config,
+        &[SubscriptionRecord {
+            id: 1,
+            session_id: None,
+            topic: "topic".to_string(),
+            path: subscription_path,
+            filter: crate::subscription::SubscriptionFilter::Full,
+            activated_at: "2026-03-25T00:00:00Z".to_string(),
+            updated_at: "2026-03-25T00:00:01Z".to_string(),
+        }],
+        Some(&manifest),
+    )
+    .unwrap();
+
+    let mut messages = Vec::new();
+    turn.assemble_context(&mut messages);
+    let system_texts = messages
+        .iter()
+        .filter(|message| message.role == crate::llm::ChatRole::System)
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    MessageContent::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        system_texts
+            .iter()
+            .any(|text| text.contains("## Available Sessions"))
+    );
     assert!(
         system_texts
             .iter()

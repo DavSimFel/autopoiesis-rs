@@ -1,4 +1,5 @@
 use super::ServerState;
+use crate::context::SessionManifest;
 
 #[cfg(test)]
 use super::session_lock::SessionLockLease;
@@ -63,7 +64,8 @@ pub(super) async fn drain_session_queue_with_turn_builder<F, Fut, P, TS, AH, TB>
     make_provider: &mut F,
     token_sink: &mut TS,
     approval_handler: &mut AH,
-) -> Result<Option<crate::agent::TurnVerdict>>
+    pause_while_websocket_active: bool,
+) -> Result<(Option<crate::agent::TurnVerdict>, bool)>
 where
     F: FnMut() -> Fut + Send,
     Fut: std::future::Future<Output = Result<P>> + Send,
@@ -79,12 +81,43 @@ where
         make_provider,
         token_sink,
         approval_handler,
+        pause_while_websocket_active,
     )
     .await
 }
 
-pub(super) fn spawn_http_queue_worker(state: ServerState, session_id: String) {
-    super::queue_worker::spawn_background_queue_worker(state, session_id)
+pub(super) fn spawn_http_queue_worker(
+    state: ServerState,
+    session_id: String,
+    config: crate::config::Config,
+    session_manifest: Option<SessionManifest>,
+) {
+    tokio::spawn(async move {
+        let mut token_sink = super::queue_worker::NoopTokenSink;
+        let mut approval_handler = super::queue_worker::RejectApprovalHandler;
+        match super::queue_worker::drain_session_queue_with_subscriptions(
+            state,
+            session_id.clone(),
+            config,
+            session_manifest,
+            &mut token_sink,
+            &mut approval_handler,
+            false,
+        )
+        .await
+        {
+            Ok((Some(verdict), _processed_any)) => match verdict {
+                crate::agent::TurnVerdict::Denied { reason: _, gate_id } => {
+                    tracing::warn!(%gate_id, "http turn denied");
+                }
+                _ => unreachable!("drain_queue only returns denial verdicts"),
+            },
+            Ok((None, _processed_any)) => {}
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "failed to drain queued HTTP messages");
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -281,19 +314,19 @@ mod tests {
         let mut token_sink = |_token: String| {};
         let mut approval_handler = |_severity: &Severity, _reason: &str, _command: &str| true;
 
-        assert!(
-            drain_session_queue_with_turn_builder(
-                state.clone(),
-                session_id.to_string(),
-                &mut turn_builder,
-                &mut provider_factory,
-                &mut token_sink,
-                &mut approval_handler,
-            )
-            .await
-            .unwrap()
-            .is_none()
-        );
+        let (verdict, processed_any) = drain_session_queue_with_turn_builder(
+            state.clone(),
+            session_id.to_string(),
+            &mut turn_builder,
+            &mut provider_factory,
+            &mut token_sink,
+            &mut approval_handler,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(verdict.is_none());
+        assert!(processed_any);
 
         assert_eq!(builder_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 

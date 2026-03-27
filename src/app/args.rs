@@ -31,6 +31,7 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: PlanCommand,
     },
+    Enqueue(EnqueueArgs),
     Sub {
         #[command(subcommand)]
         action: SubscriptionCommand,
@@ -115,6 +116,15 @@ pub(crate) struct PlanListArgs {
     pub(crate) limit: usize,
 }
 
+#[derive(Args)]
+pub(crate) struct EnqueueArgs {
+    #[arg(long)]
+    pub(crate) session: String,
+
+    #[arg(help = "Message to enqueue", trailing_var_arg = true)]
+    pub(crate) message: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +198,18 @@ mod tests {
             Some(Commands::Plan {
                 action: PlanCommand::List(args),
             }) => assert_eq!(args.limit, 3),
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn parses_enqueue_command() {
+        let cli = Cli::parse_from(["autopoiesis", "enqueue", "--session", "silas-t1", "hello"]);
+        match cli.command {
+            Some(Commands::Enqueue(args)) => {
+                assert_eq!(args.session, "silas-t1");
+                assert_eq!(args.message, vec!["hello".to_string()]);
+            }
             _ => panic!("unexpected command variant"),
         }
     }

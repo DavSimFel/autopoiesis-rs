@@ -1,8 +1,13 @@
 use super::*;
 use crate::Principal;
+use crate::config::{
+    AgentDefinition, AgentTierConfig, BudgetConfig, Config, DomainsConfig, ModelsConfig,
+    QueueConfig, ReadToolConfig, ShellPolicy, SubscriptionsConfig,
+};
 use crate::identity;
 use crate::llm::history_groups::{estimate_message_tokens, estimate_messages_tokens};
 use crate::llm::{ChatRole, MessageContent};
+use crate::session_registry::SessionRegistry;
 use crate::skills::SkillDefinition;
 use crate::skills::SkillSummary;
 use crate::subscription::{SubscriptionFilter, SubscriptionRecord};
@@ -86,6 +91,68 @@ fn subscription_record(
     }
 }
 
+fn manifest_config() -> Config {
+    let mut agents = crate::config::AgentsConfig::default();
+    agents.entries.insert(
+        "silas".to_string(),
+        AgentDefinition {
+            identity: Some("silas".to_string()),
+            tier: None,
+            model: Some("gpt-5.4-mini".to_string()),
+            base_url: Some("https://example.test/api".to_string()),
+            system_prompt: Some("legacy defaults".to_string()),
+            session_name: Some("legacy-session".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            t1: AgentTierConfig {
+                model: Some("gpt-5.4-mini".to_string()),
+                base_url: None,
+                system_prompt: Some("t1 prompt".to_string()),
+                session_name: Some("silas-t1".to_string()),
+                reasoning: None,
+                reasoning_effort: None,
+                delegation_token_threshold: None,
+                delegation_tool_depth: None,
+            },
+            t2: AgentTierConfig {
+                model: Some("o3".to_string()),
+                base_url: None,
+                system_prompt: Some("t2 prompt".to_string()),
+                session_name: Some("silas-t2".to_string()),
+                reasoning: Some("high".to_string()),
+                reasoning_effort: None,
+                delegation_token_threshold: None,
+                delegation_tool_depth: None,
+            },
+        },
+    );
+
+    Config {
+        model: "gpt-5.4-mini".to_string(),
+        system_prompt: "system".to_string(),
+        base_url: "https://example.test/api".to_string(),
+        reasoning_effort: Some("medium".to_string()),
+        session_name: Some("legacy-session".to_string()),
+        operator_key: None,
+        shell_policy: ShellPolicy::default(),
+        budget: Some(BudgetConfig {
+            max_tokens_per_turn: None,
+            max_tokens_per_session: None,
+            max_tokens_per_day: None,
+        }),
+        read: ReadToolConfig::default(),
+        subscriptions: SubscriptionsConfig::default(),
+        queue: QueueConfig::default(),
+        identity_files: identity::t1_identity_files("identity-templates", "silas"),
+        agents,
+        models: ModelsConfig::default(),
+        domains: DomainsConfig::default(),
+        skills_dir: std::path::PathBuf::from("skills"),
+        skills_dir_resolved: std::path::PathBuf::from("skills"),
+        skills: crate::skills::SkillCatalog::default(),
+        active_agent: Some("silas".to_string()),
+    }
+}
+
 fn capture_warnings<F>(f: F) -> String
 where
     F: FnOnce(),
@@ -159,6 +226,36 @@ fn identity_prompt_rewrites_existing_agent_system_message() {
         "constitution\n\nidentity\n\ncontext"
     );
     assert_eq!(message_text(&messages[1]), "ask");
+}
+
+#[test]
+fn session_manifest_renders_deterministically_into_system_context() {
+    let registry = SessionRegistry::from_config(&manifest_config()).unwrap();
+    let manifest = SessionManifest::from_registry(&registry);
+    let mut messages = vec![ChatMessage::system_with_principal(
+        "base prompt",
+        Some(crate::principal::Principal::Agent),
+    )];
+
+    manifest.assemble(&mut messages);
+
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, ChatRole::System);
+    let rendered = messages[0]
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            MessageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("base prompt"));
+    assert!(rendered.contains("## Available Sessions"));
+    assert!(rendered.contains("silas-t1"));
+    assert!(rendered.contains("silas-t2"));
+    assert_eq!(rendered.matches("## Available Sessions").count(), 1);
+    assert!(rendered.find("silas-t1").unwrap() < rendered.find("silas-t2").unwrap());
 }
 
 #[test]

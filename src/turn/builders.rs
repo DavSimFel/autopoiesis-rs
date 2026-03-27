@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::context::{Identity, SkillContext, SkillLoader, SubscriptionContext};
+use crate::context::{Identity, SessionManifest, SkillContext, SkillLoader, SubscriptionContext};
 use crate::read_tool::ReadFile;
 use crate::skills::SkillDefinition;
 use crate::subscription::SubscriptionRecord;
@@ -41,14 +41,19 @@ fn add_budget_guard(turn: Turn, config: &crate::config::Config) -> Turn {
     turn
 }
 
-fn build_turn_with_tool(
-    config: &crate::config::Config,
-    tool: impl crate::tool::Tool + 'static,
+struct TurnBuildOptions<'a> {
     include_shell_guards: bool,
     include_delegation: bool,
     include_skills: bool,
     skill_loader: Option<Vec<SkillDefinition>>,
-    subscriptions: &[SubscriptionRecord],
+    session_manifest: Option<SessionManifest>,
+    subscriptions: &'a [SubscriptionRecord],
+}
+
+fn build_turn_with_tool(
+    config: &crate::config::Config,
+    tool: impl crate::tool::Tool + 'static,
+    options: TurnBuildOptions<'_>,
 ) -> Result<Turn> {
     let tool_definition = tool.definition();
     let vars = identity_vars_for_turn(config, std::slice::from_ref(&tool_definition));
@@ -56,20 +61,23 @@ fn build_turn_with_tool(
         crate::identity::load_system_prompt_from_files(&config.identity_files, &vars)?;
     let mut turn = Turn::new()
         .context(Identity::new(config.identity_files.clone(), vars, &identity_prompt).strict());
-    if include_skills {
+    if options.include_skills {
         turn = turn.context(SkillContext::new(config.skills.browse()));
     }
-    if let Some(skills) = skill_loader {
+    if let Some(skills) = options.skill_loader {
         turn = turn.context(SkillLoader::new(skills));
     }
+    if let Some(session_manifest) = options.session_manifest {
+        turn = turn.context(session_manifest);
+    }
     turn = turn.context(SubscriptionContext::new(
-        subscriptions.to_vec(),
+        options.subscriptions.to_vec(),
         config.subscriptions.context_token_budget,
     ));
     turn = turn.tool(tool);
     turn = add_budget_guard(turn, config).guard(crate::gate::SecretRedactor::default_catalog());
 
-    if include_shell_guards {
+    if options.include_shell_guards {
         turn = turn
             .guard(crate::gate::ShellSafety::with_policy_and_skills_dirs(
                 config.shell_policy.clone(),
@@ -84,7 +92,7 @@ fn build_turn_with_tool(
             ]));
     }
 
-    if include_delegation
+    if options.include_delegation
         && let Some(tier) = config.active_t1_config()
         && (tier.delegation_token_threshold.is_some() || tier.delegation_tool_depth.is_some())
     {
@@ -105,11 +113,14 @@ pub fn build_default_turn(config: &crate::config::Config) -> Result<Turn> {
             config.shell_policy.max_output_bytes,
             config.shell_policy.max_timeout_ms,
         ),
-        true,
-        true,
-        true,
-        None,
-        &[],
+        TurnBuildOptions {
+            include_shell_guards: true,
+            include_delegation: true,
+            include_skills: true,
+            skill_loader: None,
+            session_manifest: None,
+            subscriptions: &[],
+        },
     )
 }
 
@@ -123,6 +134,15 @@ pub fn build_turn_for_config_with_subscriptions(
     config: &crate::config::Config,
     subscriptions: &[SubscriptionRecord],
 ) -> Result<Turn> {
+    build_turn_for_config_with_subscriptions_and_manifest(config, subscriptions, None)
+}
+
+/// Build the active tier turn with explicit active subscriptions and an optional session manifest.
+pub fn build_turn_for_config_with_subscriptions_and_manifest(
+    config: &crate::config::Config,
+    subscriptions: &[SubscriptionRecord],
+    session_manifest: Option<&SessionManifest>,
+) -> Result<Turn> {
     match resolve_tier(config) {
         TurnTier::T1 => build_turn_with_tool(
             config,
@@ -130,25 +150,29 @@ pub fn build_turn_for_config_with_subscriptions(
                 config.shell_policy.max_output_bytes,
                 config.shell_policy.max_timeout_ms,
             ),
-            true,
-            true,
-            true,
-            None,
-            subscriptions,
+            TurnBuildOptions {
+                include_shell_guards: true,
+                include_delegation: true,
+                include_skills: true,
+                skill_loader: None,
+                session_manifest: session_manifest.cloned(),
+                subscriptions,
+            },
         ),
-        TurnTier::T2 => build_t2_turn_with_subscriptions(config, subscriptions),
-        TurnTier::T3 => build_t3_turn_with_subscriptions(config, subscriptions),
+        TurnTier::T2 => build_t2_turn_with_subscriptions(config, subscriptions, session_manifest),
+        TurnTier::T3 => build_t3_turn_with_subscriptions(config, subscriptions, session_manifest),
     }
 }
 
 /// Build a T2 turn with structured reads only.
 pub fn build_t2_turn(config: &crate::config::Config) -> Result<Turn> {
-    build_t2_turn_with_subscriptions(config, &[])
+    build_t2_turn_with_subscriptions(config, &[], None)
 }
 
 fn build_t2_turn_with_subscriptions(
     config: &crate::config::Config,
     subscriptions: &[SubscriptionRecord],
+    session_manifest: Option<&SessionManifest>,
 ) -> Result<Turn> {
     build_turn_with_tool(
         config,
@@ -159,22 +183,26 @@ fn build_t2_turn_with_subscriptions(
                 config.skills_dir_resolved.clone(),
             ],
         ),
-        false,
-        false,
-        true,
-        None,
-        subscriptions,
+        TurnBuildOptions {
+            include_shell_guards: false,
+            include_delegation: false,
+            include_skills: true,
+            skill_loader: None,
+            session_manifest: session_manifest.cloned(),
+            subscriptions,
+        },
     )
 }
 
 /// Build a T3 turn with shell access but no delegation hint support.
 pub fn build_t3_turn(config: &crate::config::Config) -> Result<Turn> {
-    build_t3_turn_with_subscriptions(config, &[])
+    build_t3_turn_with_subscriptions(config, &[], None)
 }
 
 fn build_t3_turn_with_subscriptions(
     config: &crate::config::Config,
     subscriptions: &[SubscriptionRecord],
+    session_manifest: Option<&SessionManifest>,
 ) -> Result<Turn> {
     build_turn_with_tool(
         config,
@@ -182,11 +210,14 @@ fn build_t3_turn_with_subscriptions(
             config.shell_policy.max_output_bytes,
             config.shell_policy.max_timeout_ms,
         ),
-        true,
-        false,
-        false,
-        None,
-        subscriptions,
+        TurnBuildOptions {
+            include_shell_guards: true,
+            include_delegation: false,
+            include_skills: false,
+            skill_loader: None,
+            session_manifest: session_manifest.cloned(),
+            subscriptions,
+        },
     )
 }
 
@@ -200,10 +231,13 @@ pub fn build_spawned_t3_turn(
             config.shell_policy.max_output_bytes,
             config.shell_policy.max_timeout_ms,
         ),
-        true,
-        false,
-        false,
-        Some(skills),
-        &[],
+        TurnBuildOptions {
+            include_shell_guards: true,
+            include_delegation: false,
+            include_skills: false,
+            skill_loader: Some(skills),
+            session_manifest: None,
+            subscriptions: &[],
+        },
     )
 }

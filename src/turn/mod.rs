@@ -14,6 +14,7 @@ pub mod verdicts;
 pub use builders::{
     build_default_turn, build_spawned_t3_turn, build_t2_turn, build_t3_turn, build_turn_for_config,
     build_turn_for_config_with_subscriptions,
+    build_turn_for_config_with_subscriptions_and_manifest,
 };
 pub use tiers::{TurnTier, resolve_tier};
 pub use verdicts::{GuardTraceOutcome, TracedVerdict, resolve_traced_verdict, resolve_verdict};

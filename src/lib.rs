@@ -16,6 +16,7 @@ pub mod principal;
 pub mod read_tool;
 pub mod server;
 pub mod session;
+pub mod session_registry;
 pub mod skills;
 pub mod store;
 pub mod terminal_ui;
@@ -24,7 +25,8 @@ pub mod terminal_ui;
 pub(crate) mod test_support;
 
 pub use session_runtime::factory::{
-    build_openai_provider_factory, build_turn_builder_for_subscriptions, build_turn_builder_for_t3,
+    build_openai_provider_factory, build_turn_builder_for_subscriptions,
+    build_turn_builder_for_subscriptions_with_manifest, build_turn_builder_for_t3,
     load_subscriptions_for_session,
 };
 

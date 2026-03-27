@@ -77,6 +77,15 @@ fn assert_default_read_config(read: &ReadToolConfig) {
 }
 
 #[test]
+fn agent_tier_config_reports_configuration_state() {
+    let mut tier = AgentTierConfig::default();
+    assert!(!tier.is_configured());
+
+    tier.model = Some("gpt-5.4-mini".to_string());
+    assert!(tier.is_configured());
+}
+
+#[test]
 fn loads_valid_agents_toml_with_all_fields() {
     let path = temp_toml_path(
         "all_fields",

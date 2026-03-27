@@ -8,12 +8,14 @@ pub trait ContextSource: Send + Sync {
 
 pub mod history;
 pub mod identity_prompt;
+pub mod session_manifest;
 pub mod skill_instructions;
 pub mod skill_summaries;
 pub mod subscriptions;
 
 pub use history::History;
 pub use identity_prompt::Identity;
+pub use session_manifest::SessionManifest;
 pub use skill_instructions::SkillLoader;
 pub use skill_summaries::SkillContext;
 pub use subscriptions::SubscriptionContext;

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use crate::context::SessionManifest;
 use crate::principal::Principal;
 
 use super::queue::spawn_http_queue_worker;
@@ -142,8 +143,16 @@ pub(super) async fn enqueue_message(
         return Err(HttpError::bad_request("invalid session id"));
     }
 
+    let registry_spec = state.registry.get(&session_id).cloned();
+    let session_manifest = registry_spec
+        .as_ref()
+        .map(|_| SessionManifest::from_registry(&state.registry));
     let mut store = state.store.lock().await;
-    if let Err(error) = store.create_session(&session_id, None) {
+    if registry_spec.is_some() {
+        if let Err(error) = store.ensure_session_row(&session_id) {
+            return Err(HttpError::Internal(error));
+        }
+    } else if let Err(error) = store.create_session(&session_id, None) {
         return Err(HttpError::Internal(error));
     }
 
@@ -152,7 +161,23 @@ pub(super) async fn enqueue_message(
     match store.enqueue_message(&session_id, role, &payload.content, &source) {
         Ok(message_id) => {
             drop(store);
-            spawn_http_queue_worker(state.clone(), session_id.clone());
+            if let Some(spec) = registry_spec {
+                if !spec.always_on {
+                    spawn_http_queue_worker(
+                        state.clone(),
+                        session_id.clone(),
+                        spec.config,
+                        session_manifest,
+                    );
+                }
+            } else {
+                spawn_http_queue_worker(
+                    state.clone(),
+                    session_id.clone(),
+                    state.config.clone(),
+                    None,
+                );
+            }
             Ok((StatusCode::OK, Json(EnqueueMessageResponse { message_id })))
         }
         Err(error) => Err(HttpError::Internal(error)),

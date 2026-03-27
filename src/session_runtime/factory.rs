@@ -8,6 +8,7 @@ use reqwest::Client;
 
 use crate::auth;
 use crate::config::Config;
+use crate::context::SessionManifest;
 use crate::llm::openai::OpenAIProvider;
 use crate::store::Store;
 use crate::subscription::SubscriptionRecord;
@@ -28,7 +29,21 @@ pub fn build_turn_builder_for_subscriptions(
     config: Config,
     subscriptions: Vec<SubscriptionRecord>,
 ) -> impl FnMut() -> Result<Turn> {
-    move || turn::build_turn_for_config_with_subscriptions(&config, &subscriptions)
+    build_turn_builder_for_subscriptions_with_manifest(config, subscriptions, None)
+}
+
+pub fn build_turn_builder_for_subscriptions_with_manifest(
+    config: Config,
+    subscriptions: Vec<SubscriptionRecord>,
+    session_manifest: Option<SessionManifest>,
+) -> impl FnMut() -> Result<Turn> {
+    move || {
+        turn::build_turn_for_config_with_subscriptions_and_manifest(
+            &config,
+            &subscriptions,
+            session_manifest.as_ref(),
+        )
+    }
 }
 
 pub fn build_openai_provider_factory(

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use reqwest::Client;
 use tokio::sync::Mutex;
 
-use crate::{config, identity, server, skills, store};
+use crate::{config, identity, server, session_registry, skills, store};
 
 fn test_root(prefix: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
@@ -56,14 +56,19 @@ pub(crate) fn new_test_server_state(prefix: &str) -> (server::ServerState, PathB
     let sessions_dir = root.join("sessions");
     std::fs::create_dir_all(&sessions_dir).unwrap();
     let store = store::Store::new(root.join("queue.sqlite")).unwrap();
+    let config = test_config();
+    let registry = session_registry::SessionRegistry::from_config(&config).unwrap();
     let state = server::ServerState::new(
         Arc::new(Mutex::new(store)),
         Arc::new(StdMutex::new(HashMap::new())),
         sessions_dir,
-        "mock-api-key".to_string(),
-        Some("test-operator-key".to_string()),
-        test_config(),
-        Client::new(),
+        server::state::ServerStateInit {
+            api_key: "mock-api-key".to_string(),
+            operator_key: Some("test-operator-key".to_string()),
+            config,
+            registry,
+            http_client: Client::new(),
+        },
     );
     (state, root)
 }

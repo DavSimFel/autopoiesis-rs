@@ -1,4 +1,5 @@
 pub mod args;
+pub mod enqueue_command;
 pub mod plan_commands;
 pub mod session_run;
 pub mod subscription_commands;

@@ -12,6 +12,7 @@
 ## Module Map
 
 - `src/main.rs` - CLI entrypoint, server launch, tracing setup.
+- `src/app/enqueue_command.rs` - CLI queue-only entrypoint for registry-backed sessions.
 - `src/terminal_ui.rs` - CLI presentation and denial formatting.
 - `src/lib.rs` - crate re-exports.
 - `src/agent/loop_impl.rs` - core agent loop and turn runner.
@@ -41,8 +42,9 @@
 - `src/plan/recovery.rs` - crash recovery for stalled plan runs.
 - `src/config/mod.rs` - config facade; `src/config/{runtime,load,spawn_runtime,agents,models,domains,policy,file_schema}.rs` own runtime state, validation, and schema parsing.
 - `src/context/mod.rs` - context facade and public reexports.
-- `src/context/{identity_prompt,skill_summaries,skill_instructions,subscriptions,history}.rs` - focused context sources and prompt assembly helpers.
+- `src/context/{identity_prompt,skill_summaries,skill_instructions,session_manifest,subscriptions,history}.rs` - focused context sources and prompt assembly helpers.
 - `src/session/mod.rs` - JSONL history and per-session metadata.
+- `src/session_registry.rs` - registry materialization for startup and CLI/server routing.
 - `src/store/mod.rs` - SQLite sessions, queue, subscriptions, and plan tables.
 - `src/turn/mod.rs` - turn facade and public reexports.
 - `src/turn/{verdicts,tiers,builders}.rs` - guard verdicts, tier resolution, and turn construction.
@@ -65,10 +67,13 @@
 ## Execution Flow
 
 ```text
-CLI / HTTP / WS
+Config -> SessionRegistry
+  -> startup bootstrap of declared session rows
+  -> queue-owned always-on workers paused by active websocket sessions
+  -> CLI enqueue / HTTP / WS
   -> SQLite queue
   -> atomic claim
-  -> build_turn_for_config()
+  -> build_turn_for_config(..., optional session manifest)
   -> identity + context + tier tool surface + guards
   -> LLM stream
   -> tool calls / approvals / guard checks
@@ -91,14 +96,25 @@ CLI / HTTP / WS
 - Queue claims are atomic.
 - Startup recovery only requeues stale `processing` rows.
 - `session/mod.rs` keeps JSONL history and tool-call metadata.
-- `store/mod.rs` owns the registry tables for sessions, subscriptions, and plan runs.
+- `store/mod.rs` owns the sessions table, subscriptions, and plan runs.
+- Declared registry-backed sessions are bootstrapped idempotently before server workers start.
+
+### Session Registry and Routing
+
+- `session_registry.rs` derives session ids and per-session runtime configs from loaded `agents.toml`.
+- Always-on registry-backed sessions are queue-owned and each gets one persistent worker.
+- HTTP enqueues registry-backed always-on sessions to the queue worker path.
+- WebSocket sessions mark the session active, pause the always-on worker with a count gate, drain inline, then clear the active mark on disconnect.
+- Registry-backed non-always-on sessions reuse request-owned execution with the registry manifest.
+- Non-registry sessions keep the legacy ad hoc request-owned path.
+- `autopoiesis enqueue` is the explicit CLI path for queue-owned sessions.
 
 ### Tiered Turns
 
 - T1 uses shell plus its identity stack and skill summaries.
 - T2 uses `read_file` only, plus its identity stack and skill summaries.
 - T3 uses shell and can receive full skill instructions when spawned.
-- `build_turn_for_config()` is shared by CLI and server paths through the turn builder module.
+- `build_turn_for_config()` remains the shared facade; registry-backed sessions thread the optional `## Available Sessions` manifest through the same builder path.
 
 ### Guard Pipeline
 
@@ -133,4 +149,4 @@ CLI / HTTP / WS
 
 - Subscriptions are stored in SQLite with filters and token estimates.
 - They are durable and queryable today.
-- They are not yet wired into turn-context assembly.
+- They are wired into turn-context assembly alongside the identity and session manifest blocks.

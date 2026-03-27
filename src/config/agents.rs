@@ -50,6 +50,19 @@ pub struct AgentTierConfig {
     pub delegation_tool_depth: Option<u32>,
 }
 
+impl AgentTierConfig {
+    pub fn is_configured(&self) -> bool {
+        self.model.is_some()
+            || self.base_url.is_some()
+            || self.system_prompt.is_some()
+            || self.session_name.is_some()
+            || self.reasoning.is_some()
+            || self.reasoning_effort.is_some()
+            || self.delegation_token_threshold.is_some()
+            || self.delegation_tool_depth.is_some()
+    }
+}
+
 /// v2 currently supports exactly one active agent entry. If multiple named
 /// agents are added, configuration should be extended with an explicit
 /// selector before startup tries to resolve them.

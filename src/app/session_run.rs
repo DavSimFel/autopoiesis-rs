@@ -7,29 +7,41 @@ use tracing::warn;
 use crate::app::args::Cli;
 use autopoiesis::agent;
 use autopoiesis::config;
+use autopoiesis::context::SessionManifest;
 use autopoiesis::session;
+use autopoiesis::session_registry::SessionRegistry;
 use autopoiesis::session_runtime::{
-    build_openai_provider_factory, build_turn_builder_for_subscriptions, drain_queue_with_store,
-    load_subscriptions_for_session,
+    build_openai_provider_factory, build_turn_builder_for_subscriptions_with_manifest,
+    drain_queue_with_store, load_subscriptions_for_session,
 };
 use autopoiesis::store;
 use autopoiesis::terminal_ui;
 
-fn resolve_session_id(cli_session: Option<&str>, config_session: Option<&str>) -> String {
-    cli_session
-        .or(config_session)
-        .unwrap_or("default")
-        .to_string()
+fn resolve_session_id(
+    cli_session: Option<&str>,
+    config_session: Option<&str>,
+    registry_default: Option<&str>,
+) -> Result<String> {
+    if let Some(session_id) = cli_session.or(config_session).or(registry_default) {
+        return Ok(session_id.to_string());
+    }
+
+    Err(anyhow!("no default session configured; pass --session"))
 }
 
 struct PromptRunner<'a, F> {
     queue: &'a mut store::Store,
     history: &'a mut session::Session,
     session_id: &'a str,
-    provider_config: &'a config::Config,
+    runtime: PromptRunnerRuntime<'a>,
     provider_factory: &'a mut F,
     token_sink: &'a mut (dyn agent::TokenSink + Send),
     approval_handler: &'a mut (dyn agent::ApprovalHandler + Send),
+}
+
+struct PromptRunnerRuntime<'a> {
+    provider_config: &'a config::Config,
+    session_manifest: Option<&'a SessionManifest>,
 }
 
 impl<'a, F> PromptRunner<'a, F> {
@@ -37,7 +49,7 @@ impl<'a, F> PromptRunner<'a, F> {
         queue: &'a mut store::Store,
         history: &'a mut session::Session,
         session_id: &'a str,
-        provider_config: &'a config::Config,
+        runtime: PromptRunnerRuntime<'a>,
         provider_factory: &'a mut F,
         token_sink: &'a mut (dyn agent::TokenSink + Send),
         approval_handler: &'a mut (dyn agent::ApprovalHandler + Send),
@@ -46,7 +58,7 @@ impl<'a, F> PromptRunner<'a, F> {
             queue,
             history,
             session_id,
-            provider_config,
+            runtime,
             provider_factory,
             token_sink,
             approval_handler,
@@ -64,8 +76,11 @@ where
         self.queue
             .enqueue_message(self.session_id, "user", prompt, "cli")?;
         let subscriptions = load_subscriptions_for_session(self.queue, self.session_id)?;
-        let mut turn_builder =
-            build_turn_builder_for_subscriptions(self.provider_config.clone(), subscriptions);
+        let mut turn_builder = build_turn_builder_for_subscriptions_with_manifest(
+            self.runtime.provider_config.clone(),
+            subscriptions,
+            self.runtime.session_manifest.cloned(),
+        );
         let (verdict, _, _) = drain_queue_with_store(
             &mut *self.queue,
             self.session_id,
@@ -120,8 +135,19 @@ where
 pub(crate) async fn run(cli: &Cli) -> Result<()> {
     let config = config::Config::load("agents.toml")
         .map_err(|error| anyhow!("failed to load configuration: {error}"))?;
+    let registry = SessionRegistry::from_config(&config)
+        .map_err(|error| anyhow!("failed to build session registry: {error}"))?;
+    let registry_default = registry
+        .sessions()
+        .into_iter()
+        .find(|spec| spec.tier == "t1")
+        .map(|spec| spec.session_id.as_str());
 
-    let session_id = resolve_session_id(cli.session.as_deref(), config.session_name.as_deref());
+    let session_id = resolve_session_id(
+        cli.session.as_deref(),
+        config.session_name.as_deref(),
+        registry_default,
+    )?;
     let session_root = format!("sessions/{session_id}");
     let mut history = session::Session::new(&session_root)?;
     history.load_today()?;
@@ -136,11 +162,28 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
             warn!("warning: failed to recover stale messages: {error}");
         }
     }
-    queue.create_session(&session_id, Some(r#"{"source":"cli"}"#))?;
+    let registry_spec = registry.get(&session_id).cloned();
+    let provider_config = registry_spec
+        .as_ref()
+        .map(|spec| spec.config.clone())
+        .unwrap_or_else(|| config.clone());
+    if let Some(spec) = registry_spec.as_ref() {
+        if spec.always_on {
+            return Err(anyhow!(
+                "session '{}' is queue-owned; use `autopoiesis enqueue --session {session_id}`",
+                spec.session_id
+            ));
+        }
+        queue.ensure_session_row(&session_id)?;
+    } else {
+        queue.create_session(&session_id, Some(r#"{"source":"cli"}"#))?;
+    }
 
-    let provider_config = config.clone();
     let http_client = Client::new();
     let mut provider_factory = build_openai_provider_factory(http_client, provider_config.clone());
+    let session_manifest = registry_spec
+        .as_ref()
+        .map(|_| SessionManifest::from_registry(&registry));
 
     let mut token_sink = terminal_ui::CliTokenSink::new();
     let mut approval_handler = terminal_ui::CliApprovalHandler::new();
@@ -148,7 +191,10 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
         &mut queue,
         &mut history,
         &session_id,
-        &provider_config,
+        PromptRunnerRuntime {
+            provider_config: &provider_config,
+            session_manifest: session_manifest.as_ref(),
+        },
         &mut provider_factory,
         &mut token_sink,
         &mut approval_handler,
@@ -179,21 +225,34 @@ mod tests {
     #[test]
     fn resolve_session_id_prefers_cli_value() {
         assert_eq!(
-            resolve_session_id(Some("fix-auth"), Some("configured-default")),
+            resolve_session_id(
+                Some("fix-auth"),
+                Some("configured-default"),
+                Some("silas-t1"),
+            )
+            .unwrap(),
             "fix-auth"
         );
     }
 
     #[test]
-    fn resolve_session_id_uses_config_value_when_cli_missing() {
+    fn resolve_session_id_uses_configured_default_when_cli_missing() {
         assert_eq!(
-            resolve_session_id(None, Some("configured-default")),
+            resolve_session_id(None, Some("configured-default"), Some("silas-t1")).unwrap(),
             "configured-default"
         );
     }
 
     #[test]
-    fn resolve_session_id_falls_back_to_default() {
-        assert_eq!(resolve_session_id(None, None), "default");
+    fn resolve_session_id_falls_back_to_registry_default() {
+        assert_eq!(
+            resolve_session_id(None, None, Some("silas-t1")).unwrap(),
+            "silas-t1"
+        );
+    }
+
+    #[test]
+    fn resolve_session_id_errors_without_any_default() {
+        assert!(resolve_session_id(None, None, None).is_err());
     }
 }
