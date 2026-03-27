@@ -5,9 +5,9 @@
 ## Snapshot
 
 - Rust source files in `src/`: `104`
-- Lines of Rust in `src/`: `38,037`
-- Lines of Rust in `tests/`: `1,873`
-- Commits on `HEAD`: `177`
+- Lines of Rust in `src/`: `38,142`
+- Lines of Rust in `tests/`: `1,901`
+- Commits on `HEAD`: `178`
 
 ## Module Map
 
@@ -113,6 +113,8 @@ CLI / HTTP / WS
 - T2 and T3 load constitution and context only.
 - Selected domains append `context_extend` files to the identity assembly.
 - `identity-templates/` is the runtime prompt source of truth.
+
+> **Legacy vs v2:** The `identity-templates/` layout above is the current live implementation. The design in `docs/specs/identity-v2.md` describes the intended layered model (operator.md, persona dimensions, guard rules) which is specified but not yet built. When in doubt, the code in `src/identity.rs` and `src/config/agents.rs` is the authority.
 
 ### Skills
 

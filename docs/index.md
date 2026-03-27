@@ -38,7 +38,10 @@
 
 | Document | Path | Purpose |
 |----------|------|---------|
-| Research | [research/security-model.md](research/security-model.md) | Historical background only |
+| Security model research | [archive/security-model.md](archive/security-model.md) | Historical background only |
+| Vibe coding research | [archive/vibe-coding-2026.md](archive/vibe-coding-2026.md) | External industry research |
+| Doc review audit 2026-03-24 | [archive/doc-review-2026-03-24.md](archive/doc-review-2026-03-24.md) | Completed documentation audit |
+| Restructure plan | [archive/restructure-plan.md](archive/restructure-plan.md) | Completed historical structure plan |
 
 ## Rules
 

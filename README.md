@@ -111,7 +111,6 @@ main.rs
 ├─ plan.rs
 ├─ plan/
 │  ├─ runner.rs
-│  ├─ executor.rs
 │  ├─ notify.rs
 │  ├─ patch.rs
 │  └─ recovery.rs
@@ -140,6 +139,13 @@ main.rs
 
 The guard pipeline reduces blast radius, but it is not a sandbox. Shell commands still run as the current user with filesystem and network access. RLIMIT caps only cover process count, file size, and CPU.
 
+## Roles
+
+Throughout the docs and commit history, three names appear:
+- **David** — human operator and project owner
+- **Silas** — the AI agent persona running on this runtime (currently hosted on OpenClaw, migrating to autopoiesis)
+- **Codex** — the OpenAI Codex coding agent used to implement changes to this repo
+
 ## Documentation
 
 - [docs/index.md](docs/index.md) - docs manifest and reading order
@@ -152,10 +158,10 @@ The guard pipeline reduces blast radius, but it is not a sandbox. Shell commands
 
 ## Stats
 
-- `src/` Rust source files: `52`
-- `src/` Rust source lines: `34,821`
-- Rust tests in `src/` + `tests/`: `558`
-- Commits on `HEAD`: `159`
+- `src/` Rust source files: `104`
+- `src/` Rust source lines: `38,142`
+- Rust tests in `src/` + `tests/`: `606`
+- Commits on `HEAD`: `178`
 
 ## Tests
 
