@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 
 use anyhow::{Context, Result, anyhow};
@@ -9,7 +10,9 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
 use crate::agent;
@@ -66,6 +69,9 @@ async fn websocket_session(
     let (tx, mut rx) = mpsc::unbounded_channel::<WsFrame>();
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<String>();
     let (approval_tx, approval_rx) = std_mpsc::channel::<WsApprovalDecision>();
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_reason = Arc::new(Mutex::new(None::<String>));
 
     let writer = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
@@ -81,6 +87,9 @@ async fn websocket_session(
     });
 
     let reader_tx = tx.clone();
+    let reader_shutdown_tx = shutdown_tx.clone();
+    let reader_shutdown_reason = shutdown_reason.clone();
+    let reader_shutdown_requested = shutdown_requested.clone();
     let reader = tokio::spawn(async move {
         while let Some(message) = receiver.next().await {
             let message = match message {
@@ -91,11 +100,24 @@ async fn websocket_session(
             };
 
             if route_ws_client_message(&message, &prompt_tx, &approval_tx).is_err() {
-                let _ = reader_tx.send(WsFrame::Error {
-                    data: "invalid websocket frame".to_string(),
-                });
+                let error = "invalid websocket frame".to_string();
+                {
+                    let mut reason = reader_shutdown_reason
+                        .lock()
+                        .expect("shutdown reason lock poisoned");
+                    if reason.is_none() {
+                        *reason = Some(error.clone());
+                    }
+                }
+                reader_shutdown_requested.store(true, Ordering::SeqCst);
+                let _ = reader_tx.send(WsFrame::Error { data: error });
+                let _ = reader_shutdown_tx.send(true);
+                break;
             }
         }
+
+        reader_shutdown_requested.store(true, Ordering::SeqCst);
+        let _ = reader_shutdown_tx.send(true);
     });
 
     let registry_spec = state.registry.get(&session_id).cloned();
@@ -118,27 +140,38 @@ async fn websocket_session(
         }
     }
 
-    let mut approval_handler = WsApprovalHandler::new(tx.clone(), approval_rx);
+    let mut approval_handler =
+        WsApprovalHandler::new(tx.clone(), approval_rx, shutdown_requested.clone());
 
-    while let Some(content) = prompt_rx.recv().await {
-        if let Err(error) = handle_ws_prompt(
-            WsPromptContext {
-                state: state.clone(),
-                session_id: session_id.clone(),
-                principal,
-                registry_spec: registry_spec.clone(),
-                session_manifest: session_manifest.clone(),
-                tx: tx.clone(),
-            },
-            content,
-            &mut approval_handler,
-        )
-        .await
-        {
-            let _ = tx.send(WsFrame::Error {
-                data: format!("error: {error}"),
-            });
-            let _ = tx.send(WsFrame::Done);
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                break;
+            }
+            maybe_content = prompt_rx.recv() => {
+                let Some(content) = maybe_content else {
+                    break;
+                };
+                handle_ws_prompt(
+                    WsPromptContext {
+                        state: state.clone(),
+                        session_id: session_id.clone(),
+                        principal,
+                        registry_spec: registry_spec.clone(),
+                        session_manifest: session_manifest.clone(),
+                        tx: tx.clone(),
+                        shutdown_reason: shutdown_reason.clone(),
+                    },
+                    content,
+                    &mut approval_handler,
+                )
+                .await;
+            }
         }
     }
 
@@ -160,56 +193,244 @@ struct WsPromptContext {
     registry_spec: Option<crate::session_registry::SessionSpec>,
     session_manifest: Option<SessionManifest>,
     tx: mpsc::UnboundedSender<WsFrame>,
+    shutdown_reason: Arc<Mutex<Option<String>>>,
 }
 
 async fn handle_ws_prompt(
     context: WsPromptContext,
     content: String,
     approval_handler: &mut WsApprovalHandler,
-) -> anyhow::Result<()> {
+) {
+    approval_handler.reset_outcome();
     let session_lock = context.state.session_lock(&context.session_id);
     let _session_guard = session_lock.lock().await;
-    {
-        let mut store = context.state.store.lock().await;
-        let source = context.principal.source_for_transport("ws");
-        store
-            .enqueue_message(&context.session_id, "user", &content, &source)
-            .map_err(|error| anyhow::anyhow!("failed to enqueue websocket message: {error}"))?;
+    let prompt_result = async {
+        {
+            let mut store = context.state.store.lock().await;
+            let source = context.principal.source_for_transport("ws");
+            store
+                .enqueue_message(&context.session_id, "user", &content, &source)
+                .map_err(|error| anyhow::anyhow!("failed to enqueue websocket message: {error}"))?;
+        }
+
+        let drain_config = context
+            .registry_spec
+            .as_ref()
+            .map(|spec| spec.config.clone())
+            .unwrap_or_else(|| context.state.config.clone());
+        let mut token_sink = WsTokenSink::new(context.tx.clone());
+        queue_worker::drain_session_queue_with_subscriptions_locked(
+            context.state,
+            context.session_id,
+            drain_config,
+            context.session_manifest,
+            &mut token_sink,
+            approval_handler,
+        )
+        .await
+    }
+    .await;
+
+    let shutdown_reason = context
+        .shutdown_reason
+        .lock()
+        .expect("shutdown reason lock poisoned")
+        .clone();
+    if shutdown_reason.is_some() {
+        finish_ws_prompt(&context.tx, None);
+        return;
     }
 
-    let drain_config = context
-        .registry_spec
-        .as_ref()
-        .map(|spec| spec.config.clone())
-        .unwrap_or_else(|| context.state.config.clone());
-    let mut token_sink = WsTokenSink::new(context.tx.clone());
-    match queue_worker::drain_session_queue_with_subscriptions_locked(
-        context.state,
-        context.session_id,
-        drain_config,
-        context.session_manifest,
-        &mut token_sink,
-        approval_handler,
-    )
-    .await
-    {
+    match prompt_result {
         Ok((Some(verdict), _processed_any)) => match verdict {
             agent::TurnVerdict::Denied { reason, gate_id } => {
-                warn!(%gate_id, "websocket turn denied");
-                send_ws_terminal_denial(&context.tx, &reason);
+                match approval_handler.last_outcome() {
+                    Some(WsApprovalOutcome::InvalidResponse) => {
+                        warn!(%gate_id, "websocket approval response had the wrong request id");
+                        finish_ws_prompt(
+                            &context.tx,
+                            Some("invalid approval response for active request".to_string()),
+                        );
+                    }
+                    Some(WsApprovalOutcome::Disconnected) => {
+                        finish_ws_prompt(&context.tx, None);
+                    }
+                    _ => {
+                        warn!(%gate_id, "websocket turn denied");
+                        send_ws_terminal_denial(&context.tx, &reason);
+                    }
+                }
             }
             _ => unreachable!("drain_queue only returns denial verdicts"),
         },
-        Ok((None, _processed_any)) => {}
+        Ok((None, _processed_any)) => {
+            finish_ws_prompt(&context.tx, None);
+        }
         Err(error) => {
-            let _ = context.tx.send(WsFrame::Error {
-                data: format!("error: {error}"),
-            });
+            finish_ws_prompt(&context.tx, Some(format!("error: {error}")));
+        }
+    }
+}
+
+#[cfg(test)]
+async fn protocol_test_prompt(
+    context: WsPromptContext,
+    _content: String,
+    approval_handler: &mut WsApprovalHandler,
+) {
+    approval_handler.reset_outcome();
+    let approved = crate::agent::ApprovalHandler::request_approval(
+        approval_handler,
+        &Severity::High,
+        "risky",
+        "rm -rf /tmp/demo",
+    );
+
+    match approval_handler.last_outcome() {
+        Some(WsApprovalOutcome::InvalidResponse) => {
+            finish_ws_prompt(
+                &context.tx,
+                Some("invalid approval response for active request".to_string()),
+            );
+        }
+        Some(WsApprovalOutcome::Disconnected) => {
+            finish_ws_prompt(&context.tx, None);
+        }
+        _ if approved => {
+            finish_ws_prompt(&context.tx, None);
+        }
+        _ => {
+            send_ws_terminal_denial(&context.tx, "denied by policy");
+        }
+    }
+}
+
+#[cfg(test)]
+async fn websocket_session_protocol_test(
+    state: ServerState,
+    session_id: String,
+    principal: Principal,
+    socket: WebSocket,
+) {
+    let (mut sender, mut receiver) = socket.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<WsFrame>();
+    let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<String>();
+    let (approval_tx, approval_rx) = std_mpsc::channel::<WsApprovalDecision>();
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_reason = Arc::new(Mutex::new(None::<String>));
+
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            let payload = match serde_json::to_string(&frame) {
+                Ok(payload) => payload,
+                Err(error) => format!(r#"{{"op":"error","data":"{error}"}}"#),
+            };
+
+            if sender.send(Message::Text(payload)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let reader_tx = tx.clone();
+    let reader_shutdown_tx = shutdown_tx.clone();
+    let reader_shutdown_reason = shutdown_reason.clone();
+    let reader_shutdown_requested = shutdown_requested.clone();
+    let reader = tokio::spawn(async move {
+        while let Some(message) = receiver.next().await {
+            let message = match message {
+                Ok(Message::Text(text)) => text.to_string(),
+                Ok(Message::Close(_)) => break,
+                Err(_) => break,
+                _ => continue,
+            };
+
+            if route_ws_client_message(&message, &prompt_tx, &approval_tx).is_err() {
+                let error = "invalid websocket frame".to_string();
+                {
+                    let mut reason = reader_shutdown_reason
+                        .lock()
+                        .expect("shutdown reason lock poisoned");
+                    if reason.is_none() {
+                        *reason = Some(error.clone());
+                    }
+                }
+                reader_shutdown_requested.store(true, Ordering::SeqCst);
+                let _ = reader_tx.send(WsFrame::Error { data: error });
+                let _ = reader_shutdown_tx.send(true);
+                break;
+            }
+        }
+
+        reader_shutdown_requested.store(true, Ordering::SeqCst);
+        let _ = reader_shutdown_tx.send(true);
+    });
+
+    let registry_spec = state.registry.get(&session_id).cloned();
+    let session_manifest = registry_spec
+        .as_ref()
+        .map(|_| SessionManifest::from_registry(&state.registry));
+    let always_on = registry_spec.as_ref().is_some_and(|spec| spec.always_on);
+    if always_on {
+        state.increment_always_on_websocket_count(&session_id);
+    }
+
+    {
+        let mut store = state.store.lock().await;
+        if registry_spec.is_some() {
+            if let Err(error) = store.ensure_session_row(&session_id) {
+                warn!(%session_id, %error, "failed to ensure websocket session");
+            }
+        } else if let Err(error) = store.create_session(&session_id, None) {
+            warn!(%session_id, %error, "failed to create websocket session");
         }
     }
 
-    let _ = context.tx.send(WsFrame::Done);
-    Ok(())
+    let mut approval_handler =
+        WsApprovalHandler::new(tx.clone(), approval_rx, shutdown_requested.clone());
+
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.changed() => {
+                break;
+            }
+            maybe_content = prompt_rx.recv() => {
+                let Some(content) = maybe_content else {
+                    break;
+                };
+                protocol_test_prompt(
+                    WsPromptContext {
+                        state: state.clone(),
+                        session_id: session_id.clone(),
+                        principal,
+                        registry_spec: registry_spec.clone(),
+                        session_manifest: session_manifest.clone(),
+                        tx: tx.clone(),
+                        shutdown_reason: shutdown_reason.clone(),
+                    },
+                    content,
+                    &mut approval_handler,
+                )
+                .await;
+            }
+        }
+    }
+
+    if always_on {
+        state.decrement_always_on_websocket_count(&session_id);
+    }
+
+    drop(approval_handler);
+    drop(tx);
+    reader.abort();
+    let _ = writer.await;
+    let _ = reader.await;
 }
 
 fn route_ws_client_message(
@@ -268,36 +489,73 @@ impl agent::TokenSink for WsTokenSink {
 }
 
 pub(super) fn send_ws_terminal_denial(tx: &mpsc::UnboundedSender<WsFrame>, reason: &str) {
-    let _ = tx.send(WsFrame::Error {
-        data: reason.to_string(),
-    });
+    finish_ws_prompt(tx, Some(reason.to_string()));
+}
+
+fn finish_ws_prompt(tx: &mpsc::UnboundedSender<WsFrame>, error: Option<String>) {
+    if let Some(error) = error {
+        let _ = tx.send(WsFrame::Error { data: error });
+    }
     let _ = tx.send(WsFrame::Done);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WsApprovalOutcome {
+    Approved,
+    Denied,
+    InvalidResponse,
+    Disconnected,
 }
 
 pub(super) struct WsApprovalHandler {
     tx: mpsc::UnboundedSender<WsFrame>,
     responses: std_mpsc::Receiver<WsApprovalDecision>,
     next_request_id: u64,
+    last_outcome: Option<WsApprovalOutcome>,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 impl WsApprovalHandler {
     pub(super) fn new(
         tx: mpsc::UnboundedSender<WsFrame>,
         responses: std_mpsc::Receiver<WsApprovalDecision>,
+        shutdown_requested: Arc<AtomicBool>,
     ) -> Self {
         Self {
             tx,
             responses,
             next_request_id: 1,
+            last_outcome: None,
+            shutdown_requested,
         }
     }
 
-    fn wait_for_response(&self, request_id: u64) -> bool {
+    fn reset_outcome(&mut self) {
+        self.last_outcome = None;
+    }
+
+    fn last_outcome(&self) -> Option<WsApprovalOutcome> {
+        self.last_outcome
+    }
+
+    fn wait_for_response(&self, request_id: u64) -> WsApprovalOutcome {
         loop {
-            match self.responses.recv() {
-                Ok(response) if response.request_id == request_id => return response.approved,
-                Ok(_) => continue,
-                Err(_) => return false,
+            if self.shutdown_requested.load(Ordering::SeqCst) {
+                return WsApprovalOutcome::Disconnected;
+            }
+
+            match self.responses.recv_timeout(Duration::from_millis(50)) {
+                Ok(response) if response.request_id == request_id => {
+                    if response.approved {
+                        return WsApprovalOutcome::Approved;
+                    }
+                    return WsApprovalOutcome::Denied;
+                }
+                Ok(_) => return WsApprovalOutcome::InvalidResponse,
+                Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                    return WsApprovalOutcome::Disconnected;
+                }
             }
         }
     }
@@ -322,11 +580,13 @@ impl agent::ApprovalHandler for WsApprovalHandler {
             },
         });
 
-        if tokio::runtime::Handle::try_current().is_ok() {
+        let outcome = if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(|| self.wait_for_response(request_id))
         } else {
             self.wait_for_response(request_id)
-        }
+        };
+        self.last_outcome = Some(outcome);
+        matches!(outcome, WsApprovalOutcome::Approved)
     }
 }
 
@@ -336,6 +596,22 @@ fn severity_label(severity: Severity) -> &'static str {
         Severity::Medium => "medium",
         Severity::High => "high",
     }
+}
+
+#[cfg(test)]
+async fn ws_session_protocol_test(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Path(session_id): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Result<impl IntoResponse, HttpError> {
+    if !validate_session_id(&session_id) {
+        return Err(HttpError::bad_request("invalid session id"));
+    }
+
+    Ok(ws.on_upgrade(move |socket| {
+        websocket_session_protocol_test(state, session_id, principal, socket)
+    }))
 }
 
 #[cfg(test)]
@@ -356,6 +632,8 @@ mod tests {
     use crate::principal::Principal;
     use crate::session_registry::SessionRegistry;
     use crate::test_support::new_test_server_state;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     fn registry_config(base_url: String) -> Config {
         let mut agents = crate::config::AgentsConfig::default();
@@ -419,8 +697,9 @@ mod tests {
     async fn ws_approval_handler_waits_for_client_response() {
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
         let (approval_tx, approval_rx) = std_mpsc::channel::<WsApprovalDecision>();
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
         let handle = std::thread::spawn(move || {
-            let mut handler = WsApprovalHandler::new(frame_tx, approval_rx);
+            let mut handler = WsApprovalHandler::new(frame_tx, approval_rx, shutdown_requested);
             handler.request_approval(&Severity::High, "risky", "rm -rf /tmp/demo")
         });
 
@@ -445,6 +724,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ws_approval_handler_rejects_mismatched_request_id_without_waiting_forever() {
+        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
+        let (approval_tx, approval_rx) = std_mpsc::channel::<WsApprovalDecision>();
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn(move || {
+            let mut handler = WsApprovalHandler::new(frame_tx, approval_rx, shutdown_requested);
+            handler.request_approval(&Severity::High, "risky", "rm -rf /tmp/demo")
+        });
+
+        let frame = frame_rx.recv().await.unwrap();
+        let request_id = match frame {
+            WsFrame::Approval { data } => data.request_id,
+            _ => panic!("expected approval frame"),
+        };
+        approval_tx
+            .send(WsApprovalDecision {
+                request_id: request_id + 1,
+                approved: true,
+            })
+            .unwrap();
+
+        assert!(!handle.join().unwrap());
+    }
+
+    #[tokio::test]
     async fn ws_terminal_denial_emits_error_then_done() {
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
         send_ws_terminal_denial(&frame_tx, "denied by policy");
@@ -457,6 +761,144 @@ mod tests {
         }
 
         assert!(matches!(frame_rx.recv().await.unwrap(), WsFrame::Done));
+        assert!(
+            frame_rx.try_recv().is_err(),
+            "should emit exactly one Done frame"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn websocket_malformed_approval_frame_terminates_session() {
+        let (state, root) = new_test_server_state("ws_malformed_approval_frame");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut state = state;
+        let registry =
+            SessionRegistry::from_config(&registry_config(format!("http://{}", addr))).unwrap();
+        let session_id = registry.sessions()[0].session_id.clone();
+        state.registry = registry;
+
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::post(|| async {
+                    (
+                        [
+                            ("content-type", "text/event-stream"),
+                            ("cache-control", "no-cache"),
+                        ],
+                        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"execute\",\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}\n\n\
+                         data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.4-mini\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+                    )
+                }),
+            )
+            .route(
+                "/api/ws/:session_id",
+                axum::routing::get(super::ws_session_protocol_test),
+            )
+            .layer(axum::extract::Extension(Principal::Operator))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        {
+            let mut store = state.store.lock().await;
+            store.ensure_session_row(&session_id).unwrap();
+        }
+
+        let ws_url = format!("ws://127.0.0.1:{}/api/ws/{}", addr.port(), session_id);
+        let (mut websocket, _) = tokio_tungstenite::connect_async(&ws_url)
+            .await
+            .expect("websocket should connect");
+        websocket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"content":"hello world"}"#.to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let approval_frame = timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .expect("approval frame should arrive in time")
+            .expect("websocket should stay open for approval")
+            .expect("approval frame should arrive cleanly");
+        let request_id = match approval_frame {
+            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&text).expect("approval frame should be valid JSON");
+                assert_eq!(
+                    parsed.get("op").and_then(Value::as_str),
+                    Some("approval"),
+                    "first websocket frame was {text}"
+                );
+                parsed
+                    .get("data")
+                    .and_then(|data| data.get("request_id"))
+                    .and_then(Value::as_u64)
+                    .expect("approval frame should include request_id")
+            }
+            other => panic!("expected approval frame, got {other:?}"),
+        };
+        websocket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"op":"approval","data":{"approved":true}}"#.to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let mut error_count = 0usize;
+        let mut done_count = 0usize;
+        while error_count == 0 || done_count == 0 {
+            let frame = timeout(Duration::from_secs(2), websocket.next())
+                .await
+                .expect("prompt should terminate without hanging");
+            let Some(frame) = frame else {
+                panic!("websocket closed before terminal frames were received");
+            };
+            match frame {
+                Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                    if text.contains(r#""op":"error""#) {
+                        error_count += 1;
+                    }
+                    if text.contains(r#""op":"done""#) {
+                        done_count += 1;
+                    }
+                }
+                Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
+                    panic!("websocket closed before terminal frames were received");
+                }
+                Ok(_) => {}
+                Err(error) => panic!("websocket frame should arrive cleanly: {error}"),
+            }
+        }
+
+        let terminal = timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .expect("websocket session should terminate after terminal frames");
+        match terminal {
+            Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => {}
+            Some(Err(error)) => {
+                let error = error.to_string();
+                assert!(
+                    error.contains("ResetWithoutClosingHandshake")
+                        || error.contains("Connection reset without closing handshake")
+                        || error.contains("Protocol"),
+                    "unexpected websocket termination error: {error}"
+                );
+            }
+            None => {}
+            Some(Ok(other)) => panic!("unexpected extra websocket frame: {other:?}"),
+        }
+
+        assert_eq!(request_id, 1);
+        assert_eq!(error_count, 1);
+        assert_eq!(done_count, 1);
+
+        drop(websocket);
+        server.abort();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

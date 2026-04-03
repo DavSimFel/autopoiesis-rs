@@ -65,16 +65,10 @@ impl ExfilDetector {
             let before = command[..index].chars().next_back();
             let after = command[index + needle.len()..].chars().next();
             let before_ok = before.is_none_or(|character| {
-                !character.is_ascii_alphanumeric()
-                    && character != '_'
-                    && character != '.'
-                    && character != '/'
+                !character.is_ascii_alphanumeric() && character != '_' && character != '.'
             });
             let after_ok = after.is_none_or(|character| {
-                !character.is_ascii_alphanumeric()
-                    && character != '_'
-                    && character != '.'
-                    && character != '/'
+                !character.is_ascii_alphanumeric() && character != '_' && character != '.'
             });
 
             if before_ok && after_ok {
@@ -105,6 +99,8 @@ impl ExfilDetector {
                 "~/.autopoiesis/auth.json",
                 "~/.ssh/id_rsa",
                 "~/.ssh/id_ed25519",
+                "id_rsa",
+                "id_ed25519",
                 "~/.aws/credentials",
                 ".env.production.local",
                 ".env.production",

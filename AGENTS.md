@@ -2,6 +2,8 @@
 
 How to work in this repo. Read this first.
 
+> **Global coding standards:** See [CODING_STANDARDS.md](/home/user/.openclaw/workspace/CODING_STANDARDS.md) — applies to all coding work. This repo's rules take precedence on conflicts.
+
 > **⚠️ Read [docs/risks.md](docs/risks.md) before trusting any invariant claim.** Shell guards remain heuristic, there is no PTY or real sandboxing yet, and subscriptions are wired into turn context through `build_turn_for_config_with_subscriptions()`.
 
 ## Build and test
@@ -13,6 +15,17 @@ cargo fmt --check              # must pass
 cargo clippy -- -D warnings    # must pass
 cargo test --features integration  # live API tests (skip if no auth)
 ```
+
+### Running specific tests
+
+```bash
+cargo test test_name                    # run a single test by name
+cargo test module::submodule            # run all tests in a module
+cargo test -- --nocapture test_name     # run with stdout visible
+cargo test -p autopoiesis test_name     # explicit package (for when workspace grows)
+```
+
+Use file-scoped tests during iteration. Run the full suite before committing.
 
 **Every change must pass all four checks before committing.** Pre-commit hooks enforce this.
 
@@ -66,6 +79,7 @@ docs/                Architecture, specs, risks, vision, roadmap
 4. `build_turn_for_config()` is the shared turn constructor for CLI and server paths.
 5. `agent/`, `server/`, `gate/`, and `plan/` are the current major responsibility boundaries.
 6. Docs must stay synced with `src/` changes in the same merge.
+7. OpenTelemetry spans are wired via `opentelemetry-otlp` (gRPC/tonic). Do not add alternative exporters without discussion.
 
 ## Architecture Diagram
 
@@ -138,10 +152,34 @@ A junior dev should be able to read any file and understand what it does.
 
 ### Dependencies
 
-- Minimize dependencies.
-- `tracing` and `tracing-subscriber` are already in the stack.
-- `thiserror` is already in the stack.
+- Minimize dependencies. Do not add new dependencies without justification.
 - Do not switch rusqlite to sqlx without measured contention.
+
+**Approved stack (already in Cargo.toml):**
+
+| Purpose | Crate | Notes |
+|---------|-------|-------|
+| HTTP client | `reqwest` (rustls-tls) | No openssl. No `ureq`, `hyper` direct. |
+| Async runtime | `tokio` (full) | No `async-std`. |
+| Serialization | `serde` + `serde_json` | — |
+| Config | `toml` | — |
+| CLI | `clap` (derive) | — |
+| Errors (app) | `anyhow` | Orchestration, CLI, glue. |
+| Errors (boundary) | `thiserror` | Where callers branch on kind. |
+| Logging | `tracing` + `tracing-subscriber` | No `log`, no `env_logger`. |
+| Database | `rusqlite` (bundled) | No sqlx without measured contention. |
+| HTTP server | `axum` | No `actix-web`, no `warp`. |
+| Tokenizer | `tiktoken-rs` | — |
+| Telemetry | `opentelemetry` + `opentelemetry-otlp` | OTLP/gRPC export. |
+| UUIDs | `uuid` (v4) | — |
+
+**Do not introduce:**
+- `async-std` — we use tokio exclusively
+- `openssl` / `native-tls` — we use rustls
+- `log` / `env_logger` — we use tracing
+- `actix-web` / `warp` — we use axum
+- `sqlx` — not without measured contention proving rusqlite insufficient
+- `diesel` — overkill for our schema
 
 ## Common Pitfalls
 
@@ -170,3 +208,14 @@ A junior dev should be able to read any file and understand what it does.
 - Don't put secrets in code.
 - Don't mix policy, I/O, and state mutation in one function.
 - Don't add dependencies without justification.
+
+## Working with Codex and other coding agents
+
+This file is read automatically by Claude Code, Codex, and other agents at session start.
+
+- **Keep sessions focused.** One task per session. Don't combine a refactor + new feature + docs update.
+- **Use file-scoped tests during iteration.** Only run the full suite before your final commit.
+- **Don't choose new dependencies.** Use only what's in the approved stack above. If you need something not listed, stop and ask.
+- **Review the architecture rules and pre-merge checklist before declaring done.**
+- **If you're unsure about an architectural decision, stop and ask.** Agents implement; humans architect.
+- **Commit messages:** `<type>: <summary>` where type is feat/fix/refactor/test/docs/chore. Explain *why*, not *what*.

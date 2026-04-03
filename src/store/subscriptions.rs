@@ -139,9 +139,9 @@ pub(super) fn list_subscriptions_for_session(
             .then_with(|| left.id.cmp(&right.id))
     });
 
-    let mut chosen: HashMap<(String, Option<String>), SubscriptionRow> = HashMap::new();
+    let mut chosen: HashMap<(String, String, Option<String>), SubscriptionRow> = HashMap::new();
     for row in rows {
-        let key = (row.path.clone(), row.filter.clone());
+        let key = (row.topic.clone(), row.path.clone(), row.filter.clone());
         let replace = match chosen.get(&key) {
             None => true,
             Some(existing) => {

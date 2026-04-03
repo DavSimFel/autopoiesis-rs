@@ -491,7 +491,7 @@ fn load_today_with_no_file_is_ok() {
 }
 
 #[test]
-fn load_today_trims_context_after_restore() {
+fn load_today_keeps_metadata_only_history_when_estimate_is_within_limit() {
     let dir = temp_sessions_dir("load_trim");
 
     let mut seed = Session::new(&dir).unwrap();
@@ -516,8 +516,9 @@ fn load_today_trims_context_after_restore() {
     session.max_context_tokens = 50;
     session.load_today().unwrap();
 
-    assert!(session.history().len() <= 1);
-    assert!(session.total_tokens() <= 100);
+    assert_eq!(session.history().len(), 2);
+    assert_eq!(session.total_tokens(), 200);
+    assert!(session.estimate_context_tokens() <= 50);
 
     fs::remove_dir_all(&dir).unwrap();
 }
@@ -801,6 +802,74 @@ fn trim_uses_estimation_when_no_metadata() {
 }
 
 #[test]
+fn ensure_context_within_limit_trims_when_estimate_exceeds_meta_total() {
+    let dir = temp_sessions_dir("trim_mixed_meta");
+    let path = dir.join("2026-03-31.jsonl");
+    write_entries(
+        &path,
+        &[
+            SessionEntry {
+                role: "system".to_string(),
+                content: "instructions".to_string(),
+                blocks: vec![MessageContent::text("instructions")],
+                ts: "2026-03-31T00:00:00Z".to_string(),
+                meta: None,
+                principal: Some(Principal::System),
+                call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+            SessionEntry {
+                role: "user".to_string(),
+                content: "this is a deliberately long user message that should push the estimated context over the limit".to_string(),
+                blocks: vec![MessageContent::text(
+                    "this is a deliberately long user message that should push the estimated context over the limit",
+                )],
+                ts: "2026-03-31T00:01:00Z".to_string(),
+                meta: None,
+                principal: Some(Principal::Operator),
+                call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+            SessionEntry {
+                role: "assistant".to_string(),
+                content: "ack".to_string(),
+                blocks: vec![MessageContent::text("ack")],
+                ts: "2026-03-31T00:02:00Z".to_string(),
+                meta: Some(TurnMeta {
+                    input_tokens: Some(4),
+                    output_tokens: Some(0),
+                    ..Default::default()
+                }),
+                principal: Some(Principal::Agent),
+                call_id: None,
+                tool_name: None,
+                tool_calls: None,
+            },
+        ],
+    );
+
+    let mut session = Session::new(&dir).unwrap();
+    session.load_today().unwrap();
+    assert!(session.total_tokens() < session.estimate_context_tokens() as u64);
+    assert!(session.total_tokens() < 10);
+    assert!(session.estimate_context_tokens() > 10);
+
+    session.set_max_context_tokens(10);
+    session.ensure_context_within_limit();
+
+    assert!(session.history().len() < 3);
+    assert!(session.estimate_context_tokens() <= 10);
+    assert!(matches!(
+        session.history().first().map(|message| &message.role),
+        Some(ChatRole::System)
+    ));
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn estimation_is_roughly_accurate() {
     let dir = temp_sessions_dir("estimate_rough");
     let mut session = Session::new(&dir).unwrap();
@@ -819,7 +888,7 @@ fn estimation_is_roughly_accurate() {
 fn trim_drops_oldest_non_system_messages() {
     let dir = temp_sessions_dir("trim");
     let mut session = Session::new(&dir).unwrap();
-    session.max_context_tokens = 50;
+    session.max_context_tokens = 1;
 
     let big_meta = TurnMeta {
         input_tokens: Some(30),
@@ -869,7 +938,7 @@ fn trim_drops_oldest_non_system_messages() {
 fn trim_does_not_pin_oldest_user_when_history_has_no_system_message() {
     let dir = temp_sessions_dir("trim_no_system_pin");
     let mut session = Session::new(&dir).unwrap();
-    session.max_context_tokens = 50;
+    session.max_context_tokens = 1;
 
     let big_meta = TurnMeta {
         input_tokens: Some(30),

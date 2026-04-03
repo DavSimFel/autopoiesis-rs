@@ -36,3 +36,9 @@ integration = []
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
+todo = "warn"
+dbg_macro = "warn"

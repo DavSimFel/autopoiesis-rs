@@ -152,8 +152,9 @@ impl Store {
                 updated_at TEXT NOT NULL
             );
             DROP INDEX IF EXISTS idx_subscriptions_topic_path;
+            DROP INDEX IF EXISTS idx_subscriptions_session_path_filter;
             CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_session_path_filter
-                ON subscriptions(COALESCE(session_id, ''), path, COALESCE(filter, ''));
+                ON subscriptions(COALESCE(session_id, ''), topic, path, COALESCE(filter, ''));
             CREATE INDEX IF NOT EXISTS idx_subscriptions_timestamps
                 ON subscriptions(updated_at, activated_at, id);
             CREATE INDEX IF NOT EXISTS idx_subscriptions_session_timestamps
@@ -2499,6 +2500,83 @@ mod tests {
         assert_eq!(
             store.get_parent_session("child").unwrap(),
             Some("parent".to_string())
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn store_new_migrates_subscription_unique_index_to_include_topic() {
+        let path = temp_db_path("migrate_subscription_topic_index");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                topic TEXT NOT NULL DEFAULT '_default',
+                path TEXT NOT NULL,
+                filter TEXT,
+                activated_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX idx_subscriptions_session_path_filter
+                ON subscriptions(COALESCE(session_id, ''), path, COALESCE(filter, ''));
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = Store::new(&path).unwrap();
+        assert!(has_index(
+            &store.conn,
+            "idx_subscriptions_session_path_filter"
+        ));
+
+        store
+            .create_subscription("notes", "/tmp/shared.txt", None)
+            .unwrap();
+        store
+            .create_subscription("alerts", "/tmp/shared.txt", None)
+            .unwrap();
+
+        let topics = store
+            .list_subscriptions(None)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.topic)
+            .collect::<Vec<_>>();
+        assert_eq!(topics.len(), 2);
+        assert!(topics.contains(&"notes".to_string()));
+        assert!(topics.contains(&"alerts".to_string()));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn list_subscriptions_for_session_deduplicates_only_within_the_same_topic() {
+        let path = temp_db_path("subscription_topic_dedup");
+        let mut store = Store::new(&path).unwrap();
+
+        store
+            .create_subscription("notes", "/tmp/shared.txt", None)
+            .unwrap();
+        store
+            .create_subscription_for_session(Some("session-1"), "notes", "/tmp/shared.txt", None)
+            .unwrap();
+        store
+            .create_subscription("alerts", "/tmp/shared.txt", None)
+            .unwrap();
+
+        let rows = store.list_subscriptions_for_session("session-1").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|row| row.topic == "notes" && row.session_id.as_deref() == Some("session-1"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.topic == "alerts" && row.session_id.is_none())
         );
 
         let _ = std::fs::remove_file(&path);

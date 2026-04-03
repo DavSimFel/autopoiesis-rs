@@ -24,7 +24,7 @@
 - `src/child_session/{mod,create,completion}.rs` - child-session creation, metadata, and parent completion propagation.
 - `src/server/mod.rs` - server wiring.
 - `src/server/http.rs` - HTTP control plane.
-- `src/server/ws.rs` - WebSocket streaming and approval prompts.
+- `src/server/ws.rs` - WebSocket streaming, approval prompts, and terminal protocol-error shutdown.
 - `src/server/auth.rs` - server-side auth handling.
 - `src/server/queue.rs` - server queue draining.
 - `src/gate/budget.rs` - token budget guard.
@@ -147,6 +147,7 @@ Config -> SessionRegistry
 
 ### Subscriptions
 
-- Subscriptions are stored in SQLite with filters and token estimates.
+- Subscriptions are stored in SQLite with topics, filters, and token estimates.
+- Topic is part of subscription identity; session-scoped rows only override globals within the same topic.
 - They are durable and queryable today.
 - They are wired into turn-context assembly alongside the identity and session manifest blocks.

@@ -36,24 +36,15 @@ impl Session {
         history_groups::history_group_range(&self.messages, start)
     }
 
-    pub(super) fn current_context_tokens(&self, use_estimation: bool) -> u64 {
-        if use_estimation {
-            self.estimate_context_tokens() as u64
-        } else {
-            self.total_tokens
-        }
-    }
-
     /// Trim oldest conversational groups when over token limit without splitting tool round-trips.
     pub(super) fn trim_context(&mut self) {
-        let use_estimation = self.total_tokens == 0;
         debug!(
             total_tokens = self.total_tokens,
             estimated_tokens = self.estimate_context_tokens(),
             max_context_tokens = self.max_context_tokens,
             "trim context if needed"
         );
-        while self.current_context_tokens(use_estimation) > self.max_context_tokens {
+        while self.estimate_context_tokens() as u64 > self.max_context_tokens {
             let Some((start, end)) = self.trim_group_range(self.trim_anchor_index()) else {
                 break;
             };
@@ -69,7 +60,7 @@ impl Session {
         history_groups::estimate_messages_tokens(&self.messages)
     }
 
-    /// Ensure context is trimmed before sending to the LLM when metadata is missing.
+    /// Ensure context is trimmed before sending to the LLM using the estimated live size.
     pub fn ensure_context_within_limit(&mut self) {
         if self.estimate_context_tokens() as u64 > self.max_context_tokens {
             self.trim_context();

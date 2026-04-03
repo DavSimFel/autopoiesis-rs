@@ -99,7 +99,8 @@ impl Session {
         self.total_tokens += token_delta;
         self.session_total_tokens += token_delta;
 
-        if should_trim && self.total_tokens > self.max_context_tokens {
+        // Trim against the live estimated context size, not the partial provider metadata total.
+        if should_trim && self.estimate_context_tokens() as u64 > self.max_context_tokens {
             self.trim_context();
         }
 
