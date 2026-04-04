@@ -17,11 +17,13 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 pub(crate) fn set_force_notify_failure_tx_error(value: bool) {
     set_force_notify_failure_tx_error_after(value.then_some(1));
 }
 
 #[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 pub(crate) fn set_force_notify_failure_tx_error_after(value: Option<usize>) {
     FORCE_NOTIFY_FAILURE_TX_ERROR_AFTER.with(|flag| flag.set(value));
 }
@@ -237,7 +239,7 @@ fn verdict_to_string(verdict: &CheckVerdict) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::set_force_notify_failure_tx_error;
     use super::*;

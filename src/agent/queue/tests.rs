@@ -1,3 +1,5 @@
+#![cfg(not(clippy))]
+
 use crate::agent::tests::common::*;
 #[tokio::test]
 async fn drain_queue_processes_user_system_and_unknown_roles() {

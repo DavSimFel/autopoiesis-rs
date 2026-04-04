@@ -55,7 +55,7 @@ pub(crate) const SECRET_PATTERNS: [SecretPattern; 3] = [
     },
 ];
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use regex::Regex;

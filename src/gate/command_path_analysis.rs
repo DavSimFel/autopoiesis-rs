@@ -1285,7 +1285,7 @@ pub(crate) fn simple_command_reads_target_path(argv: &[String], target: &str) ->
     simple_command_reads_path(argv, PathReference::Target(target))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
 

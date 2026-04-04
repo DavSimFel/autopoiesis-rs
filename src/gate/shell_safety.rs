@@ -260,7 +260,7 @@ impl Guard for ShellSafety {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use crate::gate::GuardEvent;

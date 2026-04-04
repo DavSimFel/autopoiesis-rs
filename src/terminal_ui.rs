@@ -25,11 +25,13 @@ pub(crate) fn write_token_output(output: &mut dyn Write, token: &str) -> io::Res
 }
 
 #[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 pub(crate) fn write_completion_newline(output: &mut dyn Write) -> io::Result<()> {
     writeln!(output)
 }
 
 #[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 pub(crate) fn render_approval_banner(
     output: &mut dyn Write,
     severity: &Severity,
@@ -113,7 +115,7 @@ impl ApprovalHandler for CliApprovalHandler {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use crate::agent::format_denial_message;

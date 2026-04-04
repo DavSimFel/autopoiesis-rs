@@ -247,7 +247,7 @@ impl StreamingTextBuffer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::super::secret_catalog::SECRET_PATTERNS;
     use super::*;

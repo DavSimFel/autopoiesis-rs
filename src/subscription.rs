@@ -470,7 +470,7 @@ fn apply_jq_stage(
     Ok(current)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use std::fs;

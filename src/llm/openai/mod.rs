@@ -14,13 +14,13 @@ use crate::principal::Principal;
 mod request;
 mod sse;
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 pub(crate) use sse::SseEvent;
 pub(crate) use sse::{
     SseStreamState, apply_sse_event, note_terminal_sse_event, parse_sse_line,
     require_terminal_sse_event,
 };
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 pub(crate) use sse::{finalize_function_call, finalize_output_item};
 
 /// HTTP client and request settings for the OpenAI-compatible Responses API.
@@ -206,7 +206,7 @@ impl LlmProvider for OpenAIProvider {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use std::collections::HashMap;

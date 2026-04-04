@@ -361,7 +361,7 @@ struct TokenExchangeResponse {
     expires_in: i64,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
 

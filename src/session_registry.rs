@@ -99,7 +99,7 @@ fn tier_session_id(active_name: &str, tier: &str, tier_config: &AgentTierConfig)
         .unwrap_or_else(|| format!("{active_name}-{tier}"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
 

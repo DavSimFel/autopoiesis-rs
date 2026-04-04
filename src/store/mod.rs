@@ -14,9 +14,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 use crate::time::utc_timestamp;
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 use rusqlite::params;
 
 #[derive(Debug, Clone)]
@@ -225,6 +225,7 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 }
 
 #[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 fn has_table(conn: &Connection, table: &str) -> Result<bool> {
     let mut statement = conn
         .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1")
@@ -287,7 +288,7 @@ pub fn format_system_time(time: SystemTime) -> String {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use std::path::PathBuf;

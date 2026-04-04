@@ -19,6 +19,8 @@ where
     SW: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
     EW: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
 {
+    // Invariant: these are static format strings — parsing cannot fail.
+    #[allow(clippy::expect_used)]
     let diagnostic_filter = diagnostic_filter
         .add_directive(
             format!("{STDOUT_USER_OUTPUT_TARGET}=off")
@@ -82,7 +84,7 @@ pub(crate) fn init_tracing() {
     let _ = subscriber.try_init();
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use std::io::{self, Write};

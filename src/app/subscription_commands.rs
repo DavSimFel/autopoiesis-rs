@@ -124,7 +124,7 @@ pub(crate) async fn handle_subscription_command(command: SubscriptionCommand) ->
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use crate::app::args::{SubscriptionAddArgs, SubscriptionListArgs, SubscriptionRemoveArgs};
@@ -150,7 +150,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_subscription_command_covers_add_list_and_remove() {
-        let _cwd_guard = crate::app::test_cwd_lock().lock().unwrap();
+        let _cwd_guard = crate::app::test_cwd_lock().lock().await;
         let temp_root = std::env::temp_dir().join(format!(
             "autopoiesis_subscription_command_test_{}",
             std::time::SystemTime::now()

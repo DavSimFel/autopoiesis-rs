@@ -94,7 +94,7 @@ pub fn validate_agent_identity(identity: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::validate_agent_identity;
 

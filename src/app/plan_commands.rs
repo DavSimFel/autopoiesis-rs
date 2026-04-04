@@ -127,7 +127,7 @@ pub(crate) async fn handle_plan_command(command: PlanCommand) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use crate::app::args::PlanStatusArgs;
@@ -226,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_plan_command_emits_expected_output_branches() {
-        let _cwd_guard = crate::app::test_cwd_lock().lock().unwrap();
+        let _cwd_guard = crate::app::test_cwd_lock().lock().await;
         let temp_root = std::env::temp_dir().join(format!(
             "autopoiesis_plan_command_output_test_{}",
             std::time::SystemTime::now()

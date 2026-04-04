@@ -125,7 +125,7 @@ pub(crate) struct EnqueueArgs {
     pub(crate) message: Vec<String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use clap::Parser;

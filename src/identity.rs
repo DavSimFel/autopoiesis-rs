@@ -40,7 +40,7 @@ pub fn t2_identity_files(identity_root: impl AsRef<Path>) -> Vec<PathBuf> {
     vec![root.join("constitution.md"), root.join("context.md")]
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use std::env;

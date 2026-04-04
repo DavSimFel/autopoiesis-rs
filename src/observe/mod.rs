@@ -336,7 +336,7 @@ impl TraceEvent {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 pub(crate) mod test_support {
     use super::*;
     use std::sync::{Arc, Mutex};
@@ -363,7 +363,7 @@ pub(crate) mod test_support {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use std::fs;

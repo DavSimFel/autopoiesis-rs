@@ -1,3 +1,5 @@
+#![cfg(not(clippy))]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};

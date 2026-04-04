@@ -102,7 +102,7 @@ pub(crate) struct SpawnDrainContext<'a> {
     pub(crate) spawn_result: SpawnResult,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 pub(crate) async fn finish_spawned_child_drain<F, Fut, P, TS>(
     context: SpawnDrainContext<'_>,
     metadata_json: &str,

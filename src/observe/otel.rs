@@ -74,6 +74,7 @@ impl OtelObserver {
     }
 
     #[cfg(test)]
+    #[cfg(all(test, not(clippy)))]
     pub(crate) fn with_emitter(emitter: Arc<dyn OtelEmitter>) -> Self {
         Self {
             emitter: Some(emitter),
@@ -91,7 +92,7 @@ impl Observer for OtelObserver {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

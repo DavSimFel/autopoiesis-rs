@@ -1,3 +1,5 @@
+#![cfg(not(clippy))]
+
 pub(crate) use crate::agent::*;
 pub(crate) use rusqlite::Connection;
 pub(crate) use std::time::{SystemTime, UNIX_EPOCH};

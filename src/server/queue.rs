@@ -1,20 +1,20 @@
 use super::ServerState;
 use crate::context::SessionManifest;
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 use super::session_lock::SessionLockLease;
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 use crate::session;
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 use crate::session_runtime::drain::{self, SharedStoreDrainBackend};
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 use anyhow::Context;
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 use anyhow::Result;
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 use std::sync::Arc;
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 #[tracing::instrument(level = "debug", skip(state, turn, make_provider, token_sink, approval_handler), fields(session_id = %session_id))]
 pub(super) async fn drain_session_queue<F, Fut, P, TS, AH>(
     state: ServerState,
@@ -55,7 +55,7 @@ where
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 #[tracing::instrument(level = "debug", skip(state, turn_builder, make_provider, token_sink, approval_handler), fields(session_id = %session_id))]
 pub(super) async fn drain_session_queue_with_turn_builder<F, Fut, P, TS, AH, TB>(
     state: ServerState,
@@ -120,7 +120,7 @@ pub(super) fn spawn_http_queue_worker(
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use anyhow::{Result, anyhow};

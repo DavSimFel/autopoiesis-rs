@@ -195,7 +195,7 @@ fn validate_non_empty(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
 

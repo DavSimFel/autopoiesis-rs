@@ -218,7 +218,7 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::resolve_session_id;
 

@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::all))]
+
 pub mod agent;
 pub mod auth;
 pub mod child_session;

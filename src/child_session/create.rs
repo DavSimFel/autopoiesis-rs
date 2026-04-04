@@ -242,7 +242,7 @@ fn generate_child_session_id() -> String {
     format!("child-session-{nanos}-{process_id}-{sequence}")
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use std::fs;

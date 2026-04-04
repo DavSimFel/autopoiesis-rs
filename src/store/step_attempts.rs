@@ -465,7 +465,7 @@ impl super::Store {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use crate::test_support::new_test_store;

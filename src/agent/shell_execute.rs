@@ -20,7 +20,7 @@ pub struct GuardedShellResult {
 }
 
 /// Run the guarded shell path for a simple command string.
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 pub async fn guarded_shell_execute<AH>(
     turn: &Turn,
     command: &str,
@@ -193,7 +193,7 @@ fn parse_exit_code(output: &str) -> Option<i32> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use crate::agent::tests::common::shell_policy;

@@ -52,7 +52,7 @@ impl SqliteObserver {
     }
 
     fn insert_event(&self, event: &TraceEvent) -> Result<()> {
-        let conn = self.conn.lock().expect("sqlite trace mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT INTO trace_events (
                 event_type,
@@ -86,7 +86,7 @@ impl Observer for SqliteObserver {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use crate::observe::TraceEvent;

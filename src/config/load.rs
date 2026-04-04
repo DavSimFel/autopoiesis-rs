@@ -1,8 +1,8 @@
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 use std::cell::Cell;
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 use std::sync::Mutex;
 
 use anyhow::{Result, anyhow};
@@ -18,15 +18,15 @@ use super::models::ModelsConfig;
 use super::policy::{ShellPolicy, validate_read_tool_config, validate_subscriptions_config};
 use super::runtime::{Config, QueueConfig, ReadToolConfig, SubscriptionsConfig};
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 static CONFIG_LOAD_LOCK: Mutex<()> = Mutex::new(());
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 thread_local! {
     static SKIP_CONFIG_LOAD_LOCK: Cell<bool> = const { Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 pub(crate) fn with_config_load_lock<T>(f: impl FnOnce() -> T) -> T {
     struct ResetFlag<'a> {
         cell: &'a Cell<bool>,
@@ -122,7 +122,7 @@ impl Config {
     pub fn from_file_typed(
         config_path: impl AsRef<Path>,
     ) -> std::result::Result<Self, ConfigError> {
-        #[cfg(test)]
+        #[cfg(all(test, not(clippy)))]
         let _guard = SKIP_CONFIG_LOAD_LOCK.with(|skip| {
             if skip.get() {
                 None

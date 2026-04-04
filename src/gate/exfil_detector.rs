@@ -179,7 +179,7 @@ impl Guard for ExfilDetector {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use crate::gate::GuardEvent;

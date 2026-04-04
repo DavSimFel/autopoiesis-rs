@@ -167,7 +167,7 @@ fn nullable_update_for_child_session(child_session_id: Option<String>) -> Nullab
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use crate::observe::TraceEvent;

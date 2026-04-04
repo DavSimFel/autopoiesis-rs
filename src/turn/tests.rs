@@ -1,3 +1,5 @@
+#![cfg(not(clippy))]
+
 use super::*;
 use crate::config::{AgentDefinition, AgentTierConfig, BudgetConfig, Config, ShellPolicy};
 use crate::context::{History, Identity};

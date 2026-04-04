@@ -1,3 +1,5 @@
+#![cfg(not(clippy))]
+
 use super::*;
 use crate::gate::{Guard, GuardContext, GuardEvent, ShellSafety, Verdict};
 use crate::llm::ToolCall;

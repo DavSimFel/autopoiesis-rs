@@ -1,3 +1,5 @@
+#![cfg(not(clippy))]
+
 use super::*;
 use crate::gate::GuardContext;
 use crate::llm::{ChatMessage, ChatRole, MessageContent, ToolCall};

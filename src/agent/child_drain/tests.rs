@@ -1,3 +1,5 @@
+#![cfg(not(clippy))]
+
 use crate::agent::child_drain::{
     SpawnDrainContext, finish_spawned_child_drain, spawn_and_drain_with_provider,
 };

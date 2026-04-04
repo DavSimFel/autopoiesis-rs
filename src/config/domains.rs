@@ -37,7 +37,7 @@ pub fn validate_domain_context_extend(path: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::validate_domain_context_extend;
 

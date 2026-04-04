@@ -475,7 +475,7 @@ impl Tool for ReadFile {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use std::fs::{self, File};

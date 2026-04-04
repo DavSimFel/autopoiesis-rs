@@ -73,7 +73,7 @@ pub(crate) fn cap_tool_output(
     Ok(pointer)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use std::env;

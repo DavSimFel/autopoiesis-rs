@@ -15,7 +15,7 @@ pub use budget::BudgetGuard;
 pub use exfil_detector::ExfilDetector;
 pub(crate) use output_cap::{DEFAULT_OUTPUT_CAP_BYTES, cap_tool_output};
 pub(crate) use protected_paths::path_is_protected;
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 pub(crate) use secret_catalog::SECRET_PATTERNS;
 pub use secret_redactor::SecretRedactor;
 pub use shell_safety::ShellSafety;

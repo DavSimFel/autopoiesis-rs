@@ -46,7 +46,7 @@ pub(crate) async fn handle_enqueue_command(args: EnqueueArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::render_message;
     use crate::app::args::EnqueueArgs;

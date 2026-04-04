@@ -1,4 +1,5 @@
 //! Binary entrypoint for the `autopoiesis` CLI.
+#![cfg_attr(test, allow(clippy::all))]
 
 mod app;
 

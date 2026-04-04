@@ -87,7 +87,7 @@ fn decode_hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use axum::{

@@ -58,7 +58,7 @@ pub fn check_delegation(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use crate::llm::ChatMessage;

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
@@ -174,7 +174,7 @@ impl SkillCatalog {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use std::fs::{self, File};

@@ -1,3 +1,5 @@
+#![cfg(not(clippy))]
+
 use crate::agent::tests::common::*;
 use crate::llm::{ChatRole, StreamedTurn};
 use std::sync::{
@@ -35,7 +37,9 @@ impl crate::llm::LlmProvider for PanicProvider {
         _tools: &[crate::llm::FunctionTool],
         _on_token: &'a mut (dyn FnMut(String) + Send),
     ) -> crate::llm::BoxFutureLlm<'a, anyhow::Result<StreamedTurn>> {
-        Box::pin(async move { panic!("provider should not be called when inbound approval is denied") })
+        Box::pin(
+            async move { panic!("provider should not be called when inbound approval is denied") },
+        )
     }
 }
 
@@ -140,8 +144,8 @@ max_tokens_per_day = 10
             _on_token: &'a mut (dyn FnMut(String) + Send),
         ) -> crate::llm::BoxFutureLlm<'a, anyhow::Result<StreamedTurn>> {
             Box::pin(async move {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.turn.clone())
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.turn.clone())
             })
         }
     }

@@ -64,6 +64,7 @@ fn emit_plan_failed(
 }
 
 #[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 pub(crate) fn apply_plan_patch(
     store: &mut Store,
     owner_session_id: &str,
@@ -172,6 +173,7 @@ pub(crate) fn apply_plan_patch_observed(
 }
 
 #[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 pub(crate) fn apply_plan_action(
     store: &mut Store,
     owner_session_id: &str,
@@ -484,7 +486,7 @@ fn generate_plan_run_id() -> String {
     format!("plan-run-{nanos}-{process_id}-{sequence}")
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use crate::observe::test_support::RecordingObserver;

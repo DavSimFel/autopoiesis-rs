@@ -75,7 +75,7 @@ impl Guard for BudgetGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use crate::llm::ChatMessage;

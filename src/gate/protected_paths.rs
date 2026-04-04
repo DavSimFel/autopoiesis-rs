@@ -138,7 +138,7 @@ pub(crate) fn is_protected_git_pathspec_value(path: &str) -> bool {
         || basename.is_some_and(is_protected_env_filename)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
 

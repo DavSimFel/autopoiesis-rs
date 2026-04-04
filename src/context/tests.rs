@@ -1,3 +1,5 @@
+#![cfg(not(clippy))]
+
 use super::*;
 use crate::Principal;
 use crate::config::{

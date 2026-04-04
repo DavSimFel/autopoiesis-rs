@@ -42,7 +42,7 @@ pub(crate) fn utc_timestamp() -> String {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};

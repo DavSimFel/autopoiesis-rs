@@ -74,7 +74,7 @@ pub(crate) fn latest_assistant_response(session: &Session) -> Option<String> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use std::fs;
 

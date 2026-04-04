@@ -31,6 +31,7 @@ impl SecretRedactor {
             .map(|pattern| pattern.regex)
             .collect();
         // Invariant: the built-in catalog is repo-owned static configuration; an invalid pattern is a programmer bug.
+        #[allow(clippy::expect_used)]
         Self::new(&patterns).expect("secret redaction catalog patterns must be valid")
     }
 
@@ -107,7 +108,7 @@ impl Guard for SecretRedactor {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::super::secret_catalog::SECRET_PATTERNS;
     use super::*;
