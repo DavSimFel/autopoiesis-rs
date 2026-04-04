@@ -77,21 +77,31 @@ Template variables such as `{{model}}`, `{{cwd}}`, and `{{tools}}` are resolved 
 
 ```text
 main.rs
+├─ app/
+│  ├─ args.rs
+│  ├─ enqueue_command.rs
+│  ├─ plan_commands.rs
+│  ├─ session_run.rs
+│  ├─ subscription_commands.rs
+│  └─ tracing.rs
 ├─ agent/
-│  ├─ loop_impl.rs
-│  ├─ queue.rs
+│  ├─ loop_impl.rs (+submodules)
+│  ├─ queue.rs (+submodules)
 │  ├─ shell_execute.rs
-│  └─ child_drain.rs
+│  ├─ child_drain.rs (+submodules)
+│  ├─ audit.rs
+│  └─ usage.rs
 ├─ child_session/
-│  ├─ mod.rs
 │  ├─ create.rs
 │  └─ completion.rs
 ├─ server/
-│  ├─ mod.rs
 │  ├─ http.rs
 │  ├─ ws.rs
 │  ├─ auth.rs
-│  └─ queue.rs
+│  ├─ queue.rs
+│  ├─ queue_worker.rs
+│  ├─ session_lock.rs
+│  └─ state.rs
 ├─ gate/
 │  ├─ budget.rs
 │  ├─ shell_safety.rs
@@ -103,9 +113,8 @@ main.rs
 │  ├─ protected_paths.rs
 │  └─ command_path_analysis.rs
 ├─ llm/
-│  ├─ mod.rs
+│  ├─ history_groups.rs
 │  └─ openai/
-│     ├─ mod.rs
 │     ├─ request.rs
 │     └─ sse.rs
 ├─ plan.rs
@@ -114,23 +123,58 @@ main.rs
 │  ├─ notify.rs
 │  ├─ patch.rs
 │  └─ recovery.rs
-├─ lib.rs
 ├─ config/
+│  ├─ agents.rs
+│  ├─ domains.rs
+│  ├─ file_schema.rs
+│  ├─ load.rs
+│  ├─ models.rs
+│  ├─ policy.rs
+│  ├─ runtime.rs
+│  └─ spawn_runtime.rs
 ├─ context/
+│  ├─ history.rs
+│  ├─ identity_prompt.rs
+│  ├─ session_manifest.rs
+│  ├─ skill_instructions.rs
+│  ├─ skill_summaries.rs
+│  └─ subscriptions.rs
 ├─ session/
+│  ├─ budget.rs
+│  ├─ delegation_hint.rs
+│  ├─ jsonl.rs
+│  └─ trimming.rs
+├─ session_runtime/
+│  ├─ drain.rs
+│  └─ factory.rs
 ├─ store/
+│  ├─ message_queue.rs
+│  ├─ migrations.rs
+│  ├─ sessions.rs
+│  ├─ plan_runs.rs
+│  ├─ step_attempts.rs
+│  └─ subscriptions.rs
 ├─ turn/
+│  ├─ builders.rs
+│  ├─ tiers.rs
+│  └─ verdicts.rs
+├─ observe/
+│  ├─ otel.rs
+│  └─ sqlite.rs
+├─ lib.rs
 ├─ tool.rs
 ├─ skills.rs
 ├─ subscription.rs
 ├─ delegation.rs
 ├─ model_selection.rs
+├─ session_registry.rs
 ├─ read_tool.rs
 ├─ principal.rs
 ├─ identity.rs
 ├─ template.rs
+├─ terminal_ui.rs
+├─ test_support.rs
 ├─ auth.rs
-├─ cli.rs
 ├─ logging.rs
 └─ time.rs
 ```
@@ -158,10 +202,10 @@ Throughout the docs and commit history, three names appear:
 
 ## Stats
 
-- `src/` Rust source files: `104`
-- `src/` Rust source lines: `38,142`
-- Rust tests in `src/` + `tests/`: `606`
-- Commits on `HEAD`: `178`
+- `src/` Rust source files: `111`
+- `src/` Rust source lines: `42,699`
+- Rust tests in `src/` + `tests/`: `533`
+- Commits on `HEAD`: `190`
 
 ## Tests
 
