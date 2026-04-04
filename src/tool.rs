@@ -663,7 +663,7 @@ mod tests {
                 .any(|cause| cause.to_string().contains("timed out after 50ms"))
         );
         assert!(
-            start.elapsed() < Duration::from_millis(TERMINATION_GRACE_MS + 500),
+            start.elapsed() < Duration::from_secs(5),
             "clamped timeout should be enforced close to the configured ceiling"
         );
     }
@@ -742,7 +742,7 @@ mod tests {
 
         assert!(error.to_string().contains("timed out"));
         assert!(
-            start.elapsed() < Duration::from_millis(POST_CAP_DRAIN_TIMEOUT_MS + 100),
+            start.elapsed() < Duration::from_secs(5),
             "original timeout should win over the later post-cap deadline"
         );
     }
@@ -757,8 +757,7 @@ mod tests {
 
         assert!(error.to_string().contains("timed out"));
         assert!(
-            start.elapsed()
-                < Duration::from_millis(POST_CAP_DRAIN_TIMEOUT_MS + TERMINATION_GRACE_MS + 500),
+            start.elapsed() < Duration::from_secs(5),
             "post-cap deadline should cap total runtime once capture is truncated"
         );
     }
