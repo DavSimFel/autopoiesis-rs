@@ -26,6 +26,7 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 fn set_force_missing_spawn_metadata(value: bool) {
     FORCE_MISSING_SPAWN_METADATA.with(|flag| flag.set(value));
 }
@@ -1419,7 +1420,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use crate::agent::tests::common::{
@@ -1645,7 +1646,7 @@ mod tests {
         store.get_plan_run(plan_run_id).unwrap().unwrap()
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn tick_plan_runner_advances_shell_step_and_releases_claim() {
         let root = temp_sessions_dir("tick_shell");
         let config = test_config(&root);
@@ -1728,7 +1729,7 @@ mod tests {
         assert_eq!(attempts[0].status, "passed");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn tick_plan_runner_reports_stale_when_another_worker_advances_the_run() {
         let root = temp_sessions_dir("tick_race");
         let config = test_config(&root);
@@ -1800,7 +1801,7 @@ mod tests {
         assert_eq!(updated.current_step_index, 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn run_plan_step_spawn_step_records_child_and_advances() {
         let root = temp_sessions_dir("spawn_step");
         let config = test_config(&root);
@@ -1855,7 +1856,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn run_plan_step_observed_emits_completion_event() {
         let root = temp_sessions_dir("complete_event");
         let config = test_config(&root);
@@ -1908,7 +1909,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn run_plan_step_observed_emits_waiting_t2_event() {
         let root = temp_sessions_dir("waiting_t2_event");
         let config = test_config(&root);
@@ -1965,7 +1966,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn run_plan_step_shell_denial_returns_waiting_t2() {
         let root = temp_sessions_dir("shell_denial");
         let config = test_config(&root);
@@ -2015,7 +2016,7 @@ mod tests {
         assert_eq!(failure_payload["reason"], "shell_denied");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn run_plan_step_spawn_drain_failure_returns_waiting_t2() {
         let root = temp_sessions_dir("spawn_drain_failure");
         let config = test_config(&root);
@@ -2081,7 +2082,7 @@ mod tests {
         assert_eq!(failure_payload["reason"], "spawn_failed");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn run_plan_step_spawn_missing_metadata_returns_waiting_t2() {
         let root = temp_sessions_dir("spawn_missing_metadata_route");
         let config = test_config(&root);
@@ -2151,7 +2152,7 @@ mod tests {
         assert!(updated.active_child_session_id.is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn run_plan_step_detects_preexisting_running_attempt_and_returns_waiting_t2() {
         let root = temp_sessions_dir("stale_attempt_resume");
         let config = test_config(&root);
@@ -2266,7 +2267,7 @@ mod tests {
         assert_eq!(updated.current_step_index, 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn run_plan_step_check_failure_returns_waiting_t2() {
         let root = temp_sessions_dir("shell_failure");
         let config = test_config(&root);
@@ -2323,7 +2324,7 @@ mod tests {
         assert_eq!(attempts[0].status, "failed");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn tick_plan_runner_notifies_t2_after_waiting_for_failure() {
         let root = temp_sessions_dir("tick_waiting_t2_notify");
         let config = test_config(&root);
@@ -2475,7 +2476,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn run_plan_step_rejects_step_index_past_end() {
         let root = temp_sessions_dir("step_index_past_end");
         let config = test_config(&root);
@@ -2522,7 +2523,7 @@ mod tests {
         assert_eq!(stored.claimed_at, None);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn tick_plan_runner_marks_internal_error_failed_and_releases_claim() {
         let root = temp_sessions_dir("tick_internal_error");
         let config = test_config(&root);

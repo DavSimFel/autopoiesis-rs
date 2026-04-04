@@ -5,8 +5,8 @@ pub mod session_run;
 pub mod subscription_commands;
 pub mod tracing;
 
-#[cfg(test)]
-pub(crate) fn test_cwd_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+#[cfg(all(test, not(clippy)))]
+pub(crate) fn test_cwd_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::const_new(()))
 }

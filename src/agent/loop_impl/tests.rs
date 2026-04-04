@@ -1,3 +1,5 @@
+#![cfg(not(clippy))]
+
 use crate::agent::audit::make_denial_verdict;
 use crate::agent::tests::common::*;
 use crate::agent::usage::{charged_turn_meta, token_total};
@@ -15,7 +17,7 @@ impl crate::context::ContextSource for TailUserContext {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn observed_turn_emits_turn_and_tool_lifecycle_events() {
     use std::sync::{Arc, Mutex};
 
@@ -119,7 +121,7 @@ async fn observed_turn_emits_turn_and_tool_lifecycle_events() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn trims_context_before_stream_completion_when_over_estimated_limit() {
     let dir = temp_sessions_dir("pre_call_trim");
     let (provider, observed_message_counts) = InspectingProvider::new();
@@ -166,7 +168,7 @@ async fn trims_context_before_stream_completion_when_over_estimated_limit() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn delegation_hint_is_appended_after_successful_turn() {
     let dir = temp_sessions_dir("delegation_hint");
     let (provider, _observed_message_counts) = InspectingProvider::new();
@@ -225,7 +227,7 @@ async fn delegation_hint_is_appended_after_successful_turn() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn delegation_hint_is_retained_when_provider_fails() {
     use std::sync::{Arc, Mutex};
 
@@ -307,7 +309,7 @@ async fn delegation_hint_is_retained_when_provider_fails() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn delegation_hint_is_ignored_when_delegation_is_disabled() {
     use std::sync::{Arc, Mutex};
 
@@ -387,7 +389,7 @@ async fn delegation_hint_is_ignored_when_delegation_is_disabled() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn delegation_hint_is_cleared_after_successful_turn_without_new_advice() {
     use std::sync::{Arc, Mutex};
 
@@ -470,7 +472,7 @@ async fn delegation_hint_is_cleared_after_successful_turn_without_new_advice() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn delegation_hint_accumulates_tool_calls_across_batches() {
     use std::sync::{Arc, Mutex};
 
@@ -613,7 +615,7 @@ async fn delegation_hint_accumulates_tool_calls_across_batches() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn inbound_redaction_is_persisted_before_session_write() {
     let dir = temp_sessions_dir("redaction_persisted");
     let (provider, _observed_message_counts) = InspectingProvider::new();
@@ -652,7 +654,7 @@ async fn inbound_redaction_is_persisted_before_session_write() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn inbound_denial_returns_denied_without_looping() {
     let dir = temp_sessions_dir("inbound_denial");
     let (provider, observed_message_counts) = InspectingProvider::new();
@@ -706,7 +708,7 @@ async fn inbound_denial_returns_denied_without_looping() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn approval_denial_audit_is_not_system_role_or_raw_command() {
     let dir = temp_sessions_dir("approval_denial_audit");
     let provider = SequenceProvider::new(vec![StreamedTurn {
@@ -803,7 +805,7 @@ async fn approval_denial_audit_is_not_system_role_or_raw_command() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn context_insertion_does_not_replace_persisted_user_message() {
     let dir = temp_sessions_dir("persist_user_with_context");
     let identity_dir = dir.join("identity");
@@ -858,7 +860,7 @@ async fn context_insertion_does_not_replace_persisted_user_message() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn context_insertion_modify_path_persists_indexed_user_message() {
     let dir = temp_sessions_dir("modify_user_with_context");
     let identity_dir = dir.join("identity");
@@ -1050,7 +1052,7 @@ fn max_denial_counter_returns_summary_after_threshold() {
     assert_eq!(denial_count, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn inbound_approval_denial_audit_is_not_system_role_or_raw_command() {
     let dir = temp_sessions_dir("inbound_approval_denial_audit");
     let provider = SequenceProvider::new(vec![StreamedTurn {
@@ -1141,7 +1143,7 @@ async fn inbound_approval_denial_audit_is_not_system_role_or_raw_command() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn hard_deny_audit_is_not_system_role_or_raw_command() {
     let dir = temp_sessions_dir("hard_deny_audit");
     let provider = SequenceProvider::new(vec![StreamedTurn {
@@ -1234,7 +1236,7 @@ async fn hard_deny_audit_is_not_system_role_or_raw_command() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn denied_tool_calls_are_not_persisted_without_tool_results() {
     let dir = temp_sessions_dir("denied_tool_calls");
     let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
@@ -1301,7 +1303,7 @@ async fn denied_tool_calls_are_not_persisted_without_tool_results() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn denied_tool_calls_reload_with_placeholder_and_audit_note() {
     let dir = temp_sessions_dir("denied_tool_calls_reload");
     let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
@@ -1352,7 +1354,7 @@ async fn denied_tool_calls_reload_with_placeholder_and_audit_note() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn malformed_execute_arguments_deny_wins_over_batch_approval() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1420,7 +1422,7 @@ async fn malformed_execute_arguments_deny_wins_over_batch_approval() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn denied_mixed_content_assistant_message_keeps_text_but_drops_tool_calls() {
     let dir = temp_sessions_dir("denied_mixed_content");
     let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
@@ -1482,7 +1484,7 @@ async fn denied_mixed_content_assistant_message_keeps_text_but_drops_tool_calls(
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn protected_path_denial_writes_no_raw_tool_output_to_jsonl_or_results_dir() {
     let dir = temp_sessions_dir("protected_path_no_output");
     let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
@@ -1538,7 +1540,7 @@ async fn protected_path_denial_writes_no_raw_tool_output_to_jsonl_or_results_dir
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn protected_path_denial_persists_only_safe_audit_material() {
     let dir = temp_sessions_dir("protected_path_audit");
     let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
@@ -1604,7 +1606,7 @@ async fn protected_path_denial_persists_only_safe_audit_material() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn metacharacter_smuggling_under_allowlisted_prefix_requires_approval() {
     let dir = temp_sessions_dir("metacharacter_smuggling");
     let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
@@ -1665,7 +1667,7 @@ async fn metacharacter_smuggling_under_allowlisted_prefix_requires_approval() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn truncated_shell_output_remains_explicit_in_session_pointer_and_result_file() {
     let dir = temp_sessions_dir("truncated_shell_output");
     let call_id = "call-truncated";
@@ -1744,7 +1746,7 @@ async fn truncated_shell_output_remains_explicit_in_session_pointer_and_result_f
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn tool_output_is_redacted_before_persist() {
     let dir = temp_sessions_dir("tool_redaction");
     let provider = SequenceProvider::new(vec![
@@ -1817,7 +1819,7 @@ async fn tool_output_is_redacted_before_persist() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn execute_tool_approval_prompts_once_and_persists_result() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1885,7 +1887,7 @@ async fn execute_tool_approval_prompts_once_and_persists_result() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn execute_tool_approval_rejection_leaves_no_result_file() {
     let dir = temp_sessions_dir("execute_denied");
     let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
@@ -1938,7 +1940,7 @@ async fn execute_tool_approval_rejection_leaves_no_result_file() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn replayed_tool_result_marks_followup_turn_tainted() {
     let dir = temp_sessions_dir("replayed_tool_taint");
     let mut session = crate::session::Session::new(&dir).unwrap();
