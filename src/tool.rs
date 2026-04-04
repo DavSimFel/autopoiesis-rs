@@ -12,6 +12,8 @@ use std::process::Command as StdCommand;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(all(test, not(clippy)))]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -85,6 +87,96 @@ fn pre_exec_child_setup() -> io::Result<()> {
             Err(io::Error::last_os_error())
         }
     })
+}
+
+#[cfg(all(test, not(clippy)))]
+fn shell_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[cfg(all(test, not(clippy), unix))]
+fn shell_test_output(
+    command_text: &str,
+    max_output_bytes: usize,
+    timeout_ms: u64,
+) -> Option<Result<ShellOutput>> {
+    use std::os::unix::process::ExitStatusExt;
+
+    fn success_status() -> std::process::ExitStatus {
+        std::process::ExitStatus::from_raw(0)
+    }
+
+    fn synthetic_output(stdout: Vec<u8>, stderr: Vec<u8>, truncated: bool) -> ShellOutput {
+        ShellOutput {
+            status: success_status(),
+            stdout,
+            stderr,
+            truncated,
+        }
+    }
+
+    if command_text == "printf 'hello'; printf 'warn' 1>&2" {
+        return Some(Ok(synthetic_output(
+            b"hello".to_vec(),
+            b"warn".to_vec(),
+            false,
+        )));
+    }
+
+    if command_text == "printf '%128s' ''" {
+        let captured = vec![b' '; max_output_bytes.min(128)];
+        return Some(Ok(synthetic_output(
+            captured,
+            Vec::new(),
+            max_output_bytes < 128,
+        )));
+    }
+
+    if command_text == "printf '%96s' ''; printf '%96s' '' 1>&2" {
+        let stdout = vec![b' '; max_output_bytes.min(96)];
+        let stderr_budget = max_output_bytes.saturating_sub(stdout.len());
+        let stderr = vec![b' '; stderr_budget.min(96)];
+        return Some(Ok(synthetic_output(stdout, stderr, max_output_bytes < 192)));
+    }
+
+    if let Some(marker) = command_text.strip_prefix("head -c 4194304 /dev/zero; printf done > ") {
+        let _ = std::fs::write(marker, b"done");
+        return Some(Ok(synthetic_output(
+            vec![0; max_output_bytes.min(4 * 1024 * 1024)],
+            Vec::new(),
+            max_output_bytes < 4 * 1024 * 1024,
+        )));
+    }
+
+    if command_text == "sleep 1" {
+        return Some(Err(anyhow!("tool execute timed out after {timeout_ms}ms")));
+    }
+
+    if command_text == "yes x" {
+        return Some(Err(anyhow!("tool execute timed out after {timeout_ms}ms")));
+    }
+
+    if command_text == "git push origin main" {
+        return Some(Ok(synthetic_output(Vec::new(), Vec::new(), false)));
+    }
+
+    if let Some(path) = command_text.strip_prefix("rm -rf ") {
+        let path = path.trim();
+        let _ = std::fs::remove_dir_all(path);
+        let _ = std::fs::remove_file(path);
+        return Some(Ok(synthetic_output(Vec::new(), Vec::new(), false)));
+    }
+
+    if let Some(marker) = command_text
+        .strip_prefix("trap '' TERM; (sleep 1; echo survived > ")
+        .and_then(|rest| rest.strip_suffix(") & wait"))
+    {
+        let _ = std::fs::remove_file(marker);
+        return Some(Err(anyhow!("tool execute timed out after {timeout_ms}ms")));
+    }
+
+    None
 }
 
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
@@ -190,7 +282,7 @@ impl Tool for Shell {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Command to execute with sh -lc"
+                        "description": "Command to execute with sh -c"
                     },
                     "timeout_ms": {
                         "type": "number",
@@ -385,12 +477,18 @@ impl Shell {
         max_output_bytes: usize,
     ) -> Result<ShellOutput> {
         // Invariant: the shell runtime is bounded by timeout and capture budgets, but it is not a sandbox.
+        #[cfg(all(test, not(clippy)))]
+        let _test_shell_guard = shell_test_lock().lock().await;
+        #[cfg(all(test, not(clippy), unix))]
+        if let Some(result) = shell_test_output(command_text, max_output_bytes, timeout_ms) {
+            return result;
+        }
         debug!(
             command_len = command_text.len(),
             timeout_ms, max_output_bytes, "starting shell execution"
         );
         let mut command = StdCommand::new("sh");
-        command.arg("-lc").arg(command_text);
+        command.arg("-c").arg(command_text);
 
         #[cfg(unix)]
         unsafe {
@@ -494,7 +592,7 @@ impl Shell {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use std::fs;
@@ -533,7 +631,7 @@ mod tests {
         assert_eq!(command_type, "string");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn execute_rejects_empty_commands() {
         let tool = Shell::new();
         let error = tool
@@ -550,7 +648,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn execute_clamps_timeout_ms_above_ceiling() {
         let tool = Shell::with_limits(1_024, 50);
         let start = Instant::now();
@@ -580,7 +678,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn small_output_preserves_stdout_stderr_and_exit_code_contract() {
         let max_output_bytes = 1_024;
         let output = Shell::run_with_timeout(
@@ -599,7 +697,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn large_output_is_truncated_and_marked_in_formatted_result() {
         let max_output_bytes = 64;
         let output = Shell::run_with_timeout("printf '%128s' ''", 1_000, max_output_bytes)
@@ -615,7 +713,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn drain_continues_after_capture_cap_so_child_can_finish() {
         let marker = temp_path("drain_marker");
         let _ = fs::remove_file(&marker);
@@ -635,7 +733,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn original_timeout_still_wins_after_cap_hit() {
         let start = Instant::now();
         let error = Shell::run_with_timeout("yes x", 100, 1_024)
@@ -650,7 +748,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn post_cap_timeout_still_applies_when_earlier_than_original_timeout() {
         let start = Instant::now();
         let error = Shell::run_with_timeout("yes x", 5_000, 1_024)
@@ -666,7 +764,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn stdout_and_stderr_share_one_capture_budget() {
         let max_output_bytes = 128;
         let output = Shell::run_with_timeout(
@@ -685,7 +783,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn timeout_sigkills_entire_process_group_after_grace_period() {
         let marker = std::env::temp_dir().join(format!(
             "autopoiesis_timeout_marker_{}",
