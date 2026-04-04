@@ -1,0 +1,5 @@
+#!/bin/bash
+set -e
+echo "Pre-commit: format + lint..."
+cargo fmt --check || { echo "Run 'make fmt' to fix."; exit 1; }
+cargo clippy -- -D warnings || { echo "Fix clippy warnings."; exit 1; }

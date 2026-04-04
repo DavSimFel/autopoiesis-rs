@@ -1,0 +1,36 @@
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        language: system
+        entry: cargo fmt --check
+        pass_filenames: false
+        types: [rust]
+
+      - id: cargo-clippy
+        name: cargo clippy
+        language: system
+        entry: cargo clippy -- -D warnings
+        pass_filenames: false
+        types: [rust]
+
+      - id: no-unwrap
+        name: no unwrap() in non-test code
+        language: system
+        entry: bash -c 'rg "\.unwrap()" src/ --type rust && echo "ERROR: unwrap() found in src/" && exit 1 || exit 0'
+        pass_filenames: false
+        types: [rust]
+
+      - id: no-ok-drop
+        name: no .ok() at persistence/security boundaries
+        language: system
+        entry: bash -c 'rg "\.ok\(\)" src/store.rs src/gate/ src/auth.rs 2>/dev/null && echo "ERROR: .ok() found at security/persistence boundary" && exit 1 || exit 0'
+        pass_filenames: false
+        types: [rust]
+
+      - id: no-secrets
+        name: no hardcoded secrets
+        language: system
+        entry: bash -c 'rg -i "(api_key|secret|password|token)\s*=\s*\"[^\"]{8,}\"" src/ --type rust && echo "ERROR: possible hardcoded secret" && exit 1 || exit 0'
+        pass_filenames: false
