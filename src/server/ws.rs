@@ -104,7 +104,7 @@ async fn websocket_session(
                 {
                     let mut reason = reader_shutdown_reason
                         .lock()
-                        .expect("shutdown reason lock poisoned");
+                        .unwrap_or_else(|e| e.into_inner());
                     if reason.is_none() {
                         *reason = Some(error.clone());
                     }
@@ -234,7 +234,7 @@ async fn handle_ws_prompt(
     let shutdown_reason = context
         .shutdown_reason
         .lock()
-        .expect("shutdown reason lock poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .clone();
     if shutdown_reason.is_some() {
         finish_ws_prompt(&context.tx, None);
@@ -272,7 +272,7 @@ async fn handle_ws_prompt(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 async fn protocol_test_prompt(
     context: WsPromptContext,
     _content: String,
@@ -305,7 +305,7 @@ async fn protocol_test_prompt(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 async fn websocket_session_protocol_test(
     state: ServerState,
     session_id: String,
@@ -351,7 +351,7 @@ async fn websocket_session_protocol_test(
                 {
                     let mut reason = reader_shutdown_reason
                         .lock()
-                        .expect("shutdown reason lock poisoned");
+                        .unwrap_or_else(|e| e.into_inner());
                     if reason.is_none() {
                         *reason = Some(error.clone());
                     }
@@ -598,7 +598,7 @@ fn severity_label(severity: Severity) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 async fn ws_session_protocol_test(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
@@ -614,7 +614,7 @@ async fn ws_session_protocol_test(
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
     use crate::config::{

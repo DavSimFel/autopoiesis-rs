@@ -54,7 +54,7 @@ impl ServerState {
         let mut counts = self
             .always_on_websocket_counts
             .lock()
-            .expect("always-on websocket counts should be available");
+            .unwrap_or_else(|e| e.into_inner());
         *counts.entry(session_id.to_string()).or_insert(0) += 1;
     }
 
@@ -62,7 +62,7 @@ impl ServerState {
         let mut counts = self
             .always_on_websocket_counts
             .lock()
-            .expect("always-on websocket counts should be available");
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(count) = counts.get_mut(session_id) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -74,7 +74,7 @@ impl ServerState {
     pub(crate) fn always_on_websocket_count(&self, session_id: &str) -> usize {
         self.always_on_websocket_counts
             .lock()
-            .expect("always-on websocket counts should be available")
+            .unwrap_or_else(|e| e.into_inner())
             .get(session_id)
             .copied()
             .unwrap_or(0)

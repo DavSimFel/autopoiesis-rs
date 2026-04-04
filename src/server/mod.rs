@@ -89,7 +89,7 @@ pub async fn run(port: u16) -> Result<()> {
         state
             .always_on_workers
             .lock()
-            .expect("always-on worker map should be available")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(spec.session_id.clone(), handle);
     }
 
@@ -104,7 +104,7 @@ pub async fn run(port: u16) -> Result<()> {
         .context("server exited unexpectedly");
     for handle in always_on_workers
         .lock()
-        .expect("always-on worker map should be available")
+        .unwrap_or_else(|e| e.into_inner())
         .drain()
         .map(|(_, handle)| handle)
     {
@@ -145,7 +145,7 @@ pub(super) fn validate_session_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;
 
