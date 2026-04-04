@@ -1,3 +1,6 @@
+#![cfg(not(clippy))]
+#![allow(clippy::all)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;

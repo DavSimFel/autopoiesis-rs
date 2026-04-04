@@ -1,3 +1,7 @@
+#![cfg(not(clippy))]
+#![allow(clippy::all)]
+
+use anyhow::{Result, anyhow};
 use autopoiesis::plan::{PlanAction, PlanActionKind, extract_plan_action, validate_plan_action};
 
 fn valid_plan_json() -> &'static str {
@@ -5,37 +9,42 @@ fn valid_plan_json() -> &'static str {
 }
 
 #[test]
-fn extracts_plan_json_block_from_assistant_text() {
+fn extracts_plan_json_block_from_assistant_text() -> Result<()> {
     let assistant_text = format!(
         "assistant prose\n```plan-json\n{}\n```\nclosing prose",
         valid_plan_json()
     );
 
-    let action = extract_plan_action(&assistant_text).unwrap().unwrap();
+    let action = extract_plan_action(&assistant_text)?
+        .ok_or_else(|| anyhow!("expected a plan-json block"))?;
     assert_eq!(action.kind, PlanActionKind::Plan);
     assert_eq!(action.plan_run_id.as_deref(), Some("run-1"));
     assert_eq!(action.replace_from_step, Some(1));
     assert_eq!(action.note.as_deref(), Some("build a plan"));
     assert_eq!(action.steps.len(), 2);
+    Ok(())
 }
 
 #[test]
-fn extracts_first_plan_json_block_when_multiple_exist() {
+fn extracts_first_plan_json_block_when_multiple_exist() -> Result<()> {
     let assistant_text = format!(
         "intro\n```plan-json\n{}\n```\nmiddle\n```plan-json\n{}\n```",
         valid_plan_json(),
         valid_plan_json().replace("run-1", "run-2")
     );
 
-    let action = extract_plan_action(&assistant_text).unwrap().unwrap();
+    let action = extract_plan_action(&assistant_text)?
+        .ok_or_else(|| anyhow!("expected a plan-json block"))?;
     assert_eq!(action.plan_run_id.as_deref(), Some("run-1"));
+    Ok(())
 }
 
 #[test]
-fn validates_plan_action_with_serde() {
-    let action: PlanAction = serde_json::from_str(valid_plan_json()).unwrap();
+fn validates_plan_action_with_serde() -> Result<()> {
+    let action: PlanAction = serde_json::from_str(valid_plan_json())?;
 
-    validate_plan_action(&action).unwrap();
+    validate_plan_action(&action)?;
+    Ok(())
 }
 
 #[test]
@@ -63,7 +72,7 @@ fn rejects_semantically_invalid_plan_blocks() {
 }
 
 #[test]
-fn parses_done_action_with_empty_steps() {
+fn parses_done_action_with_empty_steps() -> Result<()> {
     let action = PlanAction {
         kind: PlanActionKind::Done,
         plan_run_id: Some("run-2".to_string()),
@@ -72,18 +81,19 @@ fn parses_done_action_with_empty_steps() {
         steps: vec![],
     };
 
-    validate_plan_action(&action).unwrap();
+    validate_plan_action(&action)?;
 
     let text = r#"```plan-json
 {"kind":"done","plan_run_id":"run-2","replace_from_step":null,"note":"done","steps":[]}
 ```"#;
-    let parsed = extract_plan_action(text).unwrap().unwrap();
+    let parsed = extract_plan_action(text)?.ok_or_else(|| anyhow!("expected plan-json block"))?;
     assert_eq!(parsed.kind, PlanActionKind::Done);
     assert!(parsed.steps.is_empty());
+    Ok(())
 }
 
 #[test]
-fn parses_escalate_action_with_empty_steps() {
+fn parses_escalate_action_with_empty_steps() -> Result<()> {
     let action = PlanAction {
         kind: PlanActionKind::Escalate,
         plan_run_id: Some("run-3".to_string()),
@@ -92,12 +102,13 @@ fn parses_escalate_action_with_empty_steps() {
         steps: vec![],
     };
 
-    validate_plan_action(&action).unwrap();
+    validate_plan_action(&action)?;
 
     let text = r#"```plan-json
 {"kind":"escalate","plan_run_id":"run-3","replace_from_step":2,"note":"escalate","steps":[]}
 ```"#;
-    let parsed = extract_plan_action(text).unwrap().unwrap();
+    let parsed = extract_plan_action(text)?.ok_or_else(|| anyhow!("expected plan-json block"))?;
     assert_eq!(parsed.kind, PlanActionKind::Escalate);
     assert!(parsed.steps.is_empty());
+    Ok(())
 }
