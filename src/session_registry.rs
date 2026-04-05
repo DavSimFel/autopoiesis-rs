@@ -151,7 +151,6 @@ mod tests {
     };
     use crate::identity;
     use crate::skills::SkillCatalog;
-    use std::path::PathBuf;
 
     fn base_config() -> Config {
         let mut agents = crate::config::AgentsConfig::default();
@@ -204,12 +203,15 @@ mod tests {
             read: ReadToolConfig::default(),
             subscriptions: SubscriptionsConfig::default(),
             queue: QueueConfig::default(),
-            identity_files: identity::t1_identity_files("identity-templates", "silas"),
+            identity_files: identity::t1_identity_files(
+                crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR,
+                "silas",
+            ),
             agents,
             models: ModelsConfig::default(),
             domains: DomainsConfig::default(),
-            skills_dir: PathBuf::from("skills"),
-            skills_dir_resolved: PathBuf::from("skills"),
+            skills_dir: crate::paths::default_skills_dir(),
+            skills_dir_resolved: crate::paths::default_skills_dir(),
             skills: SkillCatalog::default(),
             active_agent: Some("silas".to_string()),
         }

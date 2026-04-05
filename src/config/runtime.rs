@@ -112,7 +112,7 @@ impl Default for QueueConfig {
 impl Default for ReadToolConfig {
     fn default() -> Self {
         Self {
-            allowed_paths: vec!["identity-templates".to_string()],
+            allowed_paths: vec![crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR.to_string()],
             max_read_bytes: 65_536,
         }
     }

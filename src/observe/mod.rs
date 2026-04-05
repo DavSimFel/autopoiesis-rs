@@ -99,6 +99,7 @@ pub enum TraceEvent {
         turn_id: String,
         call_id: String,
         tool_name: String,
+        command: Option<String>,
     },
     ToolCallFinished {
         session_id: String,

@@ -36,10 +36,7 @@ pub struct AuthTokens {
 
 /// Resolve the auth token file path from `$HOME` with a safe fallback.
 pub fn token_file_path() -> PathBuf {
-    let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(home_dir)
-        .join(".autopoiesis")
-        .join("auth.json")
+    crate::paths::default_auth_file_path()
 }
 
 /// Read persisted tokens from disk.

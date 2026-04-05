@@ -1,0 +1,32 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/codegraph-pretool-bash.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/codegraph-pretool-search.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(code-graph *)",
+      "Bash(/home/user/.cargo/bin/code-graph *)",
+      "Bash(./scripts/code-graph *)",
+      "Bash(scripts/code-graph *)"
+    ]
+  }
+}

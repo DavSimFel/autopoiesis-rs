@@ -14,6 +14,7 @@
 - `src/main.rs` - CLI entrypoint, server launch, tracing setup.
 - `src/app/enqueue_command.rs` - CLI queue-only entrypoint for registry-backed sessions.
 - `src/terminal_ui.rs` - CLI presentation and denial formatting.
+- `src/tui/{mod,event,state,bridge,render,input}.rs` - optional ratatui TUI (`--features tui`).
 - `src/lib.rs` - crate re-exports.
 - `src/agent/loop_impl.rs` - core agent loop and turn runner.
 - `src/agent/audit.rs` - denial/audit persistence helpers and shared denial text formatting.
@@ -129,9 +130,9 @@ Config -> SessionRegistry
 - T1 loads constitution, agent, and context files.
 - T2 and T3 load constitution and context only.
 - Selected domains append `context_extend` files to the identity assembly.
-- `identity-templates/` is the runtime prompt source of truth.
+- `src/shipped/identity-templates/` is the shipped prompt source of truth.
 
-> **Legacy vs v2:** The `identity-templates/` layout above is the current live implementation. The design in `docs/specs/identity-v2.md` describes the intended layered model (operator.md, persona dimensions, guard rules) which is specified but not yet built. When in doubt, the code in `src/identity.rs` and `src/config/agents.rs` is the authority.
+> **Legacy vs v2:** The `src/shipped/identity-templates/` layout above is the current live implementation. The design in `docs/specs/identity-v2.md` describes the intended layered model (operator.md, persona dimensions, guard rules) which is specified but not yet built. When in doubt, the code in `src/identity.rs` and `src/config/agents.rs` is the authority.
 
 ### Skills
 
@@ -145,6 +146,19 @@ Config -> SessionRegistry
 - `plan.rs` and `src/plan/*` persist and execute plan runs.
 - Shell steps and postcondition checks reuse `src/agent/shell_execute.rs`.
 - Crash recovery marks stale running attempts crashed, moves the run to `waiting_t2`, and notifies the owner T2 session.
+
+### TUI (optional, `--features tui`)
+
+- Feature-gated ratatui-based terminal UI for direct interactive CLI sessions.
+- Split architecture: a dedicated OS thread owns terminal rendering and input; an async worker loop on a tokio task owns all mutable session state.
+- `src/tui/mod.rs` is the entry point (`run_tui()`); wires channels, spawns render thread, runs worker loop.
+- `src/tui/event.rs` defines the `TuiEvent`/`TuiCommand` channel protocol.
+- `src/tui/bridge.rs` implements `TokenSink`, `ApprovalHandler`, and `Observer` backed by the TUI event channel.
+- `src/tui/state.rs` is pure state logic (unit-testable, no terminal deps).
+- `src/tui/render.rs` and `src/tui/input.rs` handle ratatui drawing and crossterm key events.
+- Observer injection is local: the TUI calls `drain_queue_with_store_observed()` with a `MultiObserver` containing both the runtime observer and a `TuiObserver`. The shared observer factory is unchanged.
+- Tracing is redirected through TUI channel-backed writers via `init_tracing_for_tui()` to prevent alternate-screen corruption.
+- `--tui` is rejected when combined with any subcommand. Without the `tui` feature, it returns a clear build error.
 
 ### Subscriptions
 

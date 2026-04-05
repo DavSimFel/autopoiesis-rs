@@ -37,11 +37,14 @@ struct StandingApprovalMatch {
 
 impl ShellSafety {
     pub fn new() -> Self {
-        Self::with_policy_and_skills_dirs(ShellPolicy::default(), vec![PathBuf::from("skills")])
+        Self::with_policy_and_skills_dirs(
+            ShellPolicy::default(),
+            vec![crate::paths::default_skills_dir()],
+        )
     }
 
     pub fn with_policy(policy: ShellPolicy) -> Self {
-        Self::with_policy_and_skills_dirs(policy, vec![PathBuf::from("skills")])
+        Self::with_policy_and_skills_dirs(policy, vec![crate::paths::default_skills_dir()])
     }
 
     pub fn with_policy_and_skills_dir(policy: ShellPolicy, skills_dir: PathBuf) -> Self {
@@ -679,24 +682,24 @@ mod tests {
         ));
 
         for command in [
-            "cat ~/.autopoiesis/auth.json",
+            "cat ~/.aprs/auth.json",
             "cat .env",
             "sed -n '1,5p' ~/.ssh/id_rsa",
-            "FOO=1 cat ~/.autopoiesis/auth.json",
-            "env FOO=1 cat ~/.autopoiesis/auth.json",
-            "env -u HOME cat ~/.autopoiesis/auth.json",
-            "env -C /tmp cat ~/.autopoiesis/auth.json",
-            "env --unset HOME cat ~/.autopoiesis/auth.json",
-            "env --chdir /tmp cat ~/.autopoiesis/auth.json",
-            "env -S 'cat ~/.autopoiesis/auth.json'",
-            "env --split-string 'cat ~/.autopoiesis/auth.json'",
-            "env -i FOO=1 cat ~/.autopoiesis/auth.json",
+            "FOO=1 cat ~/.aprs/auth.json",
+            "env FOO=1 cat ~/.aprs/auth.json",
+            "env -u HOME cat ~/.aprs/auth.json",
+            "env -C /tmp cat ~/.aprs/auth.json",
+            "env --unset HOME cat ~/.aprs/auth.json",
+            "env --chdir /tmp cat ~/.aprs/auth.json",
+            "env -S 'cat ~/.aprs/auth.json'",
+            "env --split-string 'cat ~/.aprs/auth.json'",
+            "env -i FOO=1 cat ~/.aprs/auth.json",
             "env GIT_PAGER=cat git show HEAD:.env.production.local",
             "env -u GIT_PAGER git show HEAD:.env.production.local",
             "env -C /tmp git show HEAD:.env.production.local",
             "env -i GIT_PAGER=cat git show HEAD:.env.production.local",
-            "grep -f ~/.autopoiesis/auth.json README.md",
-            "git grep -f ~/.autopoiesis/auth.json README.md",
+            "grep -f ~/.aprs/auth.json README.md",
+            "git grep -f ~/.aprs/auth.json README.md",
         ] {
             let call = make_tool_call(command);
             let mut event = make_event_tool(&call);
@@ -708,7 +711,7 @@ mod tests {
 
         if let Some(home) = std::env::var_os("HOME").and_then(|value| value.into_string().ok()) {
             for command in [
-                format!("{home}/.autopoiesis/auth.json"),
+                format!("{home}/.aprs/auth.json"),
                 format!("{home}/.ssh/id_rsa"),
             ] {
                 let call = make_tool_call(&format!("cat {command}"));
@@ -744,16 +747,16 @@ mod tests {
         let gate = ShellSafety::with_policy(shell_policy("approve", &["git *"], &[], &[], "high"));
 
         for command in [
-            "git diff --no-index /dev/null ~/.autopoiesis/auth.json",
-            "git grep . ~/.autopoiesis/auth.json",
-            "git show ~/.autopoiesis/auth.json",
+            "git diff --no-index /dev/null ~/.aprs/auth.json",
+            "git grep . ~/.aprs/auth.json",
+            "git show ~/.aprs/auth.json",
             "git cat-file -p HEAD:auth.json",
-            "git show HEAD:.autopoiesis/auth.json",
+            "git show HEAD:.aprs/auth.json",
             "git show HEAD:.ssh/id_rsa",
             "git show HEAD:.aws/credentials",
             "git --no-pager show HEAD:.env.production.local",
             "git -c color.ui=always grep . main:path/to/.env.local",
-            "git -c alias.show='!cat ~/.autopoiesis/auth.json' show",
+            "git -c alias.show='!cat ~/.aprs/auth.json' show",
             "GIT_PAGER=cat git show HEAD:.env.production.local",
         ] {
             let call = make_tool_call(command);
@@ -776,7 +779,7 @@ mod tests {
     fn literal_reference_to_protected_path_is_not_hard_denied() {
         let gate =
             ShellSafety::with_policy(shell_policy("approve", &["printf *"], &[], &[], "high"));
-        let call = make_tool_call("printf '%s\\n' ~/.autopoiesis/auth.json");
+        let call = make_tool_call("printf '%s\\n' ~/.aprs/auth.json");
         let mut event = make_event_tool(&call);
 
         assert!(matches!(
@@ -791,10 +794,10 @@ mod tests {
             "approve",
             &[],
             &[],
-            &["cat ~/.autopoiesis/auth.json"],
+            &["cat ~/.aprs/auth.json"],
             "high",
         ));
-        let call = make_tool_call("cat ~/.autopoiesis/auth.json");
+        let call = make_tool_call("cat ~/.aprs/auth.json");
         let mut event = make_event_tool(&call);
 
         assert!(matches!(
@@ -812,7 +815,7 @@ mod tests {
     #[test]
     fn protected_paths_still_deny_when_policy_default_is_allow() {
         let gate = ShellSafety::with_policy(shell_policy("allow", &["cat *"], &[], &[], "medium"));
-        let call = make_tool_call("cat ~/.autopoiesis/auth.json");
+        let call = make_tool_call("cat ~/.aprs/auth.json");
         let mut event = make_event_tool(&call);
 
         assert!(matches!(
@@ -844,18 +847,18 @@ mod tests {
         ));
 
         for command in [
-            "printf hi > identity-templates/constitution.md",
-            "printf hi >identity-templates/constitution.md",
-            "bash -c \"cat > identity-templates/context.md\"",
-            "bash -c \"touch identity-templates/context.md\"",
-            "sh -c \"rm -rf identity-templates\"",
-            "bash -c \"git restore -- identity-templates/context.md\"",
-            "python -c \"from pathlib import Path; Path('identity-templates/context.md').touch()\"",
-            "tee identity-templates/context.md",
-            "cp /tmp/x identity-templates/agents/silas/agent.md",
-            "mv identity-templates/agents/silas/agent.md /tmp/x",
-            "rm -rf identity-templates/agents/silas",
-            "touch skills/code-review.toml",
+            "printf hi > src/shipped/identity-templates/constitution.md",
+            "printf hi >src/shipped/identity-templates/constitution.md",
+            "bash -c \"cat > src/shipped/identity-templates/context.md\"",
+            "bash -c \"touch src/shipped/identity-templates/context.md\"",
+            "sh -c \"rm -rf src/shipped/identity-templates\"",
+            "bash -c \"git restore -- src/shipped/identity-templates/context.md\"",
+            "python -c \"from pathlib import Path; Path('src/shipped/identity-templates/context.md').touch()\"",
+            "tee src/shipped/identity-templates/context.md",
+            "cp /tmp/x src/shipped/identity-templates/agents/silas/agent.md",
+            "mv src/shipped/identity-templates/agents/silas/agent.md /tmp/x",
+            "rm -rf src/shipped/identity-templates/agents/silas",
+            "touch src/shipped/skills/code-review.toml",
         ] {
             let call = make_tool_call(command);
             let mut event = make_event_tool(&call);
@@ -871,16 +874,16 @@ mod tests {
         let gate = ShellSafety::with_policy(shell_policy("approve", &[], &[], &[], "high"));
 
         for command in [
-            "touch identity-templates/context.md",
-            "chmod 600 identity-templates/constitution.md",
-            "chown root identity-templates/agents/silas/agent.md",
-            "ln -sf /tmp/source identity-templates/context.md",
-            "cp /tmp/source identity-templates",
-            "git checkout -- identity-templates/context.md",
-            "git restore identity-templates/constitution.md",
-            "python -c \"open('identity-templates/context.md', 'w').write('x')\"",
-            "python -c \"from pathlib import Path; Path('identity-templates/context.md').write_text('x')\"",
-            "cp /tmp/source skills/code-review.toml",
+            "touch src/shipped/identity-templates/context.md",
+            "chmod 600 src/shipped/identity-templates/constitution.md",
+            "chown root src/shipped/identity-templates/agents/silas/agent.md",
+            "ln -sf /tmp/source src/shipped/identity-templates/context.md",
+            "cp /tmp/source src/shipped/identity-templates",
+            "git checkout -- src/shipped/identity-templates/context.md",
+            "git restore src/shipped/identity-templates/constitution.md",
+            "python -c \"open('src/shipped/identity-templates/context.md', 'w').write('x')\"",
+            "python -c \"from pathlib import Path; Path('src/shipped/identity-templates/context.md').write_text('x')\"",
+            "cp /tmp/source src/shipped/skills/code-review.toml",
         ] {
             let call = make_tool_call(command);
             let mut event = make_event_tool(&call);
@@ -894,7 +897,7 @@ mod tests {
     #[test]
     fn identity_template_reads_are_not_hard_denied() {
         let gate = ShellSafety::with_policy(shell_policy("approve", &["cat *"], &[], &[], "high"));
-        let call = make_tool_call("cat identity-templates/context.md");
+        let call = make_tool_call("cat src/shipped/identity-templates/context.md");
         let mut event = make_event_tool(&call);
 
         assert!(matches!(
@@ -902,8 +905,9 @@ mod tests {
             Verdict::Allow | Verdict::Approve { .. }
         ));
 
-        let call =
-            make_tool_call("python -c \"print(open('identity-templates/context.md').read())\"");
+        let call = make_tool_call(
+            "python -c \"print(open('src/shipped/identity-templates/context.md').read())\"",
+        );
         let mut event = make_event_tool(&call);
         assert!(matches!(
             gate.check(&mut event, &GuardContext::default()),
@@ -919,7 +923,7 @@ mod identity_template_shell_safety_tests {
     #[test]
     fn denies_wrapped_perl_inplace_edit() {
         assert!(command_writes_identity_template_path(
-            r#"bash -c "perl -pi -e 's/foo/bar/' identity-templates/context.md""#,
+            r#"bash -c "perl -pi -e 's/foo/bar/' src/shipped/identity-templates/context.md""#,
         ));
         assert!(command_writes_target_path(
             r#"bash -c "perl -pi -e 's/foo/bar/' custom-skills/code-review.toml""#,
@@ -930,7 +934,7 @@ mod identity_template_shell_safety_tests {
     #[test]
     fn allows_read_only_copy_outside_the_tree() {
         assert!(!command_writes_identity_template_path(
-            r#"bash -c "cp identity-templates/context.md /tmp/x""#,
+            r#"bash -c "cp src/shipped/identity-templates/context.md /tmp/x""#,
         ));
     }
 }

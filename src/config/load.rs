@@ -149,12 +149,15 @@ impl Config {
             read: ReadToolConfig::default(),
             subscriptions: SubscriptionsConfig::default(),
             queue: QueueConfig::default(),
-            identity_files: identity::t1_identity_files("identity-templates", "silas"),
+            identity_files: identity::t1_identity_files(
+                crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR,
+                "silas",
+            ),
             agents: AgentsConfig::default(),
             models: ModelsConfig::default(),
             domains: DomainsConfig::default(),
-            skills_dir: PathBuf::from("skills"),
-            skills_dir_resolved: PathBuf::from("skills"),
+            skills_dir: crate::paths::default_skills_dir(),
+            skills_dir_resolved: crate::paths::default_skills_dir(),
             skills: SkillCatalog::default(),
             active_agent: None,
         };
@@ -222,9 +225,12 @@ impl Config {
             })?;
 
             config.identity_files = if use_t2_files {
-                identity::t2_identity_files("identity-templates")
+                identity::t2_identity_files(crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR)
             } else {
-                identity::t1_identity_files("identity-templates", &selected_identity)
+                identity::t1_identity_files(
+                    crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR,
+                    &selected_identity,
+                )
             };
             if !config.domains.entries.is_empty() && config.domains.selected.is_empty() {
                 return Err(ConfigError::validation(
@@ -298,7 +304,7 @@ impl Config {
         config.queue = file_config.queue;
         let skills_dir = file_config
             .skills_dir
-            .unwrap_or_else(|| PathBuf::from("skills"));
+            .unwrap_or_else(crate::paths::default_skills_dir);
         // Policy: relative skills_dir values resolve against the config file directory; absolute values stay absolute.
         let resolved_skills_dir = if skills_dir.is_relative() {
             config_dir.join(&skills_dir)

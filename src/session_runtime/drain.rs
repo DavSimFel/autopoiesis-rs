@@ -571,6 +571,42 @@ where
     .await
 }
 
+/// Like [`drain_queue_with_store`] but accepts a caller-supplied observer
+/// instead of constructing one via `runtime_observer()`.  Used by the TUI
+/// path to inject a `TuiObserver` alongside the default observer stack.
+#[allow(clippy::too_many_arguments)]
+pub async fn drain_queue_with_store_observed<F, Fut, P, TB>(
+    store: &mut Store,
+    observer: Arc<dyn Observer>,
+    session_id: &str,
+    session: &mut Session,
+    turn_builder: &mut TB,
+    make_provider: &mut F,
+    token_sink: &mut (dyn TokenSink + Send),
+    approval_handler: &mut (dyn ApprovalHandler + Send),
+) -> Result<(Option<TurnVerdict>, bool, Option<String>)>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: Future<Output = Result<P>> + Send,
+    P: LlmProvider + Send,
+    TB: FnMut() -> Result<Turn> + Send,
+{
+    let mut backend = StoreDrainBackend::new(store);
+    let (verdict, processed_any, last_assistant_response, _last_successful_turn_id) =
+        drain_queue_with_stats_fresh_turns_observed(
+            &mut backend,
+            observer,
+            session_id,
+            session,
+            turn_builder,
+            make_provider,
+            token_sink,
+            approval_handler,
+        )
+        .await?;
+    Ok((verdict, processed_any, last_assistant_response))
+}
+
 pub async fn drain_queue_with_shared_store<F, Fut, P, TB>(
     store: Arc<TokioMutex<Store>>,
     session_id: &str,

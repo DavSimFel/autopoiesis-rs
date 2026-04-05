@@ -175,11 +175,28 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
     let registry_spec = registry.get(&session_id).cloned();
     ensure_direct_run_target(&session_id, registry_spec.as_ref())?;
 
-    let session_root = format!("sessions/{session_id}");
+    // TUI path: initialize TUI-aware tracing and enter TUI mode.
+    if cli.tui {
+        #[cfg(feature = "tui")]
+        {
+            return run_tui_path(&session_id, &config, &registry, registry_spec.as_ref()).await;
+        }
+        #[cfg(not(feature = "tui"))]
+        {
+            return Err(anyhow!(
+                "--tui requires building with: cargo build --features tui"
+            ));
+        }
+    }
+
+    // Plain CLI path: initialize standard tracing.
+    crate::app::tracing::init_tracing();
+
+    let session_root = autopoiesis::paths::default_sessions_dir().join(&session_id);
     let mut history = session::Session::new(&session_root)?;
     history.load_today()?;
 
-    let mut queue = store::Store::new("sessions/queue.sqlite")?;
+    let mut queue = store::Store::new(autopoiesis::paths::default_queue_db_path())?;
     match queue.recover_stale_messages(config.queue.stale_processing_timeout_secs) {
         Ok(recovered) if recovered > 0 => {
             warn!("recovered {recovered} stale messages from previous crash");
@@ -236,6 +253,52 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "tui")]
+async fn run_tui_path(
+    session_id: &str,
+    config: &config::Config,
+    registry: &SessionRegistry,
+    registry_spec: Option<&autopoiesis::session_registry::SessionSpec>,
+) -> Result<()> {
+    let session_root = autopoiesis::paths::default_sessions_dir().join(session_id);
+    let history = session::Session::new(&session_root)?;
+
+    let mut queue = store::Store::new(autopoiesis::paths::default_queue_db_path())?;
+    let _ = queue.recover_stale_messages(config.queue.stale_processing_timeout_secs);
+    let provider_config = registry_spec
+        .map(|spec| spec.config.clone())
+        .unwrap_or_else(|| config.clone());
+    if registry_spec.is_some() {
+        queue.ensure_session_row(session_id)?;
+    } else {
+        queue.create_session(session_id, Some(r#"{"source":"tui"}"#))?;
+    }
+
+    let session_manifest = registry_spec.map(|_| SessionManifest::from_registry(registry));
+
+    // Create the TUI event channel and initialize TUI-aware tracing so that
+    // all log output is captured through the channel instead of raw stderr/stdout.
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    crate::app::tracing::init_tracing_for_tui(event_tx.clone());
+
+    let http_client = Client::new();
+    let provider_factory = build_openai_provider_factory(http_client, provider_config.clone());
+    let model_label = provider_config.model.clone();
+
+    autopoiesis::tui::run_tui(
+        session_id.to_string(),
+        model_label,
+        queue,
+        history,
+        provider_config,
+        session_manifest,
+        provider_factory,
+        event_tx,
+        event_rx,
+    )
+    .await
 }
 
 #[cfg(all(test, not(clippy)))]
@@ -334,6 +397,7 @@ mod tests {
         let err = super::run(&Cli {
             command: None,
             session: None,
+            tui: false,
             prompt: Vec::new(),
         })
         .await

@@ -2,6 +2,16 @@
 
 A lightweight Rust agent runtime with a tiered execution model, guarded shell tooling, structured planning, and a SQLite-backed queue.
 
+## Layout
+
+- Generated runtime data defaults to `.aprs/`.
+- Sessions live under `.aprs/sessions/`.
+- The shared SQLite queue/store lives at `.aprs/queue.sqlite`.
+- Runtime workspace defaults to `.aprs/workspace/`.
+- OAuth auth is stored at `~/.aprs/auth.json`.
+- Shipped prompts live under `src/shipped/identity-templates/`.
+- Shipped skills live under `src/shipped/skills/`.
+
 ## What It Does
 
 - Interactive CLI agent with prompt and REPL modes.
@@ -21,6 +31,8 @@ A lightweight Rust agent runtime with a tiered execution model, guarded shell to
 
 ```bash
 cargo build --release
+./scripts/code-graph stats .
+./scripts/code-graph structure --path src
 ./target/release/autopoiesis --session ad-hoc "list files in the current directory"
 ./target/release/autopoiesis enqueue --session silas-t1 "check the queue backlog"
 ./target/release/autopoiesis --session ad-hoc
@@ -28,8 +40,8 @@ cargo build --release
 ./target/release/autopoiesis auth login
 ./target/release/autopoiesis auth status
 ./target/release/autopoiesis auth logout
-./target/release/autopoiesis sub add identity-templates/context.md
-./target/release/autopoiesis sub remove identity-templates/context.md
+./target/release/autopoiesis sub add src/shipped/identity-templates/context.md
+./target/release/autopoiesis sub remove src/shipped/identity-templates/context.md
 ./target/release/autopoiesis sub list
 ./target/release/autopoiesis plan status 123
 ./target/release/autopoiesis plan resume 123
@@ -38,6 +50,36 @@ cargo build --release
 ```
 
 When `agents.toml` defines registry-backed always-on sessions such as `silas-t1`, those sessions stay queue-owned. Use `autopoiesis enqueue --session <id> "..."` for them; bare CLI mode only runs ad hoc or request-owned sessions directly.
+
+## Code Graph
+
+This repo is set up to use `code-graph` for semantic code navigation.
+
+- Use [`scripts/code-graph`](scripts/code-graph) so the tool works even if the installed binary is not on `PATH`.
+- The local project registry alias is `autopoiesis-rs`.
+- Claude Code hooks are installed under `.claude/` for automatic enrichment of symbol-like searches.
+
+Examples:
+
+```bash
+./scripts/code-graph stats .
+./scripts/code-graph structure --path src --depth 2
+./scripts/code-graph find build_turn_for_config
+./scripts/code-graph refs build_turn_for_config
+./scripts/code-graph context build_turn_for_config
+./scripts/code-graph impact build_turn_for_config
+```
+
+## Quick Start
+
+```bash
+cargo build --release
+cp agents.toml agents.local.toml 2>/dev/null || true
+./target/release/autopoiesis auth login
+./target/release/autopoiesis --session ad-hoc "show me the repo layout"
+```
+
+The binary reads `agents.toml` from the working directory. If the file is missing, the runtime falls back to built-in defaults and the shipped assets under `src/shipped/`.
 
 ## Configuration
 
@@ -68,13 +110,29 @@ cost_unit = 1
 enabled = true
 ```
 
-Identity files live in `identity-templates/`:
+Default shipped asset paths:
 
 - `constitution.md` - policy layer
 - `agents/<name>/agent.md` - T1 character layer
 - `context.md` - runtime context layer
+- `src/shipped/skills/*.toml` - local shipped skill definitions
 
 Template variables such as `{{model}}`, `{{cwd}}`, and `{{tools}}` are resolved at runtime.
+
+If you use domain context packs, `context_extend` must stay under `src/shipped/identity-templates/`.
+
+## Runtime Data
+
+Autopoiesis keeps generated data out of the repo root by default:
+
+- `.aprs/sessions/` stores per-session JSONL history and result artifacts.
+- `.aprs/queue.sqlite` stores sessions, queue rows, subscriptions, and plan state.
+- `.aprs/workspace/` is the default generated workspace root.
+
+That separation is intentional:
+
+- `src/shipped/` is versioned, shipped input data.
+- `.aprs/` is generated, local runtime state.
 
 ## Architecture
 
@@ -164,7 +222,11 @@ main.rs
 ├─ observe/
 │  ├─ otel.rs
 │  └─ sqlite.rs
+├─ shipped/
+│  ├─ identity-templates/
+│  └─ skills/
 ├─ lib.rs
+├─ paths.rs
 ├─ tool.rs
 ├─ skills.rs
 ├─ subscription.rs
@@ -213,6 +275,7 @@ Throughout the docs and commit history, three names appear:
 ## Tests
 
 ```bash
+cargo build --release
 cargo test
 cargo test --features integration
 cargo fmt --check

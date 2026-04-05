@@ -45,7 +45,7 @@ fn format_plan_run_summary(plan_run: &store::PlanRun, retries: i64) -> String {
 }
 
 pub(crate) async fn handle_plan_command(command: PlanCommand) -> Result<()> {
-    let mut store = store::Store::new("sessions/queue.sqlite")?;
+    let mut store = store::Store::new(autopoiesis::paths::default_queue_db_path())?;
 
     match command {
         PlanCommand::Status(args) => {
@@ -246,7 +246,7 @@ mod tests {
         let _restore_dir = RestoreDir(old_dir);
 
         {
-            let mut store = Store::new("sessions/queue.sqlite").unwrap();
+            let mut store = Store::new(autopoiesis::paths::default_queue_db_path()).unwrap();
             store.create_session("owner", None).unwrap();
             store
                 .create_plan_run(

@@ -31,7 +31,7 @@ fn validate_enqueue_target(session_id: &str, registry_spec: Option<&SessionSpec>
 pub(crate) async fn handle_enqueue_command(args: EnqueueArgs) -> Result<()> {
     let config = config::Config::load("agents.toml")?;
     let registry = SessionRegistry::from_config(&config)?;
-    let mut store = store::Store::new("sessions/queue.sqlite")?;
+    let mut store = store::Store::new(autopoiesis::paths::default_queue_db_path())?;
     let EnqueueArgs {
         session: session_id,
         message,

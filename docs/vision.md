@@ -45,7 +45,7 @@ Identity is three layers:
 
 Domain packs are context extensions. They are appended when selected, not treated as a separate identity layer.
 
-The live identity files are under `identity-templates/`.
+The shipped identity files are under `src/shipped/identity-templates/`, and generated runtime data defaults under `.aprs/`.
 
 ## Skills
 

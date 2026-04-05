@@ -52,6 +52,17 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+impl ToolCall {
+    /// Try to extract a `"command"` string from the JSON arguments.
+    pub fn parse_command(arguments: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()?
+            .get("command")?
+            .as_str()
+            .map(String::from)
+    }
+}
+
 /// Structured result attached by tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {

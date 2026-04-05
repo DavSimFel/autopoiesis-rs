@@ -13,6 +13,9 @@ pub(crate) struct Cli {
     )]
     pub(crate) session: Option<String>,
 
+    #[arg(long, help = "Launch interactive TUI mode (requires --features tui)")]
+    pub(crate) tui: bool,
+
     #[arg(help = "Prompt for the agent", trailing_var_arg = true)]
     pub(crate) prompt: Vec<String>,
 }

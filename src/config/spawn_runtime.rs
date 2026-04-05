@@ -61,9 +61,12 @@ impl Config {
 
         // Invariant: child identity files follow the same trusted-root rules as load-time config.
         config.identity_files = if matches!(tier, "t2" | "t3") {
-            identity::t2_identity_files("identity-templates")
+            identity::t2_identity_files(crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR)
         } else {
-            identity::t1_identity_files("identity-templates", &selected_identity)
+            identity::t1_identity_files(
+                crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR,
+                &selected_identity,
+            )
         };
         if !config.domains.entries.is_empty() && config.domains.selected.is_empty() {
             return Err(ConfigError::validation(

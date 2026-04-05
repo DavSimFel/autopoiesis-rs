@@ -191,6 +191,7 @@ fn emit_tool_call_started(
         turn_id: turn_id.to_string(),
         call_id: call.id.clone(),
         tool_name: call.name.clone(),
+        command: command_from_tool_call(call),
     });
 }
 

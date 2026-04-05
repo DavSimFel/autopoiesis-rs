@@ -37,9 +37,9 @@ pub async fn run(port: u16) -> Result<()> {
     let config = config::Config::load("agents.toml").context("failed to load configuration")?;
     let api_key = std::env::var("AUTOPOIESIS_API_KEY")
         .context("set AUTOPOIESIS_API_KEY before running serve")?;
-    let sessions_dir = std::path::PathBuf::from("sessions");
+    let sessions_dir = crate::paths::default_sessions_dir();
 
-    let mut store = store::Store::new(sessions_dir.join("queue.sqlite"))
+    let mut store = store::Store::new(crate::paths::default_queue_db_path())
         .context("failed to open session store")?;
     match store.recover_stale_messages(config.queue.stale_processing_timeout_secs) {
         Ok(recovered) if recovered > 0 => {
@@ -148,7 +148,6 @@ mod tests {
     use crate::session_registry::SessionRegistry;
     use crate::skills::SkillCatalog;
     use crate::test_support::new_test_store;
-    use std::path::PathBuf;
 
     fn registry_config() -> Config {
         let mut agents = crate::config::AgentsConfig::default();
@@ -197,12 +196,15 @@ mod tests {
             read: ReadToolConfig::default(),
             subscriptions: SubscriptionsConfig::default(),
             queue: QueueConfig::default(),
-            identity_files: identity::t1_identity_files("identity-templates", "silas"),
+            identity_files: identity::t1_identity_files(
+                crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR,
+                "silas",
+            ),
             agents,
             models: ModelsConfig::default(),
             domains: DomainsConfig::default(),
-            skills_dir: PathBuf::from("skills"),
-            skills_dir_resolved: PathBuf::from("skills"),
+            skills_dir: crate::paths::default_skills_dir(),
+            skills_dir_resolved: crate::paths::default_skills_dir(),
             skills: SkillCatalog::default(),
             active_agent: Some("silas".to_string()),
         }

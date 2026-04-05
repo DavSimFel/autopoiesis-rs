@@ -74,7 +74,10 @@ fn assert_default_queue_config(queue: &QueueConfig) {
 }
 
 fn assert_default_read_config(read: &ReadToolConfig) {
-    assert_eq!(read.allowed_paths, vec!["identity-templates".to_string()]);
+    assert_eq!(
+        read.allowed_paths,
+        vec![crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR.to_string()]
+    );
     assert_eq!(read.max_read_bytes, 65_536);
 }
 
@@ -91,7 +94,7 @@ fn agent_tier_config_reports_configuration_state() {
 fn loads_valid_agents_toml_with_all_fields() {
     let path = temp_toml_path(
         "all_fields",
-        "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning='low'\nsession_name='fix-auth'\n[models]\ndefault='gpt5_mini'\n[models.catalog.gpt5_mini]\nprovider='openai'\nmodel='gpt-5.1'\n[models.routes.default]\nrequires=[]\nprefer=['gpt5_mini']\n[domains]\nselected=['demo']\n[domains.demo]\ncontext_extend='identity-templates/domains/demo.md'\n[auth]\noperator_key='operator-secret'\n[shell]\ndefault='allow'\nallow_patterns=['git *','cargo *']\ndeny_patterns=['rm -rf /*']\nstanding_approvals=['git push *','cargo publish *']\ndefault_severity='high'\nmax_output_bytes=2048\nmax_timeout_ms=4096\n",
+        "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-5.1'\nsystem_prompt='All good'\nbase_url='https://example.test/api'\nreasoning='low'\nsession_name='fix-auth'\n[models]\ndefault='gpt5_mini'\n[models.catalog.gpt5_mini]\nprovider='openai'\nmodel='gpt-5.1'\n[models.routes.default]\nrequires=[]\nprefer=['gpt5_mini']\n[domains]\nselected=['demo']\n[domains.demo]\ncontext_extend='src/shipped/identity-templates/domains/demo.md'\n[auth]\noperator_key='operator-secret'\n[shell]\ndefault='allow'\nallow_patterns=['git *','cargo *']\ndeny_patterns=['rm -rf /*']\nstanding_approvals=['git push *','cargo publish *']\ndefault_severity='high'\nmax_output_bytes=2048\nmax_timeout_ms=4096\n",
     );
 
     let config = Config::load(&path).expect("expected config to load");
@@ -129,7 +132,7 @@ fn loads_valid_agents_toml_with_all_fields() {
 fn loads_new_agents_silas_config_with_models_and_domains() {
     let path = temp_toml_path(
         "agents_v2",
-        "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nbase_url='https://example.test/api'\nsystem_prompt='legacy defaults'\nsession_name='legacy-session'\nmodel='gpt-5.4-mini'\nreasoning='medium'\ndelegation_token_threshold=12000\ndelegation_tool_depth=3\n[agents.silas.t2]\nmodel='o3'\nreasoning='xhigh'\n[models]\ndefault='gpt5_mini'\n[models.catalog.gpt5_mini]\nprovider='openai'\nmodel='gpt-5.4-mini'\ncaps=['fast','cheap','reasoning']\ncontext_window=128000\ncost_tier='cheap'\ncost_unit=1\nenabled=true\n[models.routes.code_review]\nrequires=['code']\nprefer=['gpt5_mini']\n[domains]\nselected=['fitness']\n[domains.fitness]\ncontext_extend='identity-templates/domains/fitness.md'\n",
+        "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nbase_url='https://example.test/api'\nsystem_prompt='legacy defaults'\nsession_name='legacy-session'\nmodel='gpt-5.4-mini'\nreasoning='medium'\ndelegation_token_threshold=12000\ndelegation_tool_depth=3\n[agents.silas.t2]\nmodel='o3'\nreasoning='xhigh'\n[models]\ndefault='gpt5_mini'\n[models.catalog.gpt5_mini]\nprovider='openai'\nmodel='gpt-5.4-mini'\ncaps=['fast','cheap','reasoning']\ncontext_window=128000\ncost_tier='cheap'\ncost_unit=1\nenabled=true\n[models.routes.code_review]\nrequires=['code']\nprefer=['gpt5_mini']\n[domains]\nselected=['fitness']\n[domains.fitness]\ncontext_extend='src/shipped/identity-templates/domains/fitness.md'\n",
     );
 
     let config = Config::load(&path).expect("expected config to load");
@@ -137,10 +140,10 @@ fn loads_new_agents_silas_config_with_models_and_domains() {
     assert_eq!(
         config.identity_files,
         vec![
-            PathBuf::from("identity-templates/constitution.md"),
-            PathBuf::from("identity-templates/agents/silas/agent.md"),
-            PathBuf::from("identity-templates/context.md"),
-            PathBuf::from("identity-templates/domains/fitness.md"),
+            PathBuf::from("src/shipped/identity-templates/constitution.md"),
+            PathBuf::from("src/shipped/identity-templates/agents/silas/agent.md"),
+            PathBuf::from("src/shipped/identity-templates/context.md"),
+            PathBuf::from("src/shipped/identity-templates/domains/fitness.md"),
         ]
     );
     assert_eq!(config.model, "gpt-5.4-mini");
@@ -183,7 +186,7 @@ fn loads_new_agents_silas_config_with_models_and_domains() {
             .entries
             .get("fitness")
             .and_then(|domain| domain.context_extend.as_deref()),
-        Some("identity-templates/domains/fitness.md")
+        Some("src/shipped/identity-templates/domains/fitness.md")
     );
     assert_default_read_config(&config.read);
     assert_default_queue_config(&config.queue);
@@ -207,7 +210,7 @@ fn rejects_agent_identity_path_traversal() {
 fn rejects_domains_without_explicit_selection() {
     let path = temp_toml_path(
         "domains_without_selection",
-        "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-5.4-mini'\n[domains.demo]\ncontext_extend='identity-templates/domains/demo.md'\n",
+        "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-5.4-mini'\n[domains.demo]\ncontext_extend='src/shipped/identity-templates/domains/demo.md'\n",
     );
 
     let err = Config::load(&path).expect_err("expected missing selection to fail");
@@ -228,8 +231,8 @@ fn t2_agent_uses_t2_identity_files() {
     assert_eq!(
         config.identity_files,
         vec![
-            PathBuf::from("identity-templates/constitution.md"),
-            PathBuf::from("identity-templates/context.md"),
+            PathBuf::from("src/shipped/identity-templates/constitution.md"),
+            PathBuf::from("src/shipped/identity-templates/context.md"),
         ]
     );
     assert_eq!(config.model, "o3");
@@ -241,7 +244,7 @@ fn t2_agent_uses_t2_identity_files() {
 fn spawned_child_runtime_uses_t2_identity_files_and_reasoning_override() {
     let path = temp_toml_path(
         "spawned_child_t2",
-        "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nbase_url='https://example.test/api'\nsystem_prompt='legacy defaults'\nsession_name='legacy-session'\nmodel='gpt-5.4-mini'\nreasoning='medium'\ndelegation_token_threshold=12000\ndelegation_tool_depth=3\n[agents.silas.t2]\nmodel='o3'\nreasoning='xhigh'\n[models]\ndefault='gpt5_mini'\n[models.catalog.gpt5_mini]\nprovider='openai'\nmodel='gpt-5.4-mini'\n[domains]\nselected=['fitness']\n[domains.fitness]\ncontext_extend='identity-templates/domains/fitness.md'\n",
+        "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nbase_url='https://example.test/api'\nsystem_prompt='legacy defaults'\nsession_name='legacy-session'\nmodel='gpt-5.4-mini'\nreasoning='medium'\ndelegation_token_threshold=12000\ndelegation_tool_depth=3\n[agents.silas.t2]\nmodel='o3'\nreasoning='xhigh'\n[models]\ndefault='gpt5_mini'\n[models.catalog.gpt5_mini]\nprovider='openai'\nmodel='gpt-5.4-mini'\n[domains]\nselected=['fitness']\n[domains.fitness]\ncontext_extend='src/shipped/identity-templates/domains/fitness.md'\n",
     );
 
     let config = Config::load(&path).expect("expected config to load");
@@ -254,9 +257,9 @@ fn spawned_child_runtime_uses_t2_identity_files_and_reasoning_override() {
     assert_eq!(
         child.identity_files,
         vec![
-            PathBuf::from("identity-templates/constitution.md"),
-            PathBuf::from("identity-templates/context.md"),
-            PathBuf::from("identity-templates/domains/fitness.md"),
+            PathBuf::from("src/shipped/identity-templates/constitution.md"),
+            PathBuf::from("src/shipped/identity-templates/context.md"),
+            PathBuf::from("src/shipped/identity-templates/domains/fitness.md"),
         ]
     );
     assert_eq!(
@@ -271,7 +274,7 @@ fn spawned_child_runtime_uses_t2_identity_files_and_reasoning_override() {
 fn spawned_child_runtime_uses_t1_identity_files_and_selected_domains() {
     let path = temp_toml_path(
         "spawned_child_t1",
-        "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nbase_url='https://example.test/api'\nsystem_prompt='legacy defaults'\nsession_name='legacy-session'\nmodel='gpt-5.4-mini'\nreasoning='medium'\n[agents.silas.t2]\nmodel='o3'\nreasoning='xhigh'\n[models]\ndefault='gpt5_mini'\n[models.catalog.gpt5_mini]\nprovider='openai'\nmodel='gpt-5.4-mini'\n[domains]\nselected=['fitness']\n[domains.fitness]\ncontext_extend='identity-templates/domains/fitness.md'\n",
+        "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nbase_url='https://example.test/api'\nsystem_prompt='legacy defaults'\nsession_name='legacy-session'\nmodel='gpt-5.4-mini'\nreasoning='medium'\n[agents.silas.t2]\nmodel='o3'\nreasoning='xhigh'\n[models]\ndefault='gpt5_mini'\n[models.catalog.gpt5_mini]\nprovider='openai'\nmodel='gpt-5.4-mini'\n[domains]\nselected=['fitness']\n[domains.fitness]\ncontext_extend='src/shipped/identity-templates/domains/fitness.md'\n",
     );
 
     let config = Config::load(&path).expect("expected config to load");
@@ -283,10 +286,10 @@ fn spawned_child_runtime_uses_t1_identity_files_and_selected_domains() {
     assert_eq!(
         child.identity_files,
         vec![
-            PathBuf::from("identity-templates/constitution.md"),
-            PathBuf::from("identity-templates/agents/silas/agent.md"),
-            PathBuf::from("identity-templates/context.md"),
-            PathBuf::from("identity-templates/domains/fitness.md"),
+            PathBuf::from("src/shipped/identity-templates/constitution.md"),
+            PathBuf::from("src/shipped/identity-templates/agents/silas/agent.md"),
+            PathBuf::from("src/shipped/identity-templates/context.md"),
+            PathBuf::from("src/shipped/identity-templates/domains/fitness.md"),
         ]
     );
     assert_eq!(
@@ -312,11 +315,11 @@ fn spawned_child_runtime_falls_back_to_parent_reasoning_and_session_name() {
         subscriptions: SubscriptionsConfig::default(),
         queue: QueueConfig::default(),
         identity_files: vec![
-            PathBuf::from("identity-templates/constitution.md"),
-            PathBuf::from("identity-templates/context.md"),
+            PathBuf::from("src/shipped/identity-templates/constitution.md"),
+            PathBuf::from("src/shipped/identity-templates/context.md"),
         ],
-        skills_dir: PathBuf::from("skills"),
-        skills_dir_resolved: PathBuf::from("skills"),
+        skills_dir: crate::paths::default_skills_dir(),
+        skills_dir_resolved: crate::paths::default_skills_dir(),
         skills: SkillCatalog::default(),
         agents: {
             let mut agents = AgentsConfig::default();
@@ -438,9 +441,8 @@ fn loaded_shell_policy_still_allows_ls_but_not_env_or_git_show() {
     let git_call = ToolCall {
         id: "call-3".to_string(),
         name: "execute".to_string(),
-        arguments:
-            serde_json::json!({"command":"git diff --no-index /dev/null ~/.autopoiesis/auth.json"})
-                .to_string(),
+        arguments: serde_json::json!({"command":"git diff --no-index /dev/null ~/.aprs/auth.json"})
+            .to_string(),
     };
     let mut git_event = GuardEvent::ToolCall(&git_call);
     assert!(matches!(
@@ -682,14 +684,17 @@ fn loads_skills_catalog_from_absolute_directory_without_rebasing() {
 fn loads_read_config_with_all_fields() {
     let path = temp_toml_path(
         "read_all",
-        "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-read'\n[read]\nallowed_paths=['identity-templates','sessions']\nmax_read_bytes=4096\n",
+        "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-read'\n[read]\nallowed_paths=['src/shipped/identity-templates','.aprs/sessions']\nmax_read_bytes=4096\n",
     );
 
     let config = Config::load(&path).expect("expected config to load");
     assert_eq!(
         config.read,
         ReadToolConfig {
-            allowed_paths: vec!["identity-templates".to_string(), "sessions".to_string()],
+            allowed_paths: vec![
+                "src/shipped/identity-templates".to_string(),
+                ".aprs/sessions".to_string(),
+            ],
             max_read_bytes: 4096,
         }
     );
@@ -710,7 +715,7 @@ fn missing_read_table_keeps_read_defaults() {
 fn read_config_rejects_empty_allowed_path_entry() {
     let path = temp_toml_path(
         "read_empty_path",
-        "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-read'\n[read]\nallowed_paths=['identity-templates','']\n",
+        "[agents.silas]\nidentity='silas'\n[agents.silas.t1]\nmodel='gpt-read'\n[read]\nallowed_paths=['src/shipped/identity-templates','']\n",
     );
 
     let err = Config::load(&path).expect_err("expected invalid read config to fail");

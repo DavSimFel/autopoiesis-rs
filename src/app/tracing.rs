@@ -84,6 +84,29 @@ pub(crate) fn init_tracing() {
     let _ = subscriber.try_init();
 }
 
+/// Initialize tracing with TUI channel-backed writers.
+///
+/// All three tracing layers (diagnostic, stdout user output, stderr user output)
+/// are redirected through the TUI event channel so they don't corrupt the
+/// alternate-screen terminal.
+#[cfg(feature = "tui")]
+pub(crate) fn init_tracing_for_tui(
+    tx: tokio::sync::mpsc::UnboundedSender<autopoiesis::tui::event::TuiEvent>,
+) {
+    use autopoiesis::tui::bridge::TuiLogWriter;
+
+    let diagnostic_writer = TuiLogWriter::diagnostic(tx.clone());
+    let stdout_writer = TuiLogWriter::system(tx.clone());
+    let stderr_writer = TuiLogWriter::system(tx);
+
+    let subscriber = build_tracing_subscriber(
+        move || diagnostic_writer.clone(),
+        move || stdout_writer.clone(),
+        move || stderr_writer.clone(),
+    );
+    let _ = subscriber.try_init();
+}
+
 #[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;

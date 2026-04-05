@@ -44,7 +44,7 @@ fn print_subscription_rows(records: &[SubscriptionRecord]) {
 }
 
 pub(crate) async fn handle_subscription_command(command: SubscriptionCommand) -> Result<()> {
-    let mut store = autopoiesis::store::Store::new("sessions/queue.sqlite")?;
+    let mut store = autopoiesis::store::Store::new(autopoiesis::paths::default_queue_db_path())?;
 
     match command {
         SubscriptionCommand::Add(args) => {

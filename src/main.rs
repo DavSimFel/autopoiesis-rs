@@ -14,71 +14,85 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    app_tracing::init_tracing();
     let cli = args::Cli::parse();
 
+    // Reject --tui when a subcommand is present.
+    if cli.tui && cli.command.is_some() {
+        return Err(anyhow!(
+            "--tui is only supported for interactive mode (no subcommand)"
+        ));
+    }
+
     match cli.command {
-        Some(args::Commands::Auth { action }) => match action {
-            args::AuthAction::Login => {
-                let tokens = auth::device_code_login().await?;
-                info!(
-                    target: STDOUT_USER_OUTPUT_TARGET,
-                    "Logged in. Token expiry: {}",
-                    tokens.expires_at
-                );
-            }
-            args::AuthAction::Status => {
-                let auth_path = auth::token_file_path();
+        Some(cmd) => {
+            // Subcommands use plain tracing.
+            app_tracing::init_tracing();
 
-                if !auth_path.exists() {
-                    info!(target: STDOUT_USER_OUTPUT_TARGET, "Not logged in");
-                    info!(
-                        target: STDOUT_USER_OUTPUT_TARGET,
-                        "Run: autopoiesis auth login"
-                    );
-                    return Ok(());
+            match cmd {
+                args::Commands::Auth { action } => match action {
+                    args::AuthAction::Login => {
+                        let tokens = auth::device_code_login().await?;
+                        info!(
+                            target: STDOUT_USER_OUTPUT_TARGET,
+                            "Logged in. Token expiry: {}",
+                            tokens.expires_at
+                        );
+                    }
+                    args::AuthAction::Status => {
+                        let auth_path = auth::token_file_path();
+
+                        if !auth_path.exists() {
+                            info!(target: STDOUT_USER_OUTPUT_TARGET, "Not logged in");
+                            info!(
+                                target: STDOUT_USER_OUTPUT_TARGET,
+                                "Run: autopoiesis auth login"
+                            );
+                            return Ok(());
+                        }
+
+                        let tokens = auth::read_tokens()
+                            .map_err(|error| anyhow!("failed to read auth file: {error}"))?;
+                        info!(target: STDOUT_USER_OUTPUT_TARGET, "Logged in");
+                        info!(
+                            target: STDOUT_USER_OUTPUT_TARGET,
+                            "Expires at: {}",
+                            tokens.expires_at
+                        );
+                    }
+                    args::AuthAction::Logout => {
+                        let auth_path = auth::token_file_path();
+
+                        if !auth_path.exists() {
+                            info!(target: STDOUT_USER_OUTPUT_TARGET, "Not logged in");
+                            return Ok(());
+                        }
+
+                        std::fs::remove_file(&auth_path).map_err(|error| {
+                            anyhow!("failed to remove {}: {error}", auth_path.display())
+                        })?;
+                        info!(
+                            target: STDOUT_USER_OUTPUT_TARGET,
+                            "Logged out from {}",
+                            auth_path.display()
+                        );
+                    }
+                },
+                args::Commands::Serve { port } => {
+                    server::run(port).await?;
                 }
-
-                let tokens = auth::read_tokens()
-                    .map_err(|error| anyhow!("failed to read auth file: {error}"))?;
-                info!(target: STDOUT_USER_OUTPUT_TARGET, "Logged in");
-                info!(
-                    target: STDOUT_USER_OUTPUT_TARGET,
-                    "Expires at: {}",
-                    tokens.expires_at
-                );
-            }
-            args::AuthAction::Logout => {
-                let auth_path = auth::token_file_path();
-
-                if !auth_path.exists() {
-                    info!(target: STDOUT_USER_OUTPUT_TARGET, "Not logged in");
-                    return Ok(());
+                args::Commands::Plan { action } => {
+                    plan_commands::handle_plan_command(action).await?;
                 }
-
-                std::fs::remove_file(&auth_path).map_err(|error| {
-                    anyhow!("failed to remove {}: {error}", auth_path.display())
-                })?;
-                info!(
-                    target: STDOUT_USER_OUTPUT_TARGET,
-                    "Logged out from {}",
-                    auth_path.display()
-                );
+                args::Commands::Enqueue(enqueue_args) => {
+                    enqueue_command::handle_enqueue_command(enqueue_args).await?;
+                }
+                args::Commands::Sub { action } => {
+                    subscription_commands::handle_subscription_command(action).await?;
+                }
             }
-        },
-        Some(args::Commands::Serve { port }) => {
-            server::run(port).await?;
-        }
-        Some(args::Commands::Plan { action }) => {
-            plan_commands::handle_plan_command(action).await?;
-        }
-        Some(args::Commands::Enqueue(args)) => {
-            enqueue_command::handle_enqueue_command(args).await?;
-        }
-        Some(args::Commands::Sub { action }) => {
-            subscription_commands::handle_subscription_command(action).await?;
         }
         None => {
+            // Tracing is initialized inside run() after determining tui vs cli mode.
             session_run::run(&cli).await?;
         }
     }

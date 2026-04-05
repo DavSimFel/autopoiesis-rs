@@ -85,12 +85,12 @@ Run after every significant feature. Fill in Actual, mark PASS/FAIL.
 
 ## Graceful Degradation
 
-- [ ] Back up `~/.autopoiesis/auth.json` to `~/.autopoiesis/auth.json.bak`, run prompt, then restore the backup
+- [ ] Back up `~/.aprs/auth.json` to `~/.aprs/auth.json.bak`, run prompt, then restore the backup
 - Expected: Clear error saying "run auth login"
 - Actual: ___
 - Verdict: PASS / FAIL
 
-- [ ] Move `identity-templates/` to `identity-templates.bak/`, run prompt, then move it back
+- [ ] Move `src/shipped/identity-templates/` to `src/shipped/identity-templates.bak/`, run prompt, then move it back
 - Expected: Clear missing-file error or refusal; startup should not silently fall back
 - Actual: ___
 - Verdict: PASS / FAIL

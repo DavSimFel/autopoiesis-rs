@@ -35,6 +35,13 @@ Use file-scoped tests during iteration. Run the full suite before committing.
 - Building a feature: this file -> [docs/risks.md](docs/risks.md) -> [docs/architecture/overview.md](docs/architecture/overview.md) -> [docs/roadmap.md](docs/roadmap.md) -> [docs/vision.md](docs/vision.md).
 - Understanding a spec: [docs/index.md](docs/index.md) -> relevant spec in [docs/specs/](docs/specs/).
 
+## Code Graph
+
+- `code-graph` is installed for this repo and the project is registered as `autopoiesis-rs`.
+- Prefer [`scripts/code-graph`](scripts/code-graph) for symbol-level exploration before falling back to raw text search.
+- Use `scripts/code-graph stats .`, `scripts/code-graph structure --path src`, `scripts/code-graph find <Symbol>`, `scripts/code-graph refs <Symbol>`, and `scripts/code-graph context <Symbol>` when they fit the task.
+- Keep using `rg` for plain-text search, literals, and broad grep-style scans.
+
 ## Project Structure
 
 ```text
@@ -44,9 +51,9 @@ src/                 52 Rust source files (~34.8K lines)
   gate/              Budget, shell safety, redaction, exfil detection, output capping
   plan/              Plan runner, executor, patching, recovery, notifications
   llm/               Provider trait + OpenAI backend
-identity-templates/  Git-tracked runtime prompt files (constitution, agent, context)
+src/shipped/        Git-tracked shipped assets (identity templates, skills)
+.aprs/              Generated runtime data (sessions, queue DB, workspace)
 agents.toml          Model config, shell policy, read policy, queue limits, domains
-sessions/            JSONL history + SQLite queue + subscriptions (gitignored)
 tests/               Integration + shipped policy tests
 docs/                Architecture, specs, risks, vision, roadmap
 ```

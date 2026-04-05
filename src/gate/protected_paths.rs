@@ -8,7 +8,7 @@
 use std::path::Path;
 
 const PROTECTED_PATH_FRAGMENTS: [&str; 8] = [
-    "~/.autopoiesis/auth.json",
+    "~/.aprs/auth.json",
     "auth.json",
     ".env.",
     ".env",
@@ -19,7 +19,7 @@ const PROTECTED_PATH_FRAGMENTS: [&str; 8] = [
 ];
 
 const PROTECTED_HOME_PATHS: [&str; 4] = [
-    "HOME/.autopoiesis/auth.json",
+    "HOME/.aprs/auth.json",
     "HOME/.ssh/id_rsa",
     "HOME/.ssh/id_ed25519",
     "HOME/.aws/credentials",
@@ -37,7 +37,7 @@ const PROTECTED_ENV_FILENAMES: [&str; 7] = [
 
 const PROTECTED_GIT_PATHS: [&str; 7] = [
     "auth.json",
-    ".autopoiesis/auth.json",
+    ".aprs/auth.json",
     "id_rsa",
     "id_ed25519",
     ".ssh/id_rsa",
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn path_is_protected_matches_known_fragments() {
-        assert!(path_is_protected("~/.autopoiesis/auth.json"));
+        assert!(path_is_protected("~/.aprs/auth.json"));
         assert!(path_is_protected(".env"));
         assert!(path_is_protected(".env.local"));
         assert!(path_is_protected(".env.production.local"));
@@ -170,6 +170,7 @@ mod tests {
 
     #[test]
     fn path_is_protected_handles_home_variable_expansion() {
+        assert!(path_is_protected("$HOME/.aprs/auth.json"));
         assert!(path_is_protected("$HOME/.ssh/id_rsa"));
         assert!(path_is_protected("${HOME}/.aws/credentials"));
     }

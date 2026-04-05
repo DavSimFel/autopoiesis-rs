@@ -21,22 +21,22 @@ The current stack has three layers:
 - `agent.md` - character layer, loaded for T1 only
 - `context.md` - session context layer, loaded for every tier
 
-The runtime source of truth is `identity-templates/`.
+The shipped source of truth is `src/shipped/identity-templates/`.
 
 ### T1
 
 T1 loads:
 
-- `identity-templates/constitution.md`
-- `identity-templates/agents/<name>/agent.md`
-- `identity-templates/context.md`
+- `src/shipped/identity-templates/constitution.md`
+- `src/shipped/identity-templates/agents/<name>/agent.md`
+- `src/shipped/identity-templates/context.md`
 
 ### T2 and T3
 
 T2 and T3 load:
 
-- `identity-templates/constitution.md`
-- `identity-templates/context.md`
+- `src/shipped/identity-templates/constitution.md`
+- `src/shipped/identity-templates/context.md`
 
 ### Domains
 

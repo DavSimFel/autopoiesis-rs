@@ -1489,7 +1489,7 @@ async fn protected_path_denial_writes_no_raw_tool_output_to_jsonl_or_results_dir
     let dir = temp_sessions_dir("protected_path_no_output");
     let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
         None,
-        "cat ~/.autopoiesis/auth.json",
+        "cat ~/.aprs/auth.json",
         "call-1",
     )]);
     let mut session = crate::session::Session::new(&dir).unwrap();
@@ -1545,7 +1545,7 @@ async fn protected_path_denial_persists_only_safe_audit_material() {
     let dir = temp_sessions_dir("protected_path_audit");
     let provider = SequenceProvider::new(vec![streamed_turn_with_tool_call(
         Some("safe protected-path assistant text"),
-        "cat ~/.autopoiesis/auth.json",
+        "cat ~/.aprs/auth.json",
         "call-1",
     )]);
     let mut session = crate::session::Session::new(&dir).unwrap();

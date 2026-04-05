@@ -1,6 +1,6 @@
 //! Persistent chat sessions stored as daily JSONL files.
 //!
-//! Each day gets one file: `sessions/2026-03-14.jsonl`.
+//! Each day gets one file: `.aprs/sessions/2026-03-14.jsonl`.
 //! Messages are appended in real time. On load, the file is
 //! replayed to rebuild in-memory state.
 

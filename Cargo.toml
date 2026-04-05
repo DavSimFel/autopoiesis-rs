@@ -30,9 +30,12 @@ uuid = { version = "1", features = ["v4"] }
 opentelemetry = "0.27"
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
 
 [features]
 integration = []
+tui = ["dep:ratatui", "dep:crossterm"]
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"

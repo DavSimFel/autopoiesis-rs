@@ -291,11 +291,14 @@ fn command_basename(command: &str) -> &str {
 }
 
 fn identity_template_mentions_target(value: &str) -> bool {
-    value.contains("identity-templates/") || value == "identity-templates"
+    value.contains(&format!(
+        "{}/",
+        crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR
+    )) || value == crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR
 }
 
 pub(crate) fn command_writes_target_path(command: &str, target: &str) -> bool {
-    if target == "identity-templates" {
+    if target == crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR {
         return command_writes_identity_template_path(command);
     }
 
@@ -359,9 +362,13 @@ fn rewrite_target_path_argument(argument: &str, target: &str) -> Option<String> 
         .strip_prefix(&target_path)
         .unwrap_or_else(|_| Path::new(""));
     if suffix.as_os_str().is_empty() {
-        Some("identity-templates".to_string())
+        Some(crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR.to_string())
     } else {
-        Some(format!("identity-templates/{}", suffix.to_string_lossy()))
+        Some(format!(
+            "{}/{}",
+            crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR,
+            suffix.to_string_lossy()
+        ))
     }
 }
 
@@ -681,8 +688,10 @@ fn identity_template_wrapper_script_writes(script: &str) -> bool {
     let mentions_target = identity_template_mentions_target(script);
     let sanitized = strip_quoted_literals(script);
     mentions_target
-        && (sanitized.contains("touch identity-templates/")
-            || sanitized.contains("perl -i")
+        && (sanitized.contains(&format!(
+            "touch {}/",
+            crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR
+        )) || sanitized.contains("perl -i")
             || sanitized.contains("perl -pi")
             || identity_template_perl_shell_payload_writes(script)
             || sanitized.contains("python -c")
@@ -733,17 +742,17 @@ mod env_wrapper_regression_tests {
     #[test]
     fn env_shell_split_payload_is_reparsed() {
         assert!(command_writes_identity_template_path(
-            "env -S 'bash -c \"touch identity-templates/context.md\"'"
+            "env -S 'bash -c \"touch src/shipped/identity-templates/context.md\"'"
         ));
     }
 
     #[test]
     fn open_mode_detection_requires_target_in_invocation() {
         assert!(!command_writes_identity_template_path(
-            "python -c \"open('README.md', 'w'); print('identity-templates/context.md')\""
+            "python -c \"open('README.md', 'w'); print('src/shipped/identity-templates/context.md')\""
         ));
         assert!(command_writes_identity_template_path(
-            "python -c \"from pathlib import Path; Path('identity-templates/context.md').open('w').close()\""
+            "python -c \"from pathlib import Path; Path('src/shipped/identity-templates/context.md').open('w').close()\""
         ));
     }
 }
@@ -1291,9 +1300,7 @@ mod tests {
 
     #[test]
     fn command_references_protected_path_matches_known_fragments() {
-        assert!(command_references_protected_path(
-            "cat ~/.autopoiesis/auth.json"
-        ));
+        assert!(command_references_protected_path("cat ~/.aprs/auth.json"));
         assert!(command_references_protected_path("echo .env.production"));
         assert!(command_references_protected_path("cat ~/.ssh/id_rsa"));
         assert!(!command_references_protected_path("printf '%s' hello"));
@@ -1303,12 +1310,12 @@ mod tests {
     fn simple_command_reads_protected_path_matches_readers() {
         assert!(simple_command_reads_protected_path(&[
             "cat".to_string(),
-            "~/.autopoiesis/auth.json".to_string(),
+            "~/.aprs/auth.json".to_string(),
         ]));
         if let Ok(home) = std::env::var("HOME") {
             assert!(simple_command_reads_protected_path(&[
                 "cat".to_string(),
-                format!("{home}/.autopoiesis/auth.json"),
+                format!("{home}/.aprs/auth.json"),
             ]));
         }
         assert!(simple_command_reads_protected_path(&[
@@ -1322,7 +1329,7 @@ mod tests {
             "diff".to_string(),
             "--no-index".to_string(),
             "/dev/null".to_string(),
-            "~/.autopoiesis/auth.json".to_string(),
+            "~/.aprs/auth.json".to_string(),
         ]));
         assert!(simple_command_reads_protected_path(&[
             "git".to_string(),
@@ -1333,7 +1340,7 @@ mod tests {
         assert!(simple_command_reads_protected_path(&[
             "git".to_string(),
             "show".to_string(),
-            "HEAD:.autopoiesis/auth.json".to_string(),
+            "HEAD:.aprs/auth.json".to_string(),
         ]));
         assert!(simple_command_reads_protected_path(&[
             "git".to_string(),
@@ -1356,64 +1363,64 @@ mod tests {
         assert!(simple_command_reads_protected_path(&[
             "git".to_string(),
             "-c".to_string(),
-            "alias.show=!cat ~/.autopoiesis/auth.json".to_string(),
+            "alias.show=!cat ~/.aprs/auth.json".to_string(),
             "show".to_string(),
         ]));
         assert!(simple_command_reads_protected_path(&[
             "FOO=1".to_string(),
             "cat".to_string(),
-            "~/.autopoiesis/auth.json".to_string(),
+            "~/.aprs/auth.json".to_string(),
         ]));
         assert!(simple_command_reads_protected_path(&[
             "env".to_string(),
             "FOO=1".to_string(),
             "cat".to_string(),
-            "~/.autopoiesis/auth.json".to_string(),
+            "~/.aprs/auth.json".to_string(),
         ]));
         assert!(simple_command_reads_protected_path(&[
             "env".to_string(),
             "-u".to_string(),
             "HOME".to_string(),
             "cat".to_string(),
-            "~/.autopoiesis/auth.json".to_string(),
+            "~/.aprs/auth.json".to_string(),
         ]));
         assert!(simple_command_reads_protected_path(&[
             "env".to_string(),
             "-C".to_string(),
             "/tmp".to_string(),
             "cat".to_string(),
-            "~/.autopoiesis/auth.json".to_string(),
+            "~/.aprs/auth.json".to_string(),
         ]));
         assert!(simple_command_reads_protected_path(&[
             "env".to_string(),
             "--unset".to_string(),
             "HOME".to_string(),
             "cat".to_string(),
-            "~/.autopoiesis/auth.json".to_string(),
+            "~/.aprs/auth.json".to_string(),
         ]));
         assert!(simple_command_reads_protected_path(&[
             "env".to_string(),
             "--chdir".to_string(),
             "/tmp".to_string(),
             "cat".to_string(),
-            "~/.autopoiesis/auth.json".to_string(),
+            "~/.aprs/auth.json".to_string(),
         ]));
         assert!(simple_command_reads_protected_path(&[
             "env".to_string(),
             "-S".to_string(),
-            "cat ~/.autopoiesis/auth.json".to_string(),
+            "cat ~/.aprs/auth.json".to_string(),
         ]));
         assert!(simple_command_reads_protected_path(&[
             "env".to_string(),
             "--split-string".to_string(),
-            "cat ~/.autopoiesis/auth.json".to_string(),
+            "cat ~/.aprs/auth.json".to_string(),
         ]));
         assert!(simple_command_reads_protected_path(&[
             "env".to_string(),
             "-i".to_string(),
             "FOO=1".to_string(),
             "cat".to_string(),
-            "~/.autopoiesis/auth.json".to_string(),
+            "~/.aprs/auth.json".to_string(),
         ]));
         assert!(simple_command_reads_protected_path(&[
             "GIT_PAGER=cat".to_string(),
@@ -1439,36 +1446,36 @@ mod tests {
         assert!(simple_command_reads_protected_path(&[
             "grep".to_string(),
             "-f".to_string(),
-            "~/.autopoiesis/auth.json".to_string(),
+            "~/.aprs/auth.json".to_string(),
             "README.md".to_string(),
         ]));
         assert!(simple_command_reads_protected_path(&[
             "grep".to_string(),
-            "-f~/.autopoiesis/auth.json".to_string(),
+            "-f~/.aprs/auth.json".to_string(),
             "README.md".to_string(),
         ]));
         assert!(simple_command_reads_protected_path(&[
             "git".to_string(),
             "grep".to_string(),
             "-f".to_string(),
-            "~/.autopoiesis/auth.json".to_string(),
+            "~/.aprs/auth.json".to_string(),
             "README.md".to_string(),
         ]));
         assert!(simple_command_reads_protected_path(&[
             "git".to_string(),
             "grep".to_string(),
-            "-f~/.autopoiesis/auth.json".to_string(),
+            "-f~/.aprs/auth.json".to_string(),
             "README.md".to_string(),
         ]));
         assert!(!simple_command_reads_protected_path(&[
             "printf".to_string(),
             "%s".to_string(),
-            "~/.autopoiesis/auth.json".to_string(),
+            "~/.aprs/auth.json".to_string(),
         ]));
         assert!(!simple_command_reads_protected_path(&[
             "git".to_string(),
             "status".to_string(),
-            "~/.autopoiesis/auth.json".to_string(),
+            "~/.aprs/auth.json".to_string(),
         ]));
         assert!(!simple_command_reads_protected_path(&[
             "cat".to_string(),
@@ -1516,7 +1523,7 @@ mod tests {
         assert!(simple_command_reads_protected_path(&[
             "git".to_string(),
             "-c".to_string(),
-            "core.pager=cat ~/.autopoiesis/auth.json".to_string(),
+            "core.pager=cat ~/.aprs/auth.json".to_string(),
             "show".to_string(),
             "HEAD:README.md".to_string(),
         ]));
@@ -1585,103 +1592,103 @@ mod tests {
     #[test]
     fn identity_template_write_detection_requires_write_target() {
         assert!(command_writes_identity_template_path(
-            "rm -rf identity-templates"
+            "rm -rf src/shipped/identity-templates"
         ));
         assert!(command_writes_identity_template_path(
-            "/bin/touch identity-templates/context.md"
+            "/bin/touch src/shipped/identity-templates/context.md"
         ));
         assert!(command_writes_identity_template_path(
-            "/usr/bin/python -c \"from pathlib import Path; Path('identity-templates/context.md').touch()\""
+            "/usr/bin/python -c \"from pathlib import Path; Path('src/shipped/identity-templates/context.md').touch()\""
         ));
         assert!(command_writes_identity_template_path(
-            "mv identity-templates /tmp/x"
+            "mv src/shipped/identity-templates /tmp/x"
         ));
         assert!(command_writes_identity_template_path(
-            "dd if=/tmp/x of=identity-templates/context.md"
+            "dd if=/tmp/x of=src/shipped/identity-templates/context.md"
         ));
         assert!(command_writes_identity_template_path(
-            "env -i touch identity-templates/context.md"
+            "env -i touch src/shipped/identity-templates/context.md"
         ));
         assert!(command_writes_identity_template_path(
-            "bash -c \"touch identity-templates/context.md\""
+            "bash -c \"touch src/shipped/identity-templates/context.md\""
         ));
         assert!(command_writes_identity_template_path(
-            "bash --rcfile /tmp/rc -c \"touch identity-templates/context.md\""
+            "bash --rcfile /tmp/rc -c \"touch src/shipped/identity-templates/context.md\""
         ));
         assert!(command_writes_identity_template_path(
-            "bash -O nullglob -c \"rm -rf identity-templates\""
+            "bash -O nullglob -c \"rm -rf src/shipped/identity-templates\""
         ));
         assert!(command_writes_identity_template_path(
-            "sh -c \"rm -rf identity-templates\""
+            "sh -c \"rm -rf src/shipped/identity-templates\""
         ));
         assert!(command_writes_identity_template_path(
-            "bash -c \"git restore -- identity-templates/context.md\""
+            "bash -c \"git restore -- src/shipped/identity-templates/context.md\""
         ));
         assert!(command_writes_identity_template_path(
-            "bash -c \"mv identity-templates/context.md /tmp/x\""
+            "bash -c \"mv src/shipped/identity-templates/context.md /tmp/x\""
         ));
         assert!(command_writes_identity_template_path(
-            "bash -ec \"touch identity-templates/context.md\""
+            "bash -ec \"touch src/shipped/identity-templates/context.md\""
         ));
         assert!(command_writes_identity_template_path(
-            "printf hi > identity-templates/constitution.md"
+            "printf hi > src/shipped/identity-templates/constitution.md"
         ));
         assert!(command_writes_identity_template_path(
-            "printf hi >identity-templates/constitution.md"
+            "printf hi >src/shipped/identity-templates/constitution.md"
         ));
         assert!(command_writes_identity_template_path(
-            "bash -c \"cat > identity-templates/context.md\""
+            "bash -c \"cat > src/shipped/identity-templates/context.md\""
         ));
         assert!(command_writes_identity_template_path(
-            "python -c \"from pathlib import Path; Path('identity-templates/context.md').touch()\""
+            "python -c \"from pathlib import Path; Path('src/shipped/identity-templates/context.md').touch()\""
         ));
         assert!(command_writes_identity_template_path(
-            "python -c \"from pathlib import Path; Path('identity-templates/context.md').write_text('x')\""
+            "python -c \"from pathlib import Path; Path('src/shipped/identity-templates/context.md').write_text('x')\""
         ));
         assert!(command_writes_identity_template_path(
-            "python -c \"open('identity-templates/context.md', 'w').close()\""
+            "python -c \"open('src/shipped/identity-templates/context.md', 'w').close()\""
         ));
         assert!(command_writes_identity_template_path(
-            "python -c \"from pathlib import Path; Path('identity-templates/context.md').open('w').close()\""
+            "python -c \"from pathlib import Path; Path('src/shipped/identity-templates/context.md').open('w').close()\""
         ));
         assert!(command_writes_identity_template_path(
-            "python -c \"open('identity-templates/context.md', 'x').close()\""
+            "python -c \"open('src/shipped/identity-templates/context.md', 'x').close()\""
         ));
         assert!(command_writes_identity_template_path(
-            "python -c \"from pathlib import Path; Path('identity-templates/context.md').open(mode='a').close()\""
+            "python -c \"from pathlib import Path; Path('src/shipped/identity-templates/context.md').open(mode='a').close()\""
         ));
         assert!(command_writes_identity_template_path(
-            "python -c \"open('identity-templates/context.md', 'w+').close()\""
+            "python -c \"open('src/shipped/identity-templates/context.md', 'w+').close()\""
         ));
         assert!(command_writes_identity_template_path(
-            "python -c \"open('identity-templates/context.md', 'wb').close()\""
+            "python -c \"open('src/shipped/identity-templates/context.md', 'wb').close()\""
         ));
         assert!(!command_writes_identity_template_path(
-            "python -c \"from pathlib import Path; Path('identity-templates/context.md').open('r').read()\""
+            "python -c \"from pathlib import Path; Path('src/shipped/identity-templates/context.md').open('r').read()\""
         ));
         assert!(command_writes_identity_template_path(
-            "perl -e \"unlink 'identity-templates/context.md'\""
+            "perl -e \"unlink 'src/shipped/identity-templates/context.md'\""
         ));
         assert!(command_writes_identity_template_path(
-            "bash -c \"perl -e 'unlink \\'identity-templates/context.md\\''\""
+            "bash -c \"perl -e 'unlink \\'src/shipped/identity-templates/context.md\\''\""
         ));
         assert!(command_writes_identity_template_path(
-            "node -e \"require('fs').writeFileSync('identity-templates/context.md', 'x')\""
+            "node -e \"require('fs').writeFileSync('src/shipped/identity-templates/context.md', 'x')\""
         ));
         assert!(command_writes_identity_template_path(
-            "node --eval \"require('fs').writeFileSync('identity-templates/context.md', 'x')\""
+            "node --eval \"require('fs').writeFileSync('src/shipped/identity-templates/context.md', 'x')\""
         ));
         assert!(command_writes_identity_template_path(
-            "tee identity-templates/context.md"
+            "tee src/shipped/identity-templates/context.md"
         ));
         assert!(command_writes_identity_template_path(
-            "cp /tmp/x identity-templates/agents/silas/agent.md"
+            "cp /tmp/x src/shipped/identity-templates/agents/silas/agent.md"
         ));
         assert!(command_writes_identity_template_path(
-            "cp /tmp/x identity-templates"
+            "cp /tmp/x src/shipped/identity-templates"
         ));
         assert!(command_writes_identity_template_path(
-            "cp -t identity-templates /tmp/x"
+            "cp -t src/shipped/identity-templates /tmp/x"
         ));
         assert!(command_writes_target_path(
             "cp /tmp/x custom-skills/code-review.toml",
@@ -1692,28 +1699,28 @@ mod tests {
             "./custom-skills"
         ));
         assert!(command_writes_identity_template_path(
-            "install --target-directory=identity-templates /tmp/x"
+            "install --target-directory=src/shipped/identity-templates /tmp/x"
         ));
         assert!(command_writes_identity_template_path(
-            "ln --target-directory identity-templates /tmp/x"
+            "ln --target-directory src/shipped/identity-templates /tmp/x"
         ));
         assert!(!command_writes_identity_template_path(
-            "cp identity-templates/context.md /tmp/x"
+            "cp src/shipped/identity-templates/context.md /tmp/x"
         ));
         assert!(!command_writes_identity_template_path(
-            "cat identity-templates/context.md"
+            "cat src/shipped/identity-templates/context.md"
         ));
         assert!(!command_writes_identity_template_path(
-            "python -c \"print('>identity-templates/context.md')\""
+            "python -c \"print('>src/shipped/identity-templates/context.md')\""
         ));
         assert!(!command_writes_identity_template_path(
-            "python -c \"print(\\\"open('identity-templates/context.md', 'w')\\\")\""
+            "python -c \"print(\\\"open('src/shipped/identity-templates/context.md', 'w')\\\")\""
         ));
         assert!(!command_writes_identity_template_path(
-            "python -c \"import sys; sys.stdout.write('identity-templates/context.md')\""
+            "python -c \"import sys; sys.stdout.write('src/shipped/identity-templates/context.md')\""
         ));
         assert!(!command_writes_identity_template_path(
-            "bash -c \"printf '> identity-templates/context.md\\n'\""
+            "bash -c \"printf '> src/shipped/identity-templates/context.md\\n'\""
         ));
         assert!(!command_writes_identity_template_path(
             "bash --norc /tmp/script.sh"
@@ -1722,13 +1729,13 @@ mod tests {
             "bash --rcfile /tmp/rc /tmp/script.sh"
         ));
         assert!(!command_writes_identity_template_path(
-            "printf '> identity-templates/context.md\\n'"
+            "printf '> src/shipped/identity-templates/context.md\\n'"
         ));
         assert!(command_writes_identity_template_path(
-            "node -p \"require('fs').writeFileSync('identity-templates/context.md', 'x')\""
+            "node -p \"require('fs').writeFileSync('src/shipped/identity-templates/context.md', 'x')\""
         ));
         assert!(command_writes_identity_template_path(
-            "git -C . restore -- identity-templates/context.md"
+            "git -C . restore -- src/shipped/identity-templates/context.md"
         ));
         assert!(command_writes_target_path(
             "touch custom-skills/code-review.toml",
@@ -1740,7 +1747,7 @@ mod tests {
         ));
         assert!(!command_writes_target_path(
             "touch vendor/skills/code-review.toml",
-            "skills"
+            "src/shipped/skills"
         ));
         assert!(!command_writes_identity_template_path(
             "git -C . restore -- README.md"
@@ -1784,28 +1791,28 @@ mod identity_template_guard_tests {
     #[test]
     fn denies_wrapped_perl_inplace_edit() {
         assert!(command_writes_identity_template_path(
-            r#"bash -c "perl -pi -e 's/foo/bar/' identity-templates/context.md""#,
+            r#"bash -c "perl -pi -e 's/foo/bar/' src/shipped/identity-templates/context.md""#,
         ));
     }
 
     #[test]
     fn denies_wrapped_python_remove() {
         assert!(command_writes_identity_template_path(
-            r#"sh -c "python -c 'import os; os.remove(\"identity-templates/context.md\")'""#,
+            r#"sh -c "python -c 'import os; os.remove(\"src/shipped/identity-templates/context.md\")'""#,
         ));
     }
 
     #[test]
     fn allows_copying_identity_template_outside_the_tree() {
         assert!(!command_writes_identity_template_path(
-            r#"bash -c "cp identity-templates/context.md /tmp/x""#,
+            r#"bash -c "cp src/shipped/identity-templates/context.md /tmp/x""#,
         ));
     }
 
     #[test]
     fn allows_printf_that_mentions_identity_template_text() {
         assert!(!command_writes_identity_template_path(
-            r#"bash -c "printf '> identity-templates/context.md\n'""#,
+            r#"bash -c "printf '> src/shipped/identity-templates/context.md\n'""#,
         ));
     }
 }

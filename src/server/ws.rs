@@ -688,12 +688,15 @@ mod tests {
             read: ReadToolConfig::default(),
             subscriptions: SubscriptionsConfig::default(),
             queue: QueueConfig::default(),
-            identity_files: identity::t1_identity_files("identity-templates", "silas"),
+            identity_files: identity::t1_identity_files(
+                crate::paths::DEFAULT_IDENTITY_TEMPLATES_DIR,
+                "silas",
+            ),
             agents,
             models: ModelsConfig::default(),
             domains: DomainsConfig::default(),
-            skills_dir: std::path::PathBuf::from("skills"),
-            skills_dir_resolved: std::path::PathBuf::from("skills"),
+            skills_dir: crate::paths::default_skills_dir(),
+            skills_dir_resolved: crate::paths::default_skills_dir(),
             skills: crate::skills::SkillCatalog::default(),
             active_agent: Some("silas".to_string()),
         }
