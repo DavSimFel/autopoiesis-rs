@@ -103,11 +103,12 @@ Config -> SessionRegistry
 
 - `session_registry.rs` derives session ids and per-session runtime configs from loaded `agents.toml`.
 - Always-on registry-backed sessions are queue-owned and each gets one persistent worker.
+- Direct CLI mode does not auto-attach to queue-owned registry sessions; it only defaults to request-owned sessions when one exists.
 - HTTP enqueues registry-backed always-on sessions to the queue worker path.
 - WebSocket sessions mark the session active, pause the always-on worker with a count gate, drain inline, then clear the active mark on disconnect.
 - Registry-backed non-always-on sessions reuse request-owned execution with the registry manifest.
 - Non-registry sessions keep the legacy ad hoc request-owned path.
-- `autopoiesis enqueue` is the explicit CLI path for queue-owned sessions.
+- `autopoiesis enqueue --session <id> "task"` is the explicit CLI path for queue-owned registry sessions.
 
 ### Tiered Turns
 

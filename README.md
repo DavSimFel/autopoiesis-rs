@@ -21,8 +21,9 @@ A lightweight Rust agent runtime with a tiered execution model, guarded shell to
 
 ```bash
 cargo build --release
-./target/release/autopoiesis "list files in the current directory"
-./target/release/autopoiesis
+./target/release/autopoiesis --session ad-hoc "list files in the current directory"
+./target/release/autopoiesis enqueue --session silas-t1 "check the queue backlog"
+./target/release/autopoiesis --session ad-hoc
 ./target/release/autopoiesis serve --port 8423
 ./target/release/autopoiesis auth login
 ./target/release/autopoiesis auth status
@@ -35,6 +36,8 @@ cargo build --release
 ./target/release/autopoiesis plan cancel 123
 ./target/release/autopoiesis plan list
 ```
+
+When `agents.toml` defines registry-backed always-on sessions such as `silas-t1`, those sessions stay queue-owned. Use `autopoiesis enqueue --session <id> "..."` for them; bare CLI mode only runs ad hoc or request-owned sessions directly.
 
 ## Configuration
 

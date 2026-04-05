@@ -4,6 +4,15 @@ use anyhow::{Result, anyhow};
 
 use crate::config::{AgentDefinition, AgentTierConfig, Config};
 
+/// Reject session IDs containing path traversal or unsafe characters.
+pub fn is_valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSpec {
     pub session_id: String,
@@ -18,6 +27,16 @@ pub struct SessionRegistry {
     specs: HashMap<String, SessionSpec>,
 }
 
+impl SessionSpec {
+    pub fn is_queue_owned(&self) -> bool {
+        self.always_on
+    }
+
+    pub fn is_request_owned(&self) -> bool {
+        !self.is_queue_owned()
+    }
+}
+
 impl SessionRegistry {
     pub fn from_config(config: &Config) -> Result<Self> {
         let Some(active_name) = config.active_agent.as_deref() else {
@@ -29,13 +48,20 @@ impl SessionRegistry {
             ));
         };
 
-        let mut specs = HashMap::new();
+        let mut specs: HashMap<String, SessionSpec> = HashMap::new();
         for (tier, tier_config) in [("t1", &active_agent.t1), ("t2", &active_agent.t2)] {
             if !tier_config.is_configured() {
                 continue;
             }
 
             let session_id = tier_session_id(active_name, tier, tier_config);
+            validate_registry_session_id(active_name, tier, &session_id)?;
+            if let Some(existing) = specs.get(&session_id) {
+                return Err(anyhow!(
+                    "active agent '{active_name}' tier '{tier}' reuses session id '{session_id}' already claimed by tier '{}'",
+                    existing.tier
+                ));
+            }
             let description = tier_description(tier);
             let tier_model = tier_model(config, active_agent, tier_config);
             let session_config = config.with_spawned_child_runtime(tier, &tier_model, None)?;
@@ -67,9 +93,25 @@ impl SessionRegistry {
     pub fn always_on_sessions(&self) -> Vec<&SessionSpec> {
         self.sessions()
             .into_iter()
-            .filter(|spec| spec.always_on)
+            .filter(|spec| spec.is_queue_owned())
             .collect()
     }
+
+    pub fn default_request_owned_session(&self) -> Option<&SessionSpec> {
+        self.sessions()
+            .into_iter()
+            .find(|spec| spec.is_request_owned())
+    }
+}
+
+fn validate_registry_session_id(active_name: &str, tier: &str, session_id: &str) -> Result<()> {
+    if is_valid_session_id(session_id) {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "active agent '{active_name}' tier '{tier}' produced invalid session id '{session_id}'"
+    ))
 }
 
 fn tier_model(
@@ -189,6 +231,8 @@ mod tests {
         let t1 = registry.get("silas-t1").unwrap();
         assert_eq!(t1.tier, "t1");
         assert!(t1.always_on);
+        assert!(t1.is_queue_owned());
+        assert!(!t1.is_request_owned());
         assert_eq!(t1.description, "Fast operator-facing tier (shell)");
         assert_eq!(
             t1.config
@@ -200,6 +244,8 @@ mod tests {
         let t2 = registry.get("silas-t2").unwrap();
         assert_eq!(t2.tier, "t2");
         assert!(t2.always_on);
+        assert!(t2.is_queue_owned());
+        assert!(!t2.is_request_owned());
         assert_eq!(t2.description, "Deep analysis tier (read_file, planning)");
         assert_eq!(
             t2.config
@@ -207,6 +253,7 @@ mod tests {
                 .and_then(|agent| agent.tier.as_deref()),
             Some("t2")
         );
+        assert!(registry.default_request_owned_session().is_none());
     }
 
     #[test]
@@ -252,5 +299,70 @@ mod tests {
         let registry = SessionRegistry::from_config(&config).unwrap();
         assert!(registry.get("custom-t1").is_some());
         assert!(registry.get("silas-t1").is_none());
+    }
+
+    #[test]
+    fn from_config_rejects_invalid_configured_session_name() {
+        let mut config = base_config();
+        config
+            .agents
+            .entries
+            .get_mut("silas")
+            .unwrap()
+            .t1
+            .session_name = Some("invalid/session".to_string());
+
+        let err = SessionRegistry::from_config(&config).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("active agent 'silas'"));
+        assert!(message.contains("tier 't1'"));
+        assert!(message.contains("invalid session id 'invalid/session'"));
+    }
+
+    #[test]
+    fn from_config_rejects_duplicate_explicit_session_names() {
+        let mut config = base_config();
+        config
+            .agents
+            .entries
+            .get_mut("silas")
+            .unwrap()
+            .t2
+            .session_name = Some("silas-t1".to_string());
+
+        let err = SessionRegistry::from_config(&config).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("active agent 'silas'"));
+        assert!(message.contains("tier 't2'"));
+        assert!(message.contains("reuses session id 'silas-t1'"));
+        assert!(message.contains("tier 't1'"));
+    }
+
+    #[test]
+    fn from_config_rejects_duplicate_implicit_and_explicit_session_names() {
+        let mut config = base_config();
+        let agent = config.agents.entries.get_mut("silas").unwrap();
+        agent.t1.session_name = None;
+        agent.t2.session_name = Some("silas-t1".to_string());
+
+        let err = SessionRegistry::from_config(&config).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("active agent 'silas'"));
+        assert!(message.contains("tier 't2'"));
+        assert!(message.contains("reuses session id 'silas-t1'"));
+        assert!(message.contains("tier 't1'"));
+    }
+
+    #[test]
+    fn session_id_validation_matches_server_rules() {
+        assert!(is_valid_session_id("silas-t1"));
+        assert!(is_valid_session_id("session_123"));
+        assert!(!is_valid_session_id(""));
+        assert!(!is_valid_session_id("contains/slash"));
+        assert!(!is_valid_session_id("contains space"));
+        assert!(!is_valid_session_id(&"a".repeat(129)));
     }
 }

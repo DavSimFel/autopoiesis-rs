@@ -136,15 +136,6 @@ pub(super) fn generate_session_id() -> String {
     format!("session-{now}")
 }
 
-/// Reject session IDs containing path traversal or unsafe characters.
-pub(super) fn validate_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
 #[cfg(all(test, not(clippy)))]
 mod tests {
     use super::*;

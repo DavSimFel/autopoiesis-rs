@@ -10,9 +10,10 @@ use thiserror::Error;
 
 use crate::context::SessionManifest;
 use crate::principal::Principal;
+use crate::session_registry::is_valid_session_id;
 
 use super::queue::spawn_http_queue_worker;
-use super::{ServerState, generate_session_id, validate_session_id};
+use super::{ServerState, generate_session_id};
 
 #[derive(Serialize)]
 pub(super) struct HealthResponse {
@@ -139,7 +140,7 @@ pub(super) async fn enqueue_message(
     Path(session_id): Path<String>,
     Json(payload): Json<EnqueueMessageRequest>,
 ) -> Result<impl IntoResponse, HttpError> {
-    if !validate_session_id(&session_id) {
+    if !is_valid_session_id(&session_id) {
         return Err(HttpError::bad_request("invalid session id"));
     }
 
@@ -162,7 +163,7 @@ pub(super) async fn enqueue_message(
         Ok(message_id) => {
             drop(store);
             if let Some(spec) = registry_spec {
-                if !spec.always_on {
+                if spec.is_request_owned() {
                     spawn_http_queue_worker(
                         state.clone(),
                         session_id.clone(),
@@ -297,7 +298,7 @@ mod tests {
         let session_id = payload["session_id"]
             .as_str()
             .expect("response should contain session_id");
-        assert!(validate_session_id(session_id));
+        assert!(is_valid_session_id(session_id));
 
         let conn = rusqlite::Connection::open(root.join("queue.sqlite")).unwrap();
         let metadata: String = conn
@@ -439,6 +440,31 @@ mod tests {
         let (role, source) = load_queued_message(&root, message_id);
         assert_eq!(role, "user");
         assert_eq!(source, "http-operator");
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_invalid_session_id() {
+        let (state, _queue_path) = test_state();
+        let app = crate::server::router(state);
+
+        let response = enqueue_message_via_http(
+            app,
+            "mock-api-key",
+            "bad%20session",
+            serde_json::json!({
+                "content": "blocked",
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            r#"{"error":"invalid session id"}"#
+        );
     }
 
     #[tokio::test]

@@ -19,8 +19,9 @@ use crate::agent;
 use crate::context::SessionManifest;
 use crate::gate::Severity;
 use crate::principal::Principal;
+use crate::session_registry::is_valid_session_id;
 
-use super::{HttpError, ServerState, queue_worker, validate_session_id};
+use super::{HttpError, ServerState, queue_worker};
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -52,7 +53,7 @@ pub(super) async fn ws_session(
     Path(session_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, HttpError> {
-    if !validate_session_id(&session_id) {
+    if !is_valid_session_id(&session_id) {
         return Err(HttpError::bad_request("invalid session id"));
     }
     Ok(ws.on_upgrade(move |socket| websocket_session(state, session_id, principal, socket)))
@@ -124,7 +125,9 @@ async fn websocket_session(
     let session_manifest = registry_spec
         .as_ref()
         .map(|_| SessionManifest::from_registry(&state.registry));
-    let always_on = registry_spec.as_ref().is_some_and(|spec| spec.always_on);
+    let always_on = registry_spec
+        .as_ref()
+        .is_some_and(|spec| spec.is_queue_owned());
     if always_on {
         state.increment_always_on_websocket_count(&session_id);
     }
@@ -371,7 +374,9 @@ async fn websocket_session_protocol_test(
     let session_manifest = registry_spec
         .as_ref()
         .map(|_| SessionManifest::from_registry(&state.registry));
-    let always_on = registry_spec.as_ref().is_some_and(|spec| spec.always_on);
+    let always_on = registry_spec
+        .as_ref()
+        .is_some_and(|spec| spec.is_queue_owned());
     if always_on {
         state.increment_always_on_websocket_count(&session_id);
     }
@@ -605,7 +610,7 @@ async fn ws_session_protocol_test(
     Path(session_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, HttpError> {
-    if !validate_session_id(&session_id) {
+    if !is_valid_session_id(&session_id) {
         return Err(HttpError::bad_request("invalid session id"));
     }
 
@@ -622,6 +627,7 @@ mod tests {
         ReadToolConfig, ShellPolicy, SubscriptionsConfig,
     };
     use crate::identity;
+    use axum::http::StatusCode;
     use std::sync::mpsc as std_mpsc;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -765,6 +771,41 @@ mod tests {
             frame_rx.try_recv().is_err(),
             "should emit exactly one Done frame"
         );
+    }
+
+    #[tokio::test]
+    async fn websocket_route_rejects_invalid_session_id() {
+        let (state, root) = new_test_server_state("ws_invalid_session_id");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let app = axum::Router::new()
+            .route("/api/ws/:session_id", axum::routing::get(super::ws_session))
+            .layer(axum::extract::Extension(Principal::Operator))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let ws_url = format!("ws://127.0.0.1:{}/api/ws/bad%20session", addr.port());
+        let error = tokio_tungstenite::connect_async(&ws_url)
+            .await
+            .expect_err("websocket handshake should be rejected");
+
+        match error {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let body = response.body().clone().unwrap_or_default();
+                assert_eq!(
+                    String::from_utf8(body).unwrap(),
+                    r#"{"error":"invalid session id"}"#
+                );
+            }
+            other => panic!("unexpected websocket error: {other}"),
+        }
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test(flavor = "multi_thread")]

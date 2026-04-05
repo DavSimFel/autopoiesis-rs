@@ -9,7 +9,7 @@ use autopoiesis::agent;
 use autopoiesis::config;
 use autopoiesis::context::SessionManifest;
 use autopoiesis::session;
-use autopoiesis::session_registry::SessionRegistry;
+use autopoiesis::session_registry::{SessionRegistry, SessionSpec};
 use autopoiesis::session_runtime::{
     build_openai_provider_factory, build_turn_builder_for_subscriptions_with_manifest,
     drain_queue_with_store, load_subscriptions_for_session,
@@ -21,12 +21,32 @@ fn resolve_session_id(
     cli_session: Option<&str>,
     config_session: Option<&str>,
     registry_default: Option<&str>,
+    queue_owned_hint: Option<&str>,
 ) -> Result<String> {
     if let Some(session_id) = cli_session.or(config_session).or(registry_default) {
         return Ok(session_id.to_string());
     }
 
+    if let Some(session_id) = queue_owned_hint {
+        return Err(anyhow!(
+            "no direct CLI default session configured; registry sessions like '{session_id}' are queue-owned; use `autopoiesis enqueue --session {session_id}`"
+        ));
+    }
+
     Err(anyhow!("no default session configured; pass --session"))
+}
+
+fn ensure_direct_run_target(session_id: &str, registry_spec: Option<&SessionSpec>) -> Result<()> {
+    if let Some(spec) = registry_spec
+        && spec.is_queue_owned()
+    {
+        return Err(anyhow!(
+            "session '{}' is queue-owned; use `autopoiesis enqueue --session {session_id}`",
+            spec.session_id
+        ));
+    }
+
+    Ok(())
 }
 
 struct PromptRunner<'a, F> {
@@ -138,16 +158,23 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
     let registry = SessionRegistry::from_config(&config)
         .map_err(|error| anyhow!("failed to build session registry: {error}"))?;
     let registry_default = registry
+        .default_request_owned_session()
+        .map(|spec| spec.session_id.as_str());
+    let queue_owned_hint = registry
         .sessions()
         .into_iter()
-        .find(|spec| spec.tier == "t1")
+        .find(|spec| spec.is_queue_owned())
         .map(|spec| spec.session_id.as_str());
 
     let session_id = resolve_session_id(
         cli.session.as_deref(),
         config.session_name.as_deref(),
         registry_default,
+        queue_owned_hint,
     )?;
+    let registry_spec = registry.get(&session_id).cloned();
+    ensure_direct_run_target(&session_id, registry_spec.as_ref())?;
+
     let session_root = format!("sessions/{session_id}");
     let mut history = session::Session::new(&session_root)?;
     history.load_today()?;
@@ -162,18 +189,11 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
             warn!("warning: failed to recover stale messages: {error}");
         }
     }
-    let registry_spec = registry.get(&session_id).cloned();
     let provider_config = registry_spec
         .as_ref()
         .map(|spec| spec.config.clone())
         .unwrap_or_else(|| config.clone());
-    if let Some(spec) = registry_spec.as_ref() {
-        if spec.always_on {
-            return Err(anyhow!(
-                "session '{}' is queue-owned; use `autopoiesis enqueue --session {session_id}`",
-                spec.session_id
-            ));
-        }
+    if registry_spec.is_some() {
         queue.ensure_session_row(&session_id)?;
     } else {
         queue.create_session(&session_id, Some(r#"{"source":"cli"}"#))?;
@@ -220,7 +240,16 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
 
 #[cfg(all(test, not(clippy)))]
 mod tests {
-    use super::resolve_session_id;
+    use super::{ensure_direct_run_target, resolve_session_id};
+    use crate::app::args::Cli;
+    use autopoiesis::config::{
+        AgentsConfig, Config, DomainsConfig, ModelsConfig, QueueConfig, ReadToolConfig,
+        ShellPolicy, SubscriptionsConfig,
+    };
+    use autopoiesis::session_registry::SessionSpec;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn resolve_session_id_prefers_cli_value() {
@@ -229,6 +258,7 @@ mod tests {
                 Some("fix-auth"),
                 Some("configured-default"),
                 Some("silas-t1"),
+                Some("silas-t2"),
             )
             .unwrap(),
             "fix-auth"
@@ -238,7 +268,13 @@ mod tests {
     #[test]
     fn resolve_session_id_uses_configured_default_when_cli_missing() {
         assert_eq!(
-            resolve_session_id(None, Some("configured-default"), Some("silas-t1")).unwrap(),
+            resolve_session_id(
+                None,
+                Some("configured-default"),
+                Some("analysis-session"),
+                Some("silas-t1"),
+            )
+            .unwrap(),
             "configured-default"
         );
     }
@@ -246,13 +282,148 @@ mod tests {
     #[test]
     fn resolve_session_id_falls_back_to_registry_default() {
         assert_eq!(
-            resolve_session_id(None, None, Some("silas-t1")).unwrap(),
-            "silas-t1"
+            resolve_session_id(None, None, Some("analysis-session"), Some("silas-t1")).unwrap(),
+            "analysis-session"
         );
     }
 
     #[test]
     fn resolve_session_id_errors_without_any_default() {
-        assert!(resolve_session_id(None, None, None).is_err());
+        assert!(resolve_session_id(None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_session_id_reports_queue_owned_hint_when_no_direct_default_exists() {
+        let err = resolve_session_id(None, None, None, Some("silas-t1")).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("no direct CLI default session configured"));
+        assert!(message.contains("queue-owned"));
+        assert!(message.contains("autopoiesis enqueue --session silas-t1"));
+    }
+
+    #[test]
+    fn ensure_direct_run_target_rejects_queue_owned_registry_session() {
+        let err = ensure_direct_run_target("silas-t1", Some(&test_session_spec("silas-t1", true)))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("queue-owned"));
+        assert!(
+            err.to_string()
+                .contains("autopoiesis enqueue --session silas-t1")
+        );
+    }
+
+    #[test]
+    fn ensure_direct_run_target_allows_request_owned_registry_session() {
+        ensure_direct_run_target(
+            "analysis-session",
+            Some(&test_session_spec("analysis-session", false)),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_reports_queue_owned_hint_when_only_registry_sessions_exist() {
+        let _cwd_guard = crate::app::test_cwd_lock().lock().await;
+        let temp_root = temp_root("session_run_queue_owned_hint");
+        fs::create_dir_all(temp_root.join("sessions")).unwrap();
+        fs::write(temp_root.join("agents.toml"), queue_owned_only_config()).unwrap();
+        let _restore_dir = set_current_dir_guard(&temp_root);
+
+        let err = super::run(&Cli {
+            command: None,
+            session: None,
+            prompt: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("no direct CLI default session configured"));
+        assert!(message.contains("autopoiesis enqueue --session silas-t1"));
+    }
+
+    #[tokio::test]
+    async fn run_rejects_explicit_queue_owned_registry_session() {
+        let _cwd_guard = crate::app::test_cwd_lock().lock().await;
+        let temp_root = temp_root("session_run_explicit_queue_owned");
+        fs::create_dir_all(temp_root.join("sessions")).unwrap();
+        fs::write(temp_root.join("agents.toml"), queue_owned_only_config()).unwrap();
+        let _restore_dir = set_current_dir_guard(&temp_root);
+
+        let err = super::run(&Cli {
+            command: None,
+            session: Some("silas-t1".to_string()),
+            prompt: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("session 'silas-t1' is queue-owned"));
+        assert!(message.contains("autopoiesis enqueue --session silas-t1"));
+    }
+
+    fn test_session_spec(session_id: &str, always_on: bool) -> SessionSpec {
+        SessionSpec {
+            session_id: session_id.to_string(),
+            tier: "t1".to_string(),
+            config: test_config(),
+            description: "test session".to_string(),
+            always_on,
+        }
+    }
+
+    fn test_config() -> Config {
+        Config {
+            model: "gpt-test".to_string(),
+            system_prompt: "system".to_string(),
+            base_url: "https://example.test/api".to_string(),
+            reasoning_effort: None,
+            session_name: None,
+            operator_key: None,
+            shell_policy: ShellPolicy::default(),
+            budget: None,
+            read: ReadToolConfig::default(),
+            subscriptions: SubscriptionsConfig::default(),
+            queue: QueueConfig::default(),
+            identity_files: Vec::new(),
+            agents: AgentsConfig::default(),
+            models: ModelsConfig::default(),
+            domains: DomainsConfig::default(),
+            skills_dir: PathBuf::from("skills"),
+            skills_dir_resolved: PathBuf::from("skills"),
+            skills: autopoiesis::skills::SkillCatalog::default(),
+            active_agent: None,
+        }
+    }
+
+    fn temp_root(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "autopoiesis_{prefix}_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    fn queue_owned_only_config() -> &'static str {
+        "[agents.silas]\nidentity = \"silas\"\n\n[agents.silas.t1]\nmodel = \"gpt-5.4-mini\"\n\n[agents.silas.t2]\nmodel = \"gpt-5.4-mini\"\n"
+    }
+
+    fn set_current_dir_guard(path: &std::path::Path) -> RestoreDir {
+        let old_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(path).unwrap();
+        RestoreDir(old_dir)
+    }
+
+    struct RestoreDir(PathBuf);
+
+    impl Drop for RestoreDir {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
     }
 }
