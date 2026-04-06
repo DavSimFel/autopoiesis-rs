@@ -82,7 +82,8 @@ impl TierTestFixtures {
     }
 
     fn copy_identity_templates_from_repo(&self) -> Result<()> {
-        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("identity-templates");
+        let source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/shipped/identity-templates");
         copy_dir_recursive(&source, &self.identity_dir)
     }
 
