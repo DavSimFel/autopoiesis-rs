@@ -171,7 +171,16 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
         config.session_name.as_deref(),
         registry_default,
         queue_owned_hint,
-    )?;
+    )
+    .or_else(|e| {
+        // TUI mode with no explicit session falls back to a named interactive
+        // session rather than erroring — the session is created on first use.
+        if cli.tui {
+            Ok("interactive".to_string())
+        } else {
+            Err(e)
+        }
+    })?;
     let registry_spec = registry.get(&session_id).cloned();
     ensure_direct_run_target(&session_id, registry_spec.as_ref())?;
 
@@ -419,6 +428,7 @@ mod tests {
         let err = super::run(&Cli {
             command: None,
             session: Some("silas-t1".to_string()),
+            tui: false,
             prompt: Vec::new(),
         })
         .await

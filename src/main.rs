@@ -14,7 +14,14 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = args::Cli::parse();
+    let mut cli = args::Cli::parse();
+
+    // When built with the tui feature and invoked with no arguments, default
+    // to interactive TUI mode on an "interactive" session.
+    #[cfg(feature = "tui")]
+    if cli.command.is_none() && cli.prompt.is_empty() && cli.session.is_none() {
+        cli.tui = true;
+    }
 
     // Reject --tui when a subcommand is present.
     if cli.tui && cli.command.is_some() {
@@ -32,6 +39,14 @@ async fn main() -> Result<()> {
                 args::Commands::Auth { action } => match action {
                     args::AuthAction::Login => {
                         let tokens = auth::device_code_login().await?;
+                        info!(
+                            target: STDOUT_USER_OUTPUT_TARGET,
+                            "Logged in. Token expiry: {}",
+                            tokens.expires_at
+                        );
+                    }
+                    args::AuthAction::BrowserLogin => {
+                        let tokens = auth::browser_login().await?;
                         info!(
                             target: STDOUT_USER_OUTPUT_TARGET,
                             "Logged in. Token expiry: {}",

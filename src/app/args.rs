@@ -44,6 +44,8 @@ pub(crate) enum Commands {
 #[derive(Subcommand)]
 pub(crate) enum AuthAction {
     Login,
+    /// Browser-based OAuth2 + PKCE login (opens a browser window).
+    BrowserLogin,
     Status,
     Logout,
 }

@@ -1,16 +1,23 @@
-//! OpenAI device authorization flow for local token management.
+//! OpenAI device authorization flow and browser-based OAuth2 + PKCE login.
 
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use crate::logging::{STDERR_USER_OUTPUT_TARGET, STDOUT_USER_OUTPUT_TARGET};
 use anyhow::{Context, Result, anyhow};
+use axum::Router;
+use axum::extract::{Query, State};
+use axum::response::Html;
+use axum::routing::get;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -20,6 +27,32 @@ const POLL_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
 const REFRESH_WINDOW_SECONDS: u64 = 300;
+
+const BROWSER_AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
+const BROWSER_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+// Pre-encoded forms used in the authorization URL query string.
+const BROWSER_REDIRECT_URI_ENC: &str = "http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback";
+const BROWSER_SCOPES_ENC: &str = "openid%20profile%20email%20offline_access";
+
+const BROWSER_LOGIN_TIMEOUT_SECS: u64 = 5 * 60;
+
+const SUCCESS_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head><title>Login Successful</title></head>
+<body style="font-family:sans-serif;text-align:center;padding:2rem;">
+<h1>&#10003; Login successful</h1>
+<p>You can close this tab and return to the terminal.</p>
+</body>
+</html>"#;
+
+const ERROR_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head><title>Login Failed</title></head>
+<body style="font-family:sans-serif;text-align:center;padding:2rem;">
+<h1>&#10007; Login failed</h1>
+<p>Authorization was denied or an error occurred. Check the terminal for details.</p>
+</body>
+</html>"#;
 
 /// Stored OAuth credentials and refresh metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +83,79 @@ pub fn read_tokens() -> Result<AuthTokens> {
         .with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_str::<AuthTokens>(&raw)
         .with_context(|| format!("failed to parse {}", path.display()))
+}
+
+/// Run the browser-based OAuth2 + PKCE authorization code flow.
+///
+/// Flow:
+/// 1) Generate a PKCE pair (code_verifier + code_challenge),
+/// 2) Start a local HTTP callback server on port 1455,
+/// 3) Open the authorization URL in the default browser,
+/// 4) Wait for the callback (5 minute timeout), then
+/// 5) Exchange the authorization code for access/refresh tokens.
+pub async fn browser_login() -> Result<AuthTokens> {
+    let (code_verifier, code_challenge) = pkce_pair();
+    let state_param = uuid::Uuid::new_v4().to_string();
+
+    let auth_url = format!(
+        "{BROWSER_AUTH_URL}?response_type=code&client_id={CLIENT_ID}\
+         &redirect_uri={BROWSER_REDIRECT_URI_ENC}\
+         &scope={BROWSER_SCOPES_ENC}\
+         &state={state_param}\
+         &code_challenge={code_challenge}\
+         &code_challenge_method=S256",
+    );
+
+    let client = Client::new();
+
+    let (callback_tx, callback_rx) = oneshot::channel::<Result<(String, String), String>>();
+    let sender: CallbackSender = Arc::new(Mutex::new(Some(callback_tx)));
+
+    let router = Router::new()
+        .route("/auth/callback", get(browser_callback_handler))
+        .with_state(Arc::clone(&sender));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:1455")
+        .await
+        .context("failed to bind to port 1455 for OAuth callback — is another process using it?")?;
+
+    let server_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    info!(target: STDOUT_USER_OUTPUT_TARGET, "Opening browser for authorization...");
+    info!(
+        target: STDOUT_USER_OUTPUT_TARGET,
+        "If the browser does not open, visit:\n  {auth_url}"
+    );
+    try_open_browser(&auth_url);
+
+    let callback_result = tokio::time::timeout(
+        StdDuration::from_secs(BROWSER_LOGIN_TIMEOUT_SECS),
+        callback_rx,
+    )
+    .await
+    .context("browser login timed out after 5 minutes")?
+    .context("callback channel closed before receiving a response")?
+    .map_err(|e| anyhow!("{e}"))?;
+
+    server_handle.abort();
+
+    let (code, received_state) = callback_result;
+    if received_state != state_param {
+        return Err(anyhow!(
+            "OAuth state parameter mismatch — possible CSRF; try logging in again"
+        ));
+    }
+
+    info!(
+        target: STDOUT_USER_OUTPUT_TARGET,
+        "Authorization code received, exchanging for tokens..."
+    );
+
+    let tokens = exchange_browser_code(&client, code, code_verifier).await?;
+    save_tokens(&tokens)?;
+    Ok(tokens)
 }
 
 /// Run the device-code OAuth flow used by `autopoiesis auth login`.
@@ -243,6 +349,163 @@ async fn exchange_authorization_code(
     ];
 
     request_token(client, &form).await
+}
+
+// ---------------------------------------------------------------------------
+// Browser login helpers
+// ---------------------------------------------------------------------------
+
+/// Test whether `auth.openai.com` is reachable from this process's network
+/// path.  Fails fast if the server returns a geo-restriction error, which
+/// means the tunnel (sshuttle or otherwise) is not routing traffic correctly.
+///
+/// Uses a no-redirect client so we see the raw 302 vs 403 from the auth
+/// endpoint without chasing the login-page redirect.
+/// Channel type carrying the callback result: Ok((code, state)) or Err(error message).
+type CallbackSender = Arc<Mutex<Option<oneshot::Sender<Result<(String, String), String>>>>>;
+
+#[derive(Deserialize)]
+struct BrowserCallbackParams {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+/// Axum route handler for `/auth/callback`.  Sends the authorization result
+/// through the oneshot channel and returns a browser-friendly HTML page.
+async fn browser_callback_handler(
+    Query(params): Query<BrowserCallbackParams>,
+    State(tx): State<CallbackSender>,
+) -> Html<&'static str> {
+    let result = match (params.code, params.state, params.error) {
+        (Some(code), Some(state), _) => Ok((code, state)),
+        (_, _, Some(error)) => Err(format!("authorization denied: {error}")),
+        _ => Err("missing code or state in OAuth callback".to_string()),
+    };
+
+    let html = if result.is_ok() {
+        SUCCESS_HTML
+    } else {
+        ERROR_HTML
+    };
+
+    if let Ok(mut guard) = tx.lock()
+        && let Some(sender) = guard.take()
+    {
+        let _ = sender.send(result);
+    }
+
+    Html(html)
+}
+
+/// Exchange a browser authorization code (PKCE flow) for tokens.
+///
+/// Uses `http://localhost:1455/auth/callback` as the redirect URI to match the
+/// authorization request.
+async fn exchange_browser_code(
+    client: &Client,
+    code: String,
+    code_verifier: String,
+) -> Result<AuthTokens> {
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("client_id", CLIENT_ID),
+        ("code", code.as_str()),
+        ("code_verifier", code_verifier.as_str()),
+        ("redirect_uri", BROWSER_REDIRECT_URI),
+    ];
+    request_token(client, &form).await
+}
+
+/// Generate a PKCE code_verifier + code_challenge pair (S256 method).
+///
+/// `code_verifier`: 32 cryptographically random bytes, base64url-encoded (43 chars).
+/// `code_challenge`: SHA-256 of the verifier, base64url-encoded.
+fn pkce_pair() -> (String, String) {
+    let mut bytes = [0u8; 32];
+    let a = uuid::Uuid::new_v4();
+    let b = uuid::Uuid::new_v4();
+    bytes[..16].copy_from_slice(a.as_bytes());
+    bytes[16..].copy_from_slice(b.as_bytes());
+    let code_verifier = base64url_encode(&bytes);
+    let hash = Sha256::digest(code_verifier.as_bytes());
+    let code_challenge = base64url_encode(&hash);
+    (code_verifier, code_challenge)
+}
+
+/// Base64url encoding (no padding) per RFC 4648 §5.
+fn base64url_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Attempt to open a URL in the system default browser.  Never fails — if no
+/// browser launcher is found the user can open the URL printed to the terminal.
+///
+/// If `ALL_PROXY` or `HTTPS_PROXY` is set in the environment, Chromium/Chrome
+/// is launched directly with `--proxy-server` so the auth page goes through the
+/// same tunnel as the reqwest HTTP client (which picks up those env vars
+/// automatically).
+fn try_open_browser(url: &str) {
+    // reqwest already honours ALL_PROXY / HTTPS_PROXY; mirror that for the
+    // browser so both sides of the flow go through the same tunnel.
+    let proxy = std::env::var("ALL_PROXY")
+        .or_else(|_| std::env::var("HTTPS_PROXY"))
+        .ok();
+
+    if let Some(ref proxy_url) = proxy {
+        // Chromium-family browsers accept --proxy-server on the command line.
+        let chromium_bins = [
+            "chromium-browser",
+            "chromium",
+            "google-chrome",
+            "google-chrome-stable",
+            "brave-browser",
+        ];
+        for bin in chromium_bins {
+            if std::process::Command::new(bin)
+                .arg(format!("--proxy-server={proxy_url}"))
+                .arg("--new-window")
+                .arg(url)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .is_ok()
+            {
+                return;
+            }
+        }
+        // Firefox doesn't expose a usable --proxy CLI flag; fall through to
+        // xdg-open and let the system proxy settings handle it.
+    }
+
+    #[cfg(target_os = "macos")]
+    let launcher = "open";
+    #[cfg(target_os = "windows")]
+    let launcher = "explorer";
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let launcher = "xdg-open";
+
+    let _ = std::process::Command::new(launcher)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 fn token_is_near_expiry(expires_at: u64) -> Result<bool> {

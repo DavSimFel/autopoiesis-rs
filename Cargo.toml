@@ -32,8 +32,10 @@ opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
+sha2 = "0.10"
 
 [features]
+default = ["tui"]
 integration = []
 tui = ["dep:ratatui", "dep:crossterm"]
 

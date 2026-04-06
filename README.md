@@ -24,7 +24,8 @@ A lightweight Rust agent runtime with a tiered execution model, guarded shell to
 - Local skill catalog with summary loading and full T3 skill injection.
 - Session persistence in daily JSONL files.
 - SQLite store for sessions, queue items, subscriptions, and plans.
-- OAuth device flow auth.
+- OAuth device-code auth and browser-based OAuth2 + PKCE login.
+- Optional ratatui TUI for interactive CLI sessions (`--features tui`).
 - Token-aware context trimming.
 
 ## Usage
@@ -36,8 +37,10 @@ cargo build --release
 ./target/release/autopoiesis --session ad-hoc "list files in the current directory"
 ./target/release/autopoiesis enqueue --session silas-t1 "check the queue backlog"
 ./target/release/autopoiesis --session ad-hoc
+cargo run                                   # no-arg default: TUI on "interactive" session
 ./target/release/autopoiesis serve --port 8423
 ./target/release/autopoiesis auth login
+./target/release/autopoiesis auth browser-login
 ./target/release/autopoiesis auth status
 ./target/release/autopoiesis auth logout
 ./target/release/autopoiesis sub add src/shipped/identity-templates/context.md
@@ -75,9 +78,21 @@ Examples:
 ```bash
 cargo build --release
 cp agents.toml agents.local.toml 2>/dev/null || true
-./target/release/autopoiesis auth login
+./target/release/autopoiesis auth login       # device-code flow
+./target/release/autopoiesis auth browser-login  # browser OAuth2 + PKCE
 ./target/release/autopoiesis --session ad-hoc "show me the repo layout"
 ```
+
+### TUI mode
+
+```bash
+cargo build --release
+./target/release/autopoiesis
+```
+
+Launches a three-region ratatui interface: output scroll, status bar (active tool + budget), and an input box. `Ctrl+C` twice force-quits. TUI is compiled in by default (`tui` is a default feature); disable with `--no-default-features` for a headless build.
+
+When invoked with no arguments, the TUI build defaults to an `"interactive"` session (created on first use). Pass `--session <name>` to resume a named session.
 
 The binary reads `agents.toml` from the working directory. If the file is missing, the runtime falls back to built-in defaults and the shipped assets under `src/shipped/`.
 
@@ -222,6 +237,13 @@ main.rs
 ├─ observe/
 │  ├─ otel.rs
 │  └─ sqlite.rs
+├─ tui/                          (feature = "tui", ratatui + crossterm)
+│  ├─ event.rs
+│  ├─ state.rs
+│  ├─ bridge.rs
+│  ├─ render.rs
+│  ├─ input.rs
+│  └─ mod.rs
 ├─ shipped/
 │  ├─ identity-templates/
 │  └─ skills/
