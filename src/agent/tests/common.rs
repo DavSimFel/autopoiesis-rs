@@ -342,7 +342,10 @@ pub(crate) fn spawned_t3_test_config(
         read: crate::config::ReadToolConfig::default(),
         subscriptions: crate::config::SubscriptionsConfig::default(),
         queue: crate::config::QueueConfig::default(),
-        identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
+        identity_files: crate::identity::t1_identity_files(
+            "src/shipped/identity-templates",
+            "silas",
+        ),
         skills_dir: skills_dir.clone(),
         skills_dir_resolved: skills_dir,
         skills,
