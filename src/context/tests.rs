@@ -144,7 +144,7 @@ fn manifest_config() -> Config {
         read: ReadToolConfig::default(),
         subscriptions: SubscriptionsConfig::default(),
         queue: QueueConfig::default(),
-        identity_files: identity::t1_identity_files("identity-templates", "silas"),
+        identity_files: identity::t1_identity_files("src/shipped/identity-templates", "silas"),
         agents,
         models: ModelsConfig::default(),
         domains: DomainsConfig::default(),

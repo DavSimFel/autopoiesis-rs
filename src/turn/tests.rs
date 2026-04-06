@@ -395,7 +395,7 @@ fn default_turn_includes_skill_summaries_without_clobbering_identity() {
 #[test]
 fn t2_turn_includes_skill_summaries() {
     let mut config = test_config_for_tier(Some("t2"), None);
-    config.skills = crate::skills::SkillCatalog::load_from_dir("skills").unwrap();
+    config.skills = crate::skills::SkillCatalog::load_from_dir("src/shipped/skills").unwrap();
 
     let turn = build_t2_turn(&config).unwrap();
     let mut messages = Vec::new();
@@ -423,7 +423,7 @@ fn t2_turn_includes_skill_summaries() {
 #[test]
 fn t3_turn_does_not_include_skill_summaries() {
     let mut config = test_config_for_tier(Some("t3"), None);
-    config.skills = crate::skills::SkillCatalog::load_from_dir("skills").unwrap();
+    config.skills = crate::skills::SkillCatalog::load_from_dir("src/shipped/skills").unwrap();
 
     let turn = build_t3_turn(&config).unwrap();
     let mut messages = Vec::new();
@@ -490,7 +490,7 @@ async fn provider_input_includes_skill_summaries() {
     session.add_user_message("hello").unwrap();
 
     let mut config = test_config(None);
-    config.skills = crate::skills::SkillCatalog::load_from_dir("skills").unwrap();
+    config.skills = crate::skills::SkillCatalog::load_from_dir("src/shipped/skills").unwrap();
     let turn = build_default_turn(&config).unwrap();
 
     let observed_messages = Arc::new(Mutex::new(None));
@@ -1260,7 +1260,10 @@ fn test_config(budget: Option<BudgetConfig>) -> Config {
         read: crate::config::ReadToolConfig::default(),
         subscriptions: crate::config::SubscriptionsConfig::default(),
         queue: crate::config::QueueConfig::default(),
-        identity_files: crate::identity::t1_identity_files("identity-templates", "silas"),
+        identity_files: crate::identity::t1_identity_files(
+            "src/shipped/identity-templates",
+            "silas",
+        ),
         skills_dir: std::path::PathBuf::from("skills"),
         skills_dir_resolved: std::path::PathBuf::from("skills"),
         skills: crate::skills::SkillCatalog::default(),
@@ -1291,9 +1294,9 @@ fn test_config_for_tier(tier: Option<&str>, budget: Option<BudgetConfig>) -> Con
     config.active_agent = Some("silas".to_string());
     config.agents = agents;
     config.identity_files = if matches!(tier, Some("t2") | Some("t3")) {
-        crate::identity::t2_identity_files("identity-templates")
+        crate::identity::t2_identity_files("src/shipped/identity-templates")
     } else {
-        crate::identity::t1_identity_files("identity-templates", "silas")
+        crate::identity::t1_identity_files("src/shipped/identity-templates", "silas")
     };
     config
 }
